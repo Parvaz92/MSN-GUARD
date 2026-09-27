@@ -3656,6 +3656,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         connectivityCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                // A network change is the one thing that can flip a filtered
+                // carrier back to open: the blocked verdict belongs to the link
+                // we just left, not the one we just joined.
+                IdentityProvisioner.clearApiBlockedCache()
                 // Connectivity restored - reset backoff and try immediately if we're in auto-reconnect
                 if (willAutoReconnect() && !connected.get() && !userInitiatedStop.get()) {
                     ConnectionLog.record("NetworkCallback: connectivity restored, resetting backoff and retrying")
@@ -5191,19 +5195,23 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // phone that has connected once, and it is why this whole path is
         // invisible to returning users.
         if (IdentityProvisioner.hasIdentity(this, protocol)) return null
-        // The API answers from this link: not filtered, so the registration will
-        // succeed on its own and there is no reason to involve SHARD at all.
-        // A phone with no data at all also lands here and reports its own error.
-        if (IdentityProvisioner.accountApiReachable(this)) return null
-        // Only SHARD can get us out. Start it ourselves when nothing is live —
-        // the user picked WireGuard, but xray binds its own listener without
-        // needing a TUN, so this is invisible to them.
-        provisionedShardOurselves = !ShardManager.isRunning
-        val listener = IdentityProvisioner.ensureShardListener(this) ?: run {
+        // Probe the direct route and raise SHARD in one round trip. On a
+        // filtered carrier the probe is the slow half, so SHARD's node race runs
+        // *while* it fails instead of after it.
+        val outcome = IdentityProvisioner.probeAndRaiseShard(
+            this,
+            probe = !IdentityProvisioner.apiAlreadyMeasuredBlocked(),
+        )
+        // The carrier answers: the core will register on its own link, and the
+        // SHARD session this raised has to come back down.
+        if (outcome.direct) return null
+        val listener = outcome.listener ?: run {
             ConnectionLog.record("Identity: SHARD could not start to provision through")
-            provisionedShardOurselves = false
             return null
         }
+        // Only mark it for teardown when this call raised it — a listener that
+        // was already live belongs to the user's own session.
+        provisionedShardOurselves = !IdentityProvisioner.shardWasAlreadyRunning
         ConnectionLog.record("Identity: account API blocked — provisioning through SHARD")
         return listener
     }

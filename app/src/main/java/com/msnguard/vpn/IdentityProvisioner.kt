@@ -122,7 +122,50 @@ object IdentityProvisioner {
      * through — a probe that proves nothing would send every fresh install
      * down a 100-second path that cannot end well.
      */
+    /**
+     * A [accountApiReachable] answer is a property of the *network*, not of the
+     * protocol: the carrier either lets the account API through or it does not,
+     * and re-asking changes nothing while costing the full probe timeout on
+     * every rung of the Auto Scan ladder — 33s × 3 in the field log.
+     *
+     * Cached for [BLOCKED_CACHE_MS] after a negative answer. A positive answer is
+     * never cached (cheap, and the only thing that can flip a carrier back to
+     * open is a network change, which goes through [clearApiBlockedCache]).
+     */
+    @Volatile
+    private var apiBlockedSince = 0L
+    private const val BLOCKED_CACHE_MS = 5 * 60_000L
+
+    fun clearApiBlockedCache() {
+        apiBlockedSince = 0L
+    }
+
+    /** Whether a negative answer is still within [BLOCKED_CACHE_MS]. */
+    fun apiAlreadyMeasuredBlocked(): Boolean {
+        return apiBlockedSince != 0L &&
+            System.currentTimeMillis() - apiBlockedSince < BLOCKED_CACHE_MS
+    }
+
+    /**
+     * Whether the SHARD listener was live before this provisioning attempt
+     * raised it. A session the user was already relying on must not be torn down
+     * by [MsnGuardVpnService.stopProvisioningShard].
+     */
+    @Volatile
+    var shardWasAlreadyRunning = false
+        private set
+
     fun accountApiReachable(context: Context): Boolean {
+        // Fast path: a network already measured as filtered stays filtered for
+        // the lifetime of the cache. Nothing the caller does in between — trying
+        // WireGuard, then MASQUE, then MIM — changes what the carrier will do
+        // with this same URL, so probing again is 33s of pure waste.
+        if (apiBlockedSince != 0L &&
+            System.currentTimeMillis() - apiBlockedSince < BLOCKED_CACHE_MS
+        ) {
+            Log.i(TAG, "account API already measured blocked on this network — skipping the probe")
+            return false
+        }
         return try {
             // A POST, not a GET: on an Iranian carrier a plain GET on /reg
             // answers while the real registration is dropped once its payload
@@ -141,6 +184,7 @@ object IdentityProvisioner {
             connection.responseCode in 200..599
         } catch (e: Exception) {
             Log.i(TAG, "account API not reachable directly: ${e.message}")
+            apiBlockedSince = System.currentTimeMillis()
             false
         }
     }
@@ -159,6 +203,89 @@ object IdentityProvisioner {
      * left alone, because tearing down a working tunnel the user is relying on
      * to start our own would be destructive.
      */
+    /**
+     * Whether the device's own link reaches the account API, and a SHARD
+     * listener to register through when it does not, in one round trip.
+     *
+     * The two are decided *in parallel* on a network worth probing at all.
+     * Doing them in sequence is what made provisioning slow: the probe takes up
+     * to its full 8s+8s timeout to fail on a filtered carrier, and only then
+     * does SHARD begin its 2s node race — a serial 33s the user watches every
+     * rung of the Auto Scan ladder pay. Racing them means the listener is
+     * already bound by the time the verdict arrives, so a blocked carrier pays
+     * max(probe, shard) instead of probe + shard.
+     *
+     * @param probe whether to test the direct route at all. False when the
+     *   network is already known to be filtered ([accountApiReachable] cached a
+     *   negative answer): the probe would burn its timeout to re-confirm a
+     *   result we already have, and SHARD is the only path anyway.
+     * @return the listener address when SHARD produced one and the direct route
+     *   is not usable, null when the direct route works or nothing was raised
+     */
+    fun probeAndRaiseShard(context: Context, probe: Boolean): ProbeOutcome {
+        if (ShardManager.isRunning) {
+            // A listener is already live and belongs to the user's own session.
+            // Reuse it and skip the probe: if their tunnel is up, the account
+            // API can ride it too.
+            shardWasAlreadyRunning = true
+            return ProbeOutcome(direct = true, listener = "127.0.0.1:${ShardManager.liveSocksPort}")
+        }
+        shardWasAlreadyRunning = false
+
+        // The probe is the slow half, so start the race first and let it run
+        // while the probe is still in flight.
+        ConnectionLog.record("Identity: starting SHARD to provision through it")
+        val shardStarted = AtomicBoolean(false)
+        Thread({
+            shardStarted.set(try {
+                ShardManager.start(context)
+            } catch (e: Exception) {
+                Log.w(TAG, "SHARD would not start for provisioning: ${e.message}")
+                ConnectionLog.record("Identity: SHARD start failed — ${e.message}")
+                false
+            })
+            if (!shardStarted.get()) {
+                ConnectionLog.record(
+                    "Identity: SHARD start failed — " +
+                        "${ShardManager.lastError.ifBlank { "no node answered" }}"
+                )
+            }
+        }, "identity-shard-start").start()
+
+        val direct = if (probe) accountApiReachable(context) else false
+        if (direct) {
+            // The carrier is open: the core registers on its own link. Take the
+            // SHARD session back down — leaving it up would hold port 1824
+            // against the user's own connect.
+            waitForShard(shardStarted)
+            if (shardStarted.get()) releaseShardListener(startedOurselves = true)
+            return ProbeOutcome(direct = true, listener = null)
+        }
+
+        val listener = waitForShard(shardStarted)
+        return ProbeOutcome(direct = false, listener = listener)
+    }
+
+    data class ProbeOutcome(val direct: Boolean, val listener: String?)
+
+    private fun waitForShard(started: AtomicBoolean): String? {
+        val deadline = System.currentTimeMillis() + START_BUDGET_MS
+        val startOfErrors = ShardManager.lastError.length
+        while (System.currentTimeMillis() < deadline) {
+            if (started.get() || ShardManager.isRunning) {
+                return "127.0.0.1:${ShardManager.liveSocksPort}"
+            }
+            if (ShardManager.lastError.length > startOfErrors) break
+            try {
+                Thread.sleep(200)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+        }
+        return null
+    }
+
     fun ensureShardListener(context: Context): String? {
         if (ShardManager.isRunning) {
             Log.i(TAG, "SHARD already running; reusing its listener")
