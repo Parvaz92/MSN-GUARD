@@ -330,6 +330,9 @@ object Strings {
         "PSIPHON" to Triple("PSIPHON", "سایفون", "赛风"),
         "PSIPHON OVER WARP" to Triple("PSIPHON OVER WARP", "سایفون روی وارپ", "Psiphon over WARP"),
         "Packet pattern is too long" to Triple("Packet pattern is too long", "الگوی پکت بیش از حد بلند است", "数据包模式过长"),
+        // Capital-P: this is the notification's own headline state, not the button.
+        // Same three languages as "Pause" (the button) above.
+        "Paused" to Triple("Paused", "متوقف شد", "已暂停"),
         "Pause" to Triple("Pause", "توقف", "暂停"),
         "Performance" to Triple("Performance", "عملکرد", "性能模式"),
         "Ping unavailable" to Triple("Ping unavailable", "پینگ در دسترس نیست", "Ping 不可用"),

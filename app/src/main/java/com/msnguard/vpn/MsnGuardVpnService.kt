@@ -4110,7 +4110,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         if (protocolLower.contains("wireguard") ||
             protocolLower.contains("masque") ||
             protocolLower.contains("gool") ||
-            protocolLower.contains("warp")
+            protocolLower.contains("warp") ||
+            // MIM is its own protocol string ("mim"), not a masque substring,
+            // so the clauses above never matched it. The whole SHARD-provisioning
+            // decision was unreachable for this transport: the core was left to
+            // register on its own link, which is exactly the blocked path the
+            // fallback exists for.
+            protocolLower.contains("mim")
         ) {
             // Computed inside the worker, see below.
             needsIdentityProxy = DEFERRED_IDENTITY_PROXY
@@ -5669,10 +5675,16 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // and a user who reads that and then finds Chrome on their real IP would be
         // right to call it a lie. The port is in the title because it is the one
         // thing they need and the only place they can see it while the app is closed.
-        val title = if (proxyMode) {
-            Strings.tf("SOCKS proxy on %s", CoreConfig.proxyListenPort(this))
-        } else {
-            Strings.t("VPN connected")
+        //
+        // Paused is the same kind of lie in the other direction: the tunnel is DOWN,
+        // the device is on its own carrier link, and a row that still says
+        // "VPN connected" while offering Reconnect is telling the user two things
+        // that cannot both be true. The state goes in the title, not just the
+        // button, because a button caption is easy to miss.
+        val title = when {
+            isPaused -> Strings.t("Paused")
+            proxyMode -> Strings.tf("SOCKS proxy on %s", CoreConfig.proxyListenPort(this))
+            else -> Strings.t("VPN connected")
         }
 
         val builder = Notification.Builder(this, CHANNEL_ID)
