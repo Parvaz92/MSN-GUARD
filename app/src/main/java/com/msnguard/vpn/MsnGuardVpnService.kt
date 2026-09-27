@@ -4589,6 +4589,16 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 val detail = NativeCore.lastError().ifBlank { error.message ?: "Tunnel setup failed" }
                 Log.e(LOG_TAG, "Tunnel failed: $detail", error)
                 sendStatus(STATUS_FAILED, detail)
+                // A setup failure never produced a tunnel, but the
+                // connected.compareAndSet(false, true) guard at the top of
+                // startTunnel latched this session's claim anyway. Nothing in
+                // this catch path drops it — the finally below only clears it
+                // when the core exited on its own — so connected stays TRUE on
+                // a session that never connected. The next startTunnel hits the
+                // guard, returns immediately, and EVERY transport then appears
+                // dead until the app is force-stopped. Dropping the latch here
+                // is what makes a failed MIM connect survivable by anything.
+                connected.set(false)
                 // Setup failures reject the pinned config the same way the
                 // runtime exit above does; same cure, same reason.
                 if (startedWithExitPin) {
@@ -4659,6 +4669,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // does not need a fresh VPN consent dialog.
                     nativeExitWasUnexpected = false
                     scheduleAutoReconnect("the tunnel dropped")
+                } else if (paused.get()) {
+                    // The core exited because the user hit Pause, not on its own:
+                    // stopTunnel(teardownService = false) left this session
+                    // deliberately alive so the notification's Reconnect stays
+                    // tappable. Reaching the stopSelf() branch below would remove
+                    // the row and end the pause — the exact bug that made
+                    // WireGuard/MASQUE/WoW close the app on Pause while Psiphon,
+                    // Tor and SHARD (which never run this worker's finally) did not.
+                    ConnectionLog.record("Core exited for a pause; notification kept")
                 } else {
                     nativeExitWasUnexpected = false
                     stopForeground(STOP_FOREGROUND_REMOVE)

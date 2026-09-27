@@ -63,7 +63,20 @@ object IdentityProvisioner {
         val base = File(context.filesDir, "aether.toml")
         val configPath = when (protocol.lowercase()) {
             "masque" -> siblingFile(base, "masque")
-            "gool", "warp-in-warp", "wow" -> siblingFile(base, "gool")
+            // GOOL/WoW dials two WARP identities, so both halves must exist.
+            "gool", "warp-in-warp", "wow" -> {
+                if (!siblingFile(base, "secondary").exists()) return false
+                base
+            }
+            // MIM dials two MASQUE identities: the primary AND its -secondary
+            // sibling. The check below only looked at aether-masque.toml, so a
+            // phone that had the outer hop but not the inner one reported
+            // "already provisioned", skipped SHARD, and the core failed at
+            // load_or_provision_masque(secondary) — "no masque identity found".
+            "mim", "masque-in-masque", "masque over masque" -> {
+                if (!siblingFile(siblingFile(base, "masque"), "secondary").exists()) return false
+                siblingFile(base, "masque")
+            }
             else -> base
         }
         if (!configPath.exists()) return false
