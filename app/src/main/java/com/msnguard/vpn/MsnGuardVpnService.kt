@@ -355,6 +355,17 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     private val reconnectRequested = AtomicBoolean(false)
 
     /**
+     * The user paused the tunnel from the notification instead of disconnecting.
+     *
+     * Deliberately NOT [userInitiatedStop]: that latch means "stay off, and do not
+     * auto-reconnect", which would defeat the whole purpose — the notification's
+     * Reconnect action is exactly the resume path a pause is supposed to leave open.
+     * This latch instead says "the tunnel is down but the session is alive", so
+     * [willAutoReconnect] and the notification builder both offer the resume.
+     */
+    private val paused = AtomicBoolean(false)
+
+    /**
      * Bumped by every [startTunnel]; captured by each session's worker.
      *
      * The native core's `finally` block runs when the core exits, which on a
@@ -822,6 +833,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
 
         const val ACTION_CONNECT = "com.msnguard.vpn.CONNECT"
         const val ACTION_DISCONNECT = "com.msnguard.vpn.DISCONNECT"
+        const val ACTION_PAUSE = "com.msnguard.vpn.PAUSE"
         const val ACTION_RECONNECT = "com.msnguard.vpn.RECONNECT"
         const val ACTION_NOTIFICATION_HEALTH = "com.msnguard.vpn.NOTIFICATION_HEALTH"
         const val ACTION_RESET_IDENTITIES = "com.msnguard.vpn.RESET_IDENTITIES"
@@ -2278,6 +2290,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // with a working tunnel or fails on its own terms. Left set, a failed
                 // manual retry would be treated as "still sealed from the old drop".
                 killSwitchSealed.set(false)
+                // And the pause latch: a connect is a connect, and a stale pause
+                // would leave the notification showing Reconnect on a live session.
+                paused.set(false)
                 reconnectAttempts = 0
                 startTunnel(config)
             }
@@ -2285,6 +2300,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // The one place that means "the user wants this off". Auto-reconnect
                 // reads this latch and stays out of the way.
                 userInitiatedStop.set(true)
+                // A disconnect from the notification is the end of the session, so
+                // the paused state cannot survive it: otherwise a later auto- or
+                // manual reconnect would find a stale latch.
+                paused.set(false)
                 // Clears the reconnect latch too, or a Reconnect that never came back
                 // up would leave the service un-stoppable: every teardown path reads
                 // the latch and declines to end the service while it is set.
@@ -2302,11 +2321,48 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 cancelAutoReconnect()
                 stopTunnel()
             }
+            ACTION_PAUSE -> {
+                // The user asked for the tunnel to go down while keeping the
+                // notification alive — so this is deliberately NOT
+                // [userInitiatedStop], whose latch means "stay off" and would
+                // block the Reconnect the user is about to be offered. A pause
+                // is instead marked here, so [willAutoReconnect] and the
+                // foreground state both know reconnect is still wanted.
+                paused.set(true)
+                ConnectionLog.record("Pause requested — tunnel down, notification kept")
+                // teardownService = false is the whole point of a pause: the
+                // service stays in the foreground so the notification row is not
+                // removed, and the Reconnect action in it remains tappable.
+                // notify = false so the DISCONNECTED status does not repaint the
+                // row before we re-post it ourselves with the Reconnect button.
+                stopTunnel(notify = false, teardownService = false)
+                // The notification's Reconnect action is only correct while the
+                // session is actually paused.
+                repostNotification()
+            }
             ACTION_RECONNECT -> {
                 val config = storedConfig
-                if (config != null && connected.get()) {
-                    ConnectionLog.record("Quick reconnect requested")
-                    requestQuickReconnect("user")
+                if (config != null && (connected.get() || paused.get())) {
+                    // Clearing the pause latch here, not in stopTunnel: this is
+                    // the only path that exits the paused state. Left set, the
+                    // notification would go on showing Reconnect while the
+                    // session was already up.
+                    paused.set(false)
+                    ConnectionLog.record(
+                        if (connected.get()) "Quick reconnect requested"
+                        else "Reconnect requested after pause"
+                    )
+                    if (connected.get()) {
+                        requestQuickReconnect("user")
+                    } else {
+                        // A paused session had already torn the tunnel down, so
+                        // there is nothing to wait for: start it again from the
+                        // last config the user connected with.
+                        userInitiatedStop.set(false)
+                        killSwitchSealed.set(false)
+                        reconnectAttempts = 0
+                        startTunnel(config)
+                    }
                 }
             }
             ACTION_NOTIFICATION_HEALTH -> {
@@ -2368,6 +2424,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // Same reason as ACTION_DISCONNECT: the consent this reconnect would restart
         // into is exactly what was just taken away, so the latch must not survive.
         reconnectRequested.set(false)
+        // And a pause cannot outlive the consent its reconnect needs: the
+        // notification would offer Reconnect into a session that cannot come back.
+        paused.set(false)
         // Nor the seal — the permission it would be rebuilt on is gone, so a rebuild
         // could only fail, and failing there stops the service anyway.
         killSwitchSealed.set(false)
@@ -3660,7 +3719,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * failure (red dial, session over) or as a reconnect in progress.
      */
     private fun willAutoReconnect(): Boolean =
-        autoReconnectEnabled() && !userInitiatedStop.get() && storedConfig != null
+        autoReconnectEnabled() && !userInitiatedStop.get() && storedConfig != null && !paused.get()
 
     /**
      * Records that the current PLAIN transport reached the internet on this network.
@@ -5551,6 +5610,20 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             this, 2, reconnectIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        // Pause is the first action and the one that changes shape. While the
+        // tunnel is up the button offers Pause, which tears the session down but
+        // leaves the service in the foreground so this row survives; while it is
+        // paused the same slot offers Reconnect, which restarts the session from
+        // the config the user last connected with. Same physical row, opposite
+        // verb, so the user's muscle memory stays on one button.
+        val isPaused = paused.get()
+        val pauseIntent = Intent(this, MsnGuardVpnService::class.java).apply {
+            action = if (isPaused) ACTION_RECONNECT else ACTION_PAUSE
+        }
+        val pausePendingIntent = PendingIntent.getService(
+            this, 3, pauseIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         // Second line: what is carrying the traffic and where it comes out.
         // Byte counters and speed are deliberately gone from here — see
         // [updateTrafficNotification] for why they were the cause of the
@@ -5599,8 +5672,16 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             // content — the exact case the user is complaining about.
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setOnlyAlertOnce(true)
+            .addAction(android.R.drawable.ic_media_pause,
+                if (isPaused) Strings.t("Reconnect") else Strings.t("Pause"),
+                pausePendingIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, Strings.t("Disconnect"), disconnectPendingIntent)
-            .addAction(android.R.drawable.ic_menu_revert, Strings.t("Reconnect"), reconnectPendingIntent)
+
+        // While the tunnel is paused the Reconnect entry point is the Pause slot
+        // itself, so the separate Reconnect action is hidden rather than duplicated.
+        if (!isPaused) {
+            builder.addAction(android.R.drawable.ic_menu_revert, Strings.t("Reconnect"), reconnectPendingIntent)
+        }
 
         // The session timer, ticked by the system rather than by us.
         //
