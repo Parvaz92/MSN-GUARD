@@ -6097,72 +6097,21 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     }
 
     private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses): Builder {
-        // AI Mode (Smart DNS Split) is a core-side flag. The core's split engine
-        // intercepts DNS *inside* its own TUN bridge, so the on-device DNS
-        // configuration must stay the normal resolvers — the previous build
-        // instead pointed Android at a userspace DNS server on 127.0.0.1:15353,
-        // which Android cannot reach from port 53. That broke every lookup and
-        // was what killed all five connect attempts in the v1.9.7 field log.
-        // OURS, kept over upstream's version — this is load-bearing for Psiphon.
-        //
-        // Carrier DNS on Iranian mobile networks is both censored and rejected by
-        // Psiphon's SOCKS5 (reply 5), so public resolvers are forced and any
-        // carrier-supplied server is filtered out rather than merely appended
-        // after. Upstream instead uses 1.1.1.1/1.0.0.1 only as a *fallback* when
-        // the config lists nothing, which would let carrier DNS through.
-        //
-        // v1.9.8: the user's custom DNS list, when present, takes precedence over
-        // the public resolvers — it is added FIRST, so Android asks it before
-        // 1.1.1.1. The field log proved the previous order was useless: the
-        // custom servers were appended after 1.1.1.1/8.8.8.8 and Android never
-        // got around to asking them.
-        val configured = JSONObject(config).optString("dns_servers")
-        val custom = configured.split(',', ';', ' ', '\n')
-            .map(String::trim)
-            .filter(String::isNotEmpty)
-            .mapNotNull { entry ->
-                // Keep DoT/DoH URLs and bracketed/IPv6 forms intact. Only strip a
-                // single trailing :port on a plain v4 address. The old `count == 1`
-                // test silently dropped every v6 address and every tls:// / https://
-                // entry the user typed.
-                val address = when {
-                    entry.startsWith("https://", ignoreCase = true) ||
-                        entry.startsWith("tls://", ignoreCase = true) ||
-                        entry.startsWith("dot://", ignoreCase = true) ||
-                        entry.startsWith("doh://", ignoreCase = true) ||
-                        entry.startsWith("doh:", ignoreCase = true) ||
-                        entry.startsWith("dot:", ignoreCase = true) -> entry
-
-                    entry.startsWith('[') -> entry.substringAfter('[').substringBefore(']')
-
-                    // A bare v4 with a port ("1.2.3.4:53"). A bare v6 has 2+ colons
-                    // and must survive untouched.
-                    entry.count { it == ':' } == 1 -> entry.substringBefore(':')
-
-                    else -> entry
-                }
-                runCatching { InetAddress.getByName(address) }.getOrNull()
-            }
-            .distinct()
-
-        // Custom resolvers first — that is the whole point of the setting.
-        custom.forEach { addDnsServer(it) }
-
+        // TUN DNS stays on public resolvers. A custom list is not added
+        // here; it is handed to the core (AETHER_DNS) for in-tunnel use.
+        // Publishing a geo-local resolver on the TUN would make every query
+        // travel to it via the tunnel egress, which breaks browsing even when
+        // the tunnel itself is healthy (e.g. 111.88.96.50/51).
         val forcedDns = listOf("1.1.1.1", "8.8.8.8")
         forcedDns.forEach { addDnsServer(InetAddress.getByName(it)) }
 
-        // From upstream v0.8.0: advertise a v6 resolver when the identity has a
-        // v6 address, otherwise v6-only lookups have nowhere to go.
         if (addresses.ipv6.isNotBlank()) {
             runCatching { addDnsServer(InetAddress.getByName("2606:4700:4700::1111")) }
         }
 
-        // Carrier-supplied servers are deliberately NOT added: on Iranian mobile
-        // networks the carrier DNS is both censored and rejected by Psiphon's
-        // SOCKS5 (reply 5). Only custom + public resolvers are advertised.
-
-        ConnectionLog.record(if (custom.isEmpty()) "DNS forced to public resolvers, carrier DNS excluded"
-            else "Custom DNS first: ${custom.joinToString(", ") { it.hostAddress }}, then public resolvers")
+        val hasCustom = JSONObject(config).optString("dns_servers").isNotBlank()
+        ConnectionLog.record(if (hasCustom) "DNS: TUN public resolvers (custom via tunnel: ${JSONObject(config).optString("dns_servers")})"
+        else "DNS forced to public resolvers, carrier DNS excluded")
         return this
     }
 }
