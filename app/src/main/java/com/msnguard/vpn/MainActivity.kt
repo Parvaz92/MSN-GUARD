@@ -3892,9 +3892,7 @@ class MainActivity : Activity() {
             }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(9) })
-            // v2.0.0: the AI Mode row is gone. The Smart DNS Split engine it
-            // toggled never produced a working Gemini lookup in the field, and
-            // the DNS screen now owns resolver configuration outright.
+            // v2.0.0: the AI Mode row is gone.
             dnsRow = navRow(Strings.t("Custom DNS"), customDnsLabel()) {
                 openDnsScreen()
             }
@@ -5211,18 +5209,9 @@ class MainActivity : Activity() {
 
     /** Row value for the custom-DNS box: the servers, or Automatic. */
     private fun customDnsLabel(): String {
-        // v2.0.0: the row summarises all three transport lists, not just the
-        // legacy UDP one, so a user who entered only DoH is not shown
-        // "Automatic" for a setting they did configure.
-        val udp = readDnsField(CUSTOM_DNS_UDP)
-        val dot = readDnsField(CUSTOM_DNS_DOT)
-        val doh = readDnsField(CUSTOM_DNS_DOH)
-        if (udp.isEmpty() && dot.isEmpty() && doh.isEmpty()) return Strings.t("Automatic")
-        return listOf(
-            udp.takeIf { it.isNotEmpty() }?.let { "UDP ${it.size}" },
-            dot.takeIf { it.isNotEmpty() }?.let { "DoT ${it.size}" },
-            doh.takeIf { it.isNotEmpty() }?.let { "DoH ${it.size}" },
-        ).filterNotNull().joinToString(" · ")
+        val list = readDnsField(CUSTOM_DNS)
+        if (list.isEmpty()) return Strings.t("Automatic")
+        return list.joinToString(", ")
     }
 
     /**
@@ -5924,25 +5913,9 @@ class MainActivity : Activity() {
     }
 
     /**
-     * The DNS screen (v2.0.0).
+     * The DNS screen.
      *
-     * Replaces the single-line Custom DNS dialog with a full page: a
-     * plain-UDP field with its own Test button that pings the resolver over
-     * that transport and reports reachable / unreachable.
-     *
-     * v2.0.8: the DoT and DoH fields were removed from the page. The encrypted
-     * transports are still parsed by the core (`dns_servers_dot` /
-     * `dns_servers_doh` in [CoreConfig.json] and [saveDnsLists]) for anything
-     * that already has them stored, but no UI offers them, so the screen is
-     * plain-UDP only.
-     *
-     * Testing is done from inside the app's own process, NOT through the tunnel:
-     * a DNS server that answers from the carrier is useless when reached through
-     * a foreign exit, and one that answers through the exit is useless if the
-     * carrier blocks it. The probe speaks the transport itself — a raw UDP
-     * datagram for UDP, a TLS handshake on :853 for DoT, an HTTPS POST for DoH —
-     * so "Test passed" means "this resolver answered on this transport from the
-     * network this device is on right now."
+     * A single DNS field with its own Test button.
      */
     private fun openDnsScreen() {
         dnsPage?.let(pageHost::removeView)
@@ -5974,15 +5947,9 @@ class MainActivity : Activity() {
         // the user had just filled in and tested.
         val fields = mutableMapOf<String, EditText>()
 
-        addDnsField(content, Strings.t("Plain UDP"), CUSTOM_DNS_UDP,
-            Strings.t("Bare IP addresses, optionally with a port. The default port is 53. Fastest, but unencrypted — a carrier can see and hijack these lookups."),
-            Strings.t("1.1.1.1, 10.202.10.202:53")) { fields[CUSTOM_DNS_UDP] = it }
-        // v2.0.8: the DoT and DoH fields are intentionally not added here. The
-        // encrypted transports stay wired in CoreConfig and the core — this is
-        // the only UI that could offer them, and without an entry the user sees
-        // a plain-UDP-only DNS screen, which is the intended product.
-        // `saveDnsLists()` and `customDnsLabel()` still read the keys, so a
-        // stored value is never lost or miscounted; nothing new can be typed.
+        addDnsField(content, Strings.t("DNS"), CUSTOM_DNS,
+            Strings.t("Bare IP addresses, optionally with a port. The default port is 53."),
+            Strings.t("1.1.1.1, 10.202.10.202:53")) { fields[CUSTOM_DNS] = it }
 
         content.addView(createSettingsButton(Strings.t("Save")) {
             // Commit the typed text before anything else reads it.
@@ -5991,13 +5958,8 @@ class MainActivity : Activity() {
                 val raw = field.text.toString().trim()
                 val entries = raw.split(',', ';', ' ', '\n')
                     .map(String::trim).filter(String::isNotEmpty).distinct()
-                val transport = when (key) {
-                    CUSTOM_DNS_DOT -> "dot"
-                    CUSTOM_DNS_DOH -> "doh"
-                    else -> "udp"
-                }
                 for (entry in entries) {
-                    CoreConfig.validateDnsEntry(transport, entry)?.let { problem ->
+                    CoreConfig.validateDnsEntry("udp", entry)?.let { problem ->
                         field.error = "$entry: $problem"
                         return@createSettingsButton
                     }
@@ -6198,13 +6160,8 @@ class MainActivity : Activity() {
             // failure reads as "unreachable" for a server that is fine — the
             // entry just is not shaped the way the transport needs. Reject those
             // here, before the network call, with the reason.
-            val transport = when (prefKey) {
-                CUSTOM_DNS_DOT -> "dot"
-                CUSTOM_DNS_DOH -> "doh"
-                else -> "udp"
-            }
             for (entry in entries) {
-                CoreConfig.validateDnsEntry(transport, entry)?.let { problem ->
+                CoreConfig.validateDnsEntry("udp", entry)?.let { problem ->
                     field.error = "$entry: $problem"
                     return@createSettingsButton
                 }
@@ -6244,114 +6201,12 @@ class MainActivity : Activity() {
         ).apply { bottomMargin = dp(14) })
     }
 
-    /**
-     * Probes [entries] and reports, in words, whether they answered.
-     *
-     * Runs on a background thread: each probe is a network call, and doing it on
-     * the UI thread would freeze the screen for the full timeout on every miss.
-     */
-    private fun testDnsServers(prefKey: String, entries: List<String>, report: (String) -> Unit) {
-        val transport = when (prefKey) {
-            CUSTOM_DNS_DOT -> "dot"
-            CUSTOM_DNS_DOH -> "doh"
-            else -> "udp"
-        }
-        Thread {
-            val results = ArrayList<String>()
-            for (entry in entries) {
-                val ok = probeDns(transport, entry)
-                results.add(if (ok) Strings.tf("%s: OK", entry) else Strings.tf("%s: unreachable", entry))
-            }
-            val okCount = results.count { it.contains("OK") }
-            // "%d" reached the user untouched because the translation table only
-            // substitutes %s; tf() now normalises it. Kept readable in both
-            // numberings so the line still makes sense translated.
-            report(Strings.tf("%d of %d answered", okCount, results.size) + " · " + results.joinToString(" · "))
-        }.start()
-    }
-
-    /**
-     * One probe, one transport. Returns true on any answer.
-     *
-     * The UDP probe sends a real A query for example.com and accepts any DNS
-     * response (even NXDOMAIN proves the server is answering DNS). The DoT probe
-     * is a TCP connect to :853 plus a TLS handshake — the certificate is not
-     * verified, because the question being asked is "is this reachable", not
-     * "is this trustworthy". The DoH probe POSTs a wire-format query and accepts
-     * a 2xx with a non-empty body.
-     */
-    private fun probeDns(transport: String, entry: String): Boolean = try {
-        when (transport) {
-            "dot" -> probeDot(entry)
-            "doh" -> probeDoh(entry)
-            else -> probeUdp(entry)
-        }
-    } catch (e: Exception) {
-        false
-    }
-
-    private fun probeDot(entry: String): Boolean {
-        // Strip the scheme the field's own placeholder tells the user to type.
-        // Without this, splitHostPort sees "tls://dns.google" as one host and
-        // createSocket resolves it literally — UnknownHostException, reported
-        // to the user as "unreachable" for a server that is perfectly fine.
-        // probeDoh strips its own prefix; this had to match.
-        val stripped = entry
-            .removePrefix("tls://")
-            .removePrefix("dot://")
-            .trim()
-        val (host, port) = splitHostPort(stripped, 853)
-        val socket = javax.net.ssl.SSLSocketFactory.getDefault().createSocket(host, port)
-            as javax.net.ssl.SSLSocket
-        return socket.use {
-            it.soTimeout = 4000
-            it.startHandshake()
-            true
-        }
-    }
-
-    private fun probeDoh(entry: String): Boolean {
-        val url = if (entry.startsWith("http", ignoreCase = true)) entry
-        else if (entry.startsWith("doh:", ignoreCase = true)) "https://" + entry.substring(4)
-        else "https://$entry/dns-query"
-        // HttpURLConnection only became Closeable on API 33; this app's floor is
-        // 26, so `.use{}` does not compile against the older SDK. Disconnect is
-        // the documented release and is idempotent, so it is safe to call after
-        // any of the early returns below.
-        val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-        try {
-            conn.requestMethod = "POST"
-            conn.connectTimeout = 4000
-            conn.readTimeout = 4000
-            conn.setRequestProperty("content-type", "application/dns-message")
-            conn.doOutput = true
-            conn.outputStream.use { it.write(dnsProbeQuery()) }
-            if (conn.responseCode !in 200..299) return false
-            return conn.inputStream?.use { it.read() >= 0 } ?: false
-        } finally {
-            conn.disconnect()
-        }
-    }
-
-    /**
-     * A real end-to-end check: fetch a URL and look at the content.
-     *
-     * The DNS probes above prove a server answers; this proves a connection
-     * through the tunnel can actually retrieve a page. A DNS answer plus a
-     * blocked HTTP path is exactly the "ping works but the site does not open"
-     * failure this reports separately.
-     *
-     * Runs on the calling thread; callers must be off the UI thread.
-     */
     private fun probeContent(url: String, expect: String): String {
         val conn = try {
             (java.net.URL(url).openConnection() as java.net.HttpURLConnection)
         } catch (e: java.io.IOException) {
             return Strings.tf("Unreachable (%s)", e.javaClass.simpleName)
         }
-        // try as an expression, so each catch arm supplies the value and the
-        // finally only closes the connection — a finally on a statement try
-        // throws the result away and the function has nothing to return.
         val verdict = try {
             conn.requestMethod = "GET"
             conn.connectTimeout = 6000
@@ -6360,16 +6215,10 @@ class MainActivity : Activity() {
             conn.setRequestProperty("cache-control", "no-cache")
             val code = conn.responseCode
             if (code !in 200..299) return Strings.tf("HTTP %s", code)
-            // read() returning -1 means a body was promised and the stream was
-            // cut — a half-open connection is not a working one.
             val body = conn.inputStream?.bufferedReader()?.use { it.readText() } ?: ""
-            if (body.isEmpty()) {
-                Strings.t("Empty response")
-            } else if (expect.isNotEmpty() && !body.contains(expect, ignoreCase = true)) {
-                Strings.t("Content mismatch")
-            } else {
-                Strings.tf("%s bytes OK", String.format("%,d", body.length))
-            }
+            if (body.isEmpty()) Strings.t("Empty response")
+            else if (expect.isNotEmpty() && !body.contains(expect, ignoreCase = true)) Strings.t("Content mismatch")
+            else Strings.tf("%s bytes OK", String.format("%,d", body.length))
         } catch (e: java.net.SocketTimeoutException) {
             Strings.t("Timeout")
         } catch (e: java.net.UnknownHostException) {
@@ -6383,6 +6232,36 @@ class MainActivity : Activity() {
         }
         return verdict
     }
+
+    /**
+     * Probes [entries] and reports, in words, whether they answered.
+     *
+     * Runs on a background thread: each probe is a network call, and doing it on
+     * the UI thread would freeze the screen for the full timeout on every miss.
+     */
+    private fun testDnsServers(prefKey: String, entries: List<String>, report: (String) -> Unit) {
+        Thread {
+            val results = ArrayList<String>()
+            for (entry in entries) {
+                val ok = probeUdp(entry)
+                results.add(if (ok) Strings.tf("%s: OK", entry) else Strings.tf("%s: unreachable", entry))
+            }
+            val okCount = results.count { it.contains("OK") }
+            // "%d" reached the user untouched because the translation table only
+            // substitutes %s; tf() now normalises it. Kept readable in both
+            // numberings so the line still makes sense translated.
+            report(Strings.tf("%d of %d answered", okCount, results.size) + " · " + results.joinToString(" · "))
+        }.start()
+    }
+
+    /**
+     * One probe. Returns true on any answer.
+     *
+     * Sends a real A query for example.com and accepts any DNS
+     * response (even NXDOMAIN proves the server is answering DNS).
+     */
+    private fun probeDns(entry: String): Boolean = try { probeUdp(entry) } catch (_: Exception) { false }
+
     private fun probeUdp(entry: String): Boolean {
         val (host, port) = splitHostPort(entry, 53)
         val query = dnsProbeQuery()
@@ -6437,35 +6316,14 @@ class MainActivity : Activity() {
         return host to port
     }
 
-    /**
-     * Writes the three transport lists to their own preferences and rebuilds the
-     * legacy single list that the tunnel still consumes.
-     *
-     * [CUSTOM_DNS] remains the union of the plain-UDP entries — that is what
-     * Android's resolver list can speak — and the encrypted lists are picked up
-     * by the core at connect time. Splitting them keeps Android from being handed
-     * a tls:// URL it cannot parse.
-     */
     private fun saveDnsLists() {
-        val udp = readDnsField(CUSTOM_DNS_UDP)
-        val dot = readDnsField(CUSTOM_DNS_DOT)
-        val doh = readDnsField(CUSTOM_DNS_DOH)
+        val list = readDnsField(CUSTOM_DNS)
         preferences().edit().apply {
-            putOrRemove(CUSTOM_DNS_UDP, udp)
-            putOrRemove(CUSTOM_DNS_DOT, dot)
-            putOrRemove(CUSTOM_DNS_DOH, doh)
-            // The legacy list the tunnel reads: plain UDP only. Encrypted
-            // entries are parsed by the core, never handed to Android.
-            putOrRemove(CUSTOM_DNS, udp)
+            putOrRemove(CUSTOM_DNS, list)
         }.apply()
-        val parts = listOfNotNull(
-            udp.takeIf { it.isNotEmpty() }?.let { "UDP ${it.size}" },
-            dot.takeIf { it.isNotEmpty() }?.let { "DoT ${it.size}" },
-            doh.takeIf { it.isNotEmpty() }?.let { "DoH ${it.size}" },
-        )
         ConnectionLog.record(
-            if (parts.isEmpty()) Strings.t("Custom DNS cleared — the default resolvers answer")
-            else Strings.t("Custom DNS saved:") + " " + parts.joinToString(", ")
+            if (list.isEmpty()) Strings.t("Custom DNS cleared — the default resolvers answer")
+            else Strings.t("Custom DNS saved:") + " " + list.joinToString(", ")
         )
     }
 
@@ -8706,11 +8564,6 @@ class MainActivity : Activity() {
         const val MANUAL_ENDPOINT = "manual_endpoint"
         const val MANUAL_INNER_ENDPOINT = "manual_inner_endpoint"
         const val CUSTOM_DNS = "dns_servers"
-        /** v2.0.0: per-transport DNS lists. [CUSTOM_DNS] stays the plain-UDP
-         * union, because that is all Android's own resolver list can speak. */
-        const val CUSTOM_DNS_UDP = "dns_servers_udp"
-        const val CUSTOM_DNS_DOT = "dns_servers_dot"
-        const val CUSTOM_DNS_DOH = "dns_servers_doh"
         const val RETRY_OBFUSCATION = "retry_obfuscation_profiles"
         const val TLS_CURVE_PRESET = "tls_curve_preset"
         const val WIREGUARD_DATA_CHECK = "wireguard_data_check"

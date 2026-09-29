@@ -172,18 +172,6 @@ struct NativeStartOptions {
     /// already loaded and running, so LAN sharing on the WARP transports had no way
     /// to ask for the HTTP listener at all before this field existed.
     http_proxy: Option<String>,
-    /// AI Mode: enable the Smart DNS Split engine inside the TUN bridge.
-    /// Default false; honoured on MASQUE/WireGuard/WoW only.
-    smart_dns: bool,
-    /// User-supplied resolver list for the Smart DNS Split engine. Plain UDP
-    /// entries are handled by Android; anything with a tls:// / https:// / doh:
-    /// prefix is spoken by the core over DoT/DoH. Comma/space/newline separated.
-    smart_dns_servers: Option<String>,
-    /// v2.0.0: per-transport resolver lists from the DNS screen. `dot` and `doh`
-    /// are already transport-prefixed (tls://… / https://…) and are pushed to the
-    /// engine's encrypted resolver list at startup, independent of smart_dns.
-    dns_servers_dot: Option<String>,
-    dns_servers_doh: Option<String>,
     /// `ip:port` of a SOCKS5 listener to route the account API through.
     ///
     /// Android-only channel for what the CLI would set as `AETHER_SOCKS_PROXY`.
@@ -229,10 +217,6 @@ impl Default for NativeStartOptions {
             gateway: false,
             upstream_proxy: None,
             http_proxy: None,
-            smart_dns: false,
-            smart_dns_servers: None,
-            dns_servers_dot: None,
-            dns_servers_doh: None,
             socks_proxy: None,
         }
     }
@@ -314,14 +298,6 @@ impl TryFrom<NativeStartOptions> for StartOptions {
         } else {
             std::env::set_var("AETHER_SOCKS_PROXY", "");
         }
-        // AI Mode: the core's TUN bridge reads this to decide whether to stand
-        // up the Smart DNS Split engine. Transports that never take that bridge
-        // (Psiphon, Tor, SHARD) ignore it, which is exactly the "symbolic only"
-        // behaviour the UI promises for those protocols.
-        options.smart_dns = value.smart_dns;
-        options.smart_dns_servers = value.smart_dns_servers.clone();
-        options.dns_servers_dot = value.dns_servers_dot.clone();
-        options.dns_servers_doh = value.dns_servers_doh.clone();
         Ok(options)
     }
 }

@@ -48,13 +48,6 @@ http = "1"
 bytes = "1"
 tokio-boring = "4.22"
 
-# DoT / DoH client for the Smart DNS Split engine. hickory-proto gives a
-# wire-format DNS message parser/builder; hickory-resolver speaks DoT and DoH
-# over TLS (rustls). The plain-UDP path already existed; these add the
-# encrypted transports so the split engine is not limited to plain UDP 53.
-hickory-proto = "0.24"
-hickory-resolver = { version = "0.24", features = ["tokio-runtime", "dns-over-tls", "dns-over-https-rustls", "dns-over-rustls"] }
-
 [profile.release]
 opt-level = 3
 lto = "fat"

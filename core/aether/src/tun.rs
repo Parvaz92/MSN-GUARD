@@ -335,7 +335,6 @@ pub async fn bridge(
     local_ipv4: std::net::Ipv4Addr,
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
-    smart_dns: bool,
 ) -> Result<()> {
     // Duplicate fd: Java owns original ParcelFileDescriptor lifetime.
     let fd = unsafe { libc::dup(tun_fd) };
@@ -408,103 +407,6 @@ pub async fn bridge(
                 if clamp_tcp_mss(&mut outbound, crate::wireguard::inner_mtu_hint()) {
                     clamped_syns += 1;
                 }
-                
-                // SMART DNS SPLIT: only Gemini-domain queries are intercepted.
-                // Every other query goes straight out the tunnel's normal path —
-                // the previous build broke every lookup on the device.
-                if smart_dns {
-                    // A DNS query can arrive as IPv4 or IPv6. Android gets both
-                    // 1.1.1.1 and 2606:4700:4700::1111, and modern devices prefer
-                    // v6 — so a v4-only interceptor sees nothing at all, which is
-                    // exactly what the field log showed: engine ready, zero queries.
-                    let parsed = if let Some(ihl) = parse_ipv4_header(&outbound) {
-                        Some((ihl, 4u8))
-                    } else {
-                        parse_ipv6_header(&outbound).map(|off| (off, 6u8))
-                    };
-                    if let Some((hdr_len, ipver)) = parsed {
-                        if outbound.len() >= hdr_len + 8 {
-                            let udp = &outbound[hdr_len..];
-                            let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
-                            if dst_port == 53 && udp.len() > 8 {
-                                // Count every DNS query the TUN sees, even before
-                                // parsing. The field log proved init works but no
-                                // query was ever seen; this line separates "queries
-                                // never arrive" from "the parser drops them".
-                                log::info!(
-                                    "[smart-dns] TUN saw UDP/53 v{ipver} hdr={hdr_len} dport={dst_port} len={}",
-                                    outbound.len()
-                                );
-                                if let Some(smart_dns) = crate::smart_dns::smart_dns() {
-                                    // process_query returns a bare DNS payload, not a
-                                    // full IP packet. Rebuild the IP+UDP headers around
-                                    // it; the old code treated the payload as a whole
-                                    // packet and wrote into it at IP-header offsets,
-                                    // corrupting every intercepted reply.
-                                    if let Some((payload, _is_gemini)) = smart_dns.process_query(&outbound, hdr_len).await {
-                                        let src_ip = &outbound[12..16];
-                                        let dst_ip = &outbound[16..20];
-                                        let src_port = u16::from_be_bytes([udp[0], udp[1]]);
-                                        let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
-
-                                        // Rebuild the reply with the same IP version
-                                        // the query used. A v4 reply to a v6 query
-                                        // (or the reverse) is dropped by the kernel.
-                                        let mut resp_packet = Vec::new();
-                                        let udp_len = 8 + payload.len();
-                                        if ipver == 6 {
-                                            // Fixed 40-byte v6 header, no ext headers.
-                                            resp_packet.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
-                                            resp_packet.extend_from_slice(&(udp_len as u16).to_be_bytes());
-                                            resp_packet.extend_from_slice(&[17u8, 64]); // next=UDP, hop 64
-                                            // src = original dst, dst = original src
-                                            resp_packet.extend_from_slice(&outbound[24..40]);
-                                            resp_packet.extend_from_slice(&outbound[8..24]);
-                                        } else {
-                                            let total_len = 20 + udp_len;
-                                            resp_packet.extend_from_slice(&[0x45, 0x00]);
-                                            resp_packet.extend_from_slice(&(total_len as u16).to_be_bytes());
-                                            resp_packet.extend_from_slice(&[0x00, 0x00, 0x40, 0x00, 0x40, 0x11]);
-                                            resp_packet.extend_from_slice(&[0x00, 0x00]); // checksum, fixed below
-                                            resp_packet.extend_from_slice(dst_ip); // src = original dst
-                                            resp_packet.extend_from_slice(src_ip); // dst = original src
-                                            let ip_csum = fold_checksum(ones_complement_sum(&resp_packet[0..20], 0));
-                                            resp_packet[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-                                        }
-                                        // UDP header: swapped ports, len, checksum computed last.
-                                        resp_packet.extend_from_slice(&dst_port.to_be_bytes());
-                                        resp_packet.extend_from_slice(&src_port.to_be_bytes());
-                                        resp_packet.extend_from_slice(&(udp_len as u16).to_be_bytes());
-                                        resp_packet.extend_from_slice(&[0x00, 0x00]);
-                                        resp_packet.extend_from_slice(&payload);
-
-                                        let udp_start = if ipver == 6 { 40 } else { 20 };
-                                        let mut sum = 0u32;
-                                        if ipver == 6 {
-                                            // v6 pseudo-header: src, dst, UDP length, next header.
-                                            sum = ones_complement_sum(&resp_packet[8..24], sum);
-                                            sum = ones_complement_sum(&resp_packet[24..40], sum);
-                                            sum += udp_len as u32;
-                                            sum += 17u32;
-                                        } else {
-                                            sum = ones_complement_sum(&resp_packet[12..20], sum);
-                                            sum += 17u32;
-                                            sum += udp_len as u32;
-                                        }
-                                        sum = ones_complement_sum(&resp_packet[udp_start..], sum);
-                                        let mut udp_csum = fold_checksum(sum);
-                                        if udp_csum == 0 { udp_csum = 0xffff; }
-                                        resp_packet[udp_start + 6..udp_start + 8].copy_from_slice(&udp_csum.to_be_bytes());
-
-                                        let _ = write_packet(&tun, &resp_packet).await;
-                                        continue; // Skip sending original query to tunnel
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                
                 outbound_tx.send(outbound).await
                     .map_err(|_| AetherError::Other("tunnel outbound channel closed".into()))?;
             },
@@ -594,7 +496,6 @@ pub async fn bridge(
     _local_ipv4: std::net::Ipv4Addr,
     _inbound_rx: mpsc::Receiver<Vec<u8>>,
     _outbound_tx: mpsc::Sender<Vec<u8>>,
-    _smart_dns: bool,
 ) -> Result<()> {
     Err(AetherError::Other(
         "TUN mode requires a Unix platform".into(),

@@ -18,7 +18,6 @@ pub mod platform;
 mod prober;
 mod quic;
 mod routing;
-mod smart_dns;
 mod socks;
 pub(crate) mod socks_upstream;
 mod sysprofile;

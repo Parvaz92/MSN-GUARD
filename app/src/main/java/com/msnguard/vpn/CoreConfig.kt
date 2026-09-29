@@ -207,13 +207,6 @@ object CoreConfig {
             putOpt("access_token", SecureStore.getSecret(context, "zero_trust_token").ifBlank { null })
             putOpt("access_email", SecureStore.getSecret(context, "zero_trust_email").ifBlank { null })
             put("gateway", prefs.getBoolean("zero_trust_gateway", false))
-            // v2.0.0: DNS configuration lives on the DNS screen, split by
-            // transport. Android's resolver list can only speak plain UDP, so
-            // that list alone goes to the TUN; the encrypted lists are forwarded
-            // to the core, which speaks DoT on :853 and DoH over HTTPS itself.
-            put("dns_servers", prefs.getString("dns_servers_udp", null))
-            putOpt("dns_servers_dot", prefs.getString("dns_servers_dot", null)?.ifBlank { null })
-            putOpt("dns_servers_doh", prefs.getString("dns_servers_doh", null)?.ifBlank { null })
         }.toString()
     }
 
