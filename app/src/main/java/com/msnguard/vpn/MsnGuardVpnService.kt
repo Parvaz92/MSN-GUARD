@@ -6097,29 +6097,21 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     }
 
     private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses): Builder {
-        val customRaw = JSONObject(config).optString("dns_servers").trim()
-        val custom = customRaw.split(',', ';', ' ', '\n')
-            .map { it.trim() }.filter { it.isNotEmpty() }
-            .mapNotNull { entry ->
-                val host = when {
-                    entry.startsWith("[") -> entry.substringAfter("[").substringBefore("]")
-                    entry.count { it == ':' } == 1 -> entry.substringBefore(":")
-                    else -> entry
-                }
-                runCatching { InetAddress.getByName(host) }.getOrNull()
-            }.distinct()
-        if (custom.isNotEmpty()) {
-            custom.forEach { addDnsServer(it) }
-            ConnectionLog.record("DNS: custom ${custom.joinToString(", ") { it.hostAddress ?: it.toString() }} + fallback")
-        } else {
-            ConnectionLog.record("DNS: automatic (1.1.1.1 / 8.8.8.8)")
-        }
+        // Keep custom resolvers (e.g. 111.88.96.50 Iranian private) OFF the TUN.
+        // TUN has 0.0.0.0/0, so anything published there routes INTO the tunnel
+        // and is asked via the tunnel egress (foreign Cloudflare edge) — unreachable
+        // for an Iran-only resolver, which stalls DNS and then the whole data plane.
+        // Custom list is still carried inside the tunnel via AETHER_DNS → socks.rs
+        // resolver_addresses, which is how the HEV/mapdns reference does it.
+        val raw = JSONObject(config).optString("dns_servers").trim()
+        val hasCustom = raw.isNotEmpty()
         val fallback = listOf("1.1.1.1", "8.8.8.8")
         fallback.forEach { runCatching { addDnsServer(InetAddress.getByName(it)) } }
         if (addresses.ipv6.isNotBlank()) {
             runCatching { addDnsServer(InetAddress.getByName("2606:4700:4700::1111")) }
             runCatching { addDnsServer(InetAddress.getByName("2001:4860:4860::8888")) }
         }
+        ConnectionLog.record(if (hasCustom) "DNS: TUN public resolvers (custom $raw via tunnel)" else "DNS: TUN public resolvers")
         return this
     }
 }
