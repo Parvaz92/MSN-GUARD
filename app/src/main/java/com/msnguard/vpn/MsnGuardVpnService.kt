@@ -6097,21 +6097,29 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     }
 
     private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses): Builder {
-        // TUN DNS stays on public resolvers. A custom list is not added
-        // here; it is handed to the core (AETHER_DNS) for in-tunnel use.
-        // Publishing a geo-local resolver on the TUN would make every query
-        // travel to it via the tunnel egress, which breaks browsing even when
-        // the tunnel itself is healthy (e.g. 111.88.96.50/51).
-        val forcedDns = listOf("1.1.1.1", "8.8.8.8")
-        forcedDns.forEach { addDnsServer(InetAddress.getByName(it)) }
-
+        val customRaw = JSONObject(config).optString("dns_servers").trim()
+        val custom = customRaw.split(',', ';', ' ', '\n')
+            .map { it.trim() }.filter { it.isNotEmpty() }
+            .mapNotNull { entry ->
+                val host = when {
+                    entry.startsWith("[") -> entry.substringAfter("[").substringBefore("]")
+                    entry.count { it == ':' } == 1 -> entry.substringBefore(":")
+                    else -> entry
+                }
+                runCatching { InetAddress.getByName(host) }.getOrNull()
+            }.distinct()
+        if (custom.isNotEmpty()) {
+            custom.forEach { addDnsServer(it) }
+            ConnectionLog.record("DNS: custom ${custom.joinToString(", ") { it.hostAddress ?: it.toString() }} + fallback")
+        } else {
+            ConnectionLog.record("DNS: automatic (1.1.1.1 / 8.8.8.8)")
+        }
+        val fallback = listOf("1.1.1.1", "8.8.8.8")
+        fallback.forEach { runCatching { addDnsServer(InetAddress.getByName(it)) } }
         if (addresses.ipv6.isNotBlank()) {
             runCatching { addDnsServer(InetAddress.getByName("2606:4700:4700::1111")) }
+            runCatching { addDnsServer(InetAddress.getByName("2001:4860:4860::8888")) }
         }
-
-        val hasCustom = JSONObject(config).optString("dns_servers").isNotBlank()
-        ConnectionLog.record(if (hasCustom) "DNS: TUN public resolvers (custom via tunnel: ${JSONObject(config).optString("dns_servers")})"
-        else "DNS forced to public resolvers, carrier DNS excluded")
         return this
     }
 }
