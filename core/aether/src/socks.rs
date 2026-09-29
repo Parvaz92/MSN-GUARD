@@ -364,11 +364,26 @@ pub(crate) fn resolver_addresses() -> Vec<SocketAddr> {
         }
     }
 
+    // When the user sets an Iran-only resolver (e.g. 111.88.96.50) it is
+    // reachable only from an Iran egress. A foreign Cloudflare edge makes it
+    // unreachable, so the first query would stall 5s before any answer.
+    // Keep the public resolvers as fallback behind the custom list so DNS
+    // still answers even when the custom resolver is unreachable from abroad
+    // — the reference engine's mapdns path behaves the same (public fallback).
+    let fallbacks: [std::net::SocketAddr; 4] = [
+        "1.1.1.1:53".parse().unwrap(),
+        "1.0.0.1:53".parse().unwrap(),
+        "8.8.8.8:53".parse().unwrap(),
+        "9.9.9.9:53".parse().unwrap(),
+    ];
     if servers.is_empty() {
-        servers.push("1.1.1.1:53".parse().unwrap());
-        servers.push("1.0.0.1:53".parse().unwrap());
-        servers.push("8.8.8.8:53".parse().unwrap());
-        servers.push("9.9.9.9:53".parse().unwrap());
+        servers.extend_from_slice(&fallbacks);
+    } else {
+        for fb in fallbacks {
+            if !servers.contains(&fb) {
+                servers.push(fb);
+            }
+        }
     }
     servers
 }
@@ -387,7 +402,7 @@ async fn dns_exchange(
             continue;
         }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1800);
 
         loop {
             let resp = match tokio::time::timeout_at(deadline, from_stack.recv()).await {
