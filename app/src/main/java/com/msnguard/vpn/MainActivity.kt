@@ -5018,6 +5018,30 @@ class MainActivity : Activity() {
     private fun tunnelTypeLabel(): String =
         if (CoreConfig.proxyOnly(this)) Strings.t("SOCKS proxy") else Strings.t("VPN (whole device)")
 
+    /** Label for the TUN engine row. */
+    private fun tunEngineLabel(): String = TunEnginePref.label(TunEnginePref.get(this), this)
+
+    private fun chooseTunEngine() {
+        if (TunnelStatus.isActive()) {
+            toastShort(Strings.t("Disconnect first to change the TUN engine"))
+            return
+        }
+        val options = listOf(TunEnginePref.LEGACY, TunEnginePref.ZEPTUN, TunEnginePref.HEV)
+        showChoiceSheet(
+            title = Strings.t("TUN engine"),
+            subtitle = Strings.t("Which tunnel engine carries VPN traffic \u00b7 applies next connect"),
+            options = options,
+            selected = TunEnginePref.get(this),
+            label = { TunEnginePref.label(it, this) },
+            description = { TunEnginePref.description(it) },
+        ) { chosen ->
+            preferences().edit().putString(TunEnginePref.KEY, chosen).apply()
+            tunEngineRow?.setValue(tunEngineLabel())
+            ConnectionLog.record("TUN engine set to " + TunEnginePref.label(chosen, this) + " \u2014 applies on the next connect")
+            toastShort(Strings.t("TUN engine will apply on the next connect"))
+        }
+    }
+
     /** Value shown on the port row — the port, or why it is inert. */
     private fun proxyPortValue(): String {
         val port = CoreConfig.proxyListenPort(this)
