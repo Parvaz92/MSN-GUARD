@@ -98,6 +98,11 @@ object TunEngineManager {
         try { if (HevEngine.isRunning) HevEngine.stop() } catch (_: Throwable) {}
     }
 
+    /** Refresh Tun2SocksManager.privateAddress so engines that read it (Hev) match Builder's addresses. */
+    fun syncPrivateAddress(addr: Tun2SocksManager.PrivateAddress) {
+        Tun2SocksManager.privateAddress = addr
+    }
+
     /** Used by MsnGuardVpnService chain/shard/tor to pick a private subnet without duplicating logic. */
     fun selectPrivateAddress(): Tun2SocksManager.PrivateAddress = Tun2SocksManager.selectPrivateAddress()
 }

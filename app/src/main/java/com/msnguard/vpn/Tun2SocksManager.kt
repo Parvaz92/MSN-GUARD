@@ -102,7 +102,6 @@ object Tun2SocksManager {
 
     @Volatile
     var privateAddress: PrivateAddress = defaultPrivateAddress()
-        private set
 
     private fun defaultPrivateAddress() =
         PrivateAddress("10.0.0.1", "10.0.0.0", 8, "10.0.0.2")

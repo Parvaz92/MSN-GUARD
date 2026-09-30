@@ -28,7 +28,7 @@ android {
         applicationId = "com.msnguard.vpn"
         minSdk = 26
         targetSdk = 36
-        versionCode = 253
+        versionCode = 254
         versionName = "2.1.6"
 
     }

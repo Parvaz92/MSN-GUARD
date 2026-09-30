@@ -47,12 +47,16 @@ object HevEngine : TunEngine {
         // tunnel { name, mtu, ipv4/ipv6, multi-queue off }
         // socks5 { address, port, udp, mark(0)=no fwmark }
         // misc { task-stack, connect-timeout etc — defaults OK }
-        val addr = Tun2SocksManager.privateAddress
+        // External TUN fd (VPN mode) is already configured by VpnService.Builder
+        // with the real WARP addresses (e.g. 172.16.0.2/32). For that path Hev
+        // ignores tunnel.ipv4 (tunnel_init returns early when fd>=0), so use a
+        // non-conflicting CGNAT address instead of privateAddress (10.0.0.1/8)
+        // which would confuse logs and could clash with 10/8 LANs.
         val yaml = buildString {
             appendLine("tunnel:")
             appendLine("  name: tun0")
             appendLine("  mtu: $mtu")
-            appendLine("  ipv4: ${addr.ipAddress}/8")
+            appendLine("  ipv4: 198.18.0.1/32")
             // Hev requires an ipv6 or it defaults to fd00::1; keep it simple.
             appendLine("  ipv6: \"fd00::1/64\"")
             appendLine("  multi-queue: false")
