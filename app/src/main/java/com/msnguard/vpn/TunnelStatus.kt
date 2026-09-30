@@ -32,8 +32,8 @@ object TunnelStatus {
     var isProxyMode: Boolean = false
         internal set
 
-    /** True when either data path is up: Rust core (proxy/other protocols) or tun2socks (VPN). */
-    fun isActive(): Boolean = NativeCore.isRunning() || Tun2SocksManager.isRunning || isProxyMode
+    /** True when either data path is up: Rust core (proxy/other protocols) or any TUN engine (VPN). */
+    fun isActive(): Boolean = NativeCore.isRunning() || TunEngineManager.isRunningAny || isProxyMode
 
     /**
      * True when the whole device is being routed through tun2socks.
@@ -43,7 +43,7 @@ object TunnelStatus {
      * answer (e.g. the header's "all apps protected" claim).
      */
     val isWholeDeviceRouting: Boolean
-        get() = Tun2SocksManager.isRunning
+        get() = TunEngineManager.isRunningAny
 
     /**
      * True while the Rust core is driving an Android TUN directly.

@@ -226,6 +226,7 @@ class MainActivity : Activity() {
     private var chainOuterRow: OrbitSettingsRow? = null
     private var torChainOuterRow: OrbitSettingsRow? = null
     private var egressRegionRow: OrbitSettingsRow? = null
+    private var tunEngineRow: OrbitSettingsRow? = null
     private var psiphonModeRow: OrbitSettingsRow? = null
     private var cdnEdgeIpsRow: OrbitSettingsRow? = null
     private var cdnSniRow: OrbitSettingsRow? = null
@@ -3250,6 +3251,11 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(8) })
+            tunEngineRow = navRow(Strings.t("TUN engine"), tunEngineLabel()) { chooseTunEngine() }
+            body.addView(tunEngineRow, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(8) })
             // Share over LAN, directly under the port it publishes.
             //
             // Moved out of the PSIPHON section: it is not Psiphon's any more. Every
@@ -5174,6 +5180,7 @@ class MainActivity : Activity() {
      * chips already were.
      */
     private fun refreshTunnelTypeRows() {
+        tunEngineRow?.setValue(tunEngineLabel())
         val proxy = CoreConfig.proxyOnly(this)
         // The transport picker itself. Locked mid-session for the same reason the
         // rail is: the running tunnel cannot change transport, and a row that opens

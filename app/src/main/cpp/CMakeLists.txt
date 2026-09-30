@@ -15,6 +15,10 @@ target_link_options(aether_jni PRIVATE
 find_library(log-lib log)
 target_link_libraries(aether_jni aether ${log-lib})
 
+# Hev (hev-socks5-tunnel) is built via ndk-build in CI (build.yml) and
+# vendored as a prebuilt into jniLibs/ — not via add_subdirectory, so its
+# lwIP copy does not share a CMake scope with badvpn's lwIP.
+
 # badvpn tun2socks (lwIP-based) — builds libtun2socks.so.
 # This is the whole-device TUN path; the Rust core keeps handling Psiphon
 # lifecycle and exposes the local SOCKS5 port that tun2socks dials.

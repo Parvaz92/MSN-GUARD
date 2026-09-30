@@ -1265,7 +1265,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // started). tun2socks keeps running across Psiphon rotations — the SOCKS
         // port is fixed, so a rotation only breaks in-flight upstream sockets and
         // lwIP resets those individual flows while the TUN device stays up.
-        if (psiphonVpnActivated && Tun2SocksManager.isRunning) {
+        if (psiphonVpnActivated && TunEngineManager.isRunningAny) {
             ConnectionLog.record("Psiphon reconnected — tun2socks still routing, nothing to do")
             sendStatus(STATUS_CONNECTED)
             return
@@ -1277,7 +1277,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             return
         }
 
-        if (!Tun2SocksManager.start(tunFd, port)) {
+        if (!TunEngineManager.start(this, tunFd, port)) {
             failAndStop(Strings.t("Could not start whole-device routing"))
             return
         }
@@ -2188,7 +2188,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         //    too and would seal the device after one — exactly what the paragraph
         //    above forbids. tun2socks routing means the inner leg really was
         //    carrying the device's traffic.
-        val armed = sealOnDrop && killSwitchArmed() && Tun2SocksManager.isRunning
+        val armed = sealOnDrop && killSwitchArmed() && TunEngineManager.isRunningAny
         // A seal that is ALREADY up has to outlive this failure as well, and that
         // decision has to be made here for the same reason: it reads the preference
         // and it decides whether stopTunnel may end the service. See the block below
@@ -2294,6 +2294,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // auto-reconnect after process death), so it seeds the language
         // resolver itself. Cheap: one field write per start.
         AppLanguage.appContext = applicationContext
+        AppContext.set(applicationContext)
         when (intent?.action) {
             ACTION_CONNECT -> intent.getStringExtra(EXTRA_CONFIG)?.let { config ->
                 // A fresh user-initiated connect clears both the "user switched it
@@ -2849,7 +2850,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // e.g. speed tests) DNS replies came back on rebinded conids and
                 // were rejected as "wrong remote address" — name resolution died
                 // mid-session while the tunnel itself was still healthy.
-                if (!Tun2SocksManager.start(tun!!, TorManager.FRONT_SOCKS_PORT, dnsOnlyUdpgw = true)) {
+                if (!TunEngineManager.start(this, tun!!, TorManager.FRONT_SOCKS_PORT, dnsOnly = true)) {
                     error("Could not start device routing")
                 }
 
@@ -2965,7 +2966,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     error("Could not start the UDP front-end")
                 }
                 activeSocksPort = ShardSocksFront.LISTEN_PORT
-                if (!Tun2SocksManager.start(tun!!, ShardSocksFront.LISTEN_PORT, mtu = Tun2SocksManager.SHARD_TUNNEL_MTU)) {
+                if (!TunEngineManager.start(this, tun!!, ShardSocksFront.LISTEN_PORT, mtu = Tun2SocksManager.SHARD_TUNNEL_MTU)) {
                     error("Could not start device routing")
                 }
 
@@ -3217,7 +3218,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * died), leaving the caller to take the ordinary reconnect path.
      */
     private fun rotateShardNode(reason: String): Boolean {
-        if (!Tun2SocksManager.isRunning || !ShardSocksFront.isRunning) return false
+        if (!TunEngineManager.isRunningAny || !ShardSocksFront.isRunning) return false
         if (shardRotations >= MAX_SHARD_ROTATIONS) {
             ConnectionLog.record(
                 "SHARD: $shardRotations rotations without a stable node — falling back to a full reconnect"
@@ -3270,7 +3271,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // first watchdog tick and auto-reconnect would loop forever.
         val needsRouting = psiphonVpnMode || currentProtocol.contains("TOR") ||
             currentProtocol.contains("SHARD")
-        if (needsRouting && !Tun2SocksManager.isRunning) return "device routing stopped"
+        if (needsRouting && !TunEngineManager.isRunningAny) return "device routing stopped"
 
         // SHARD: three things can die independently, and they are reported in the
         // order that decides what the caller does about it — the two repairable ones
@@ -4736,7 +4737,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         regionPhase = false
         // Order matters: stop routing first so no more packets enter a tunnel
         // that is being torn down, then stop Psiphon itself.
-        Tun2SocksManager.stop()
+        TunEngineManager.stop(this)
         stopTrafficPolling()
         TorManager.stop()
         stopPsiphonTunnel()
