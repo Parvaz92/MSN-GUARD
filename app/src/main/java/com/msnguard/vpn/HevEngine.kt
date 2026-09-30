@@ -67,11 +67,15 @@ object HevEngine : TunEngine {
             appendLine("misc:")
             appendLine("  task-stack-size: 81920")
             appendLine("  connect-timeout: 5000")
-            appendLine("  read-write-timeout: 300000")
+            appendLine("  read-write-timeout: 60000")
             appendLine("  log-file: stderr")
             appendLine("  log-level: warn")
-            // mapdns: answer 198.18.0.2 → fake 100.64.0.0/10 pool
-            appendLine("  # mapdns disabled — DNS goes via SOCKS UDP, no synthetic pool")
+            appendLine("mapdns:")
+            appendLine("  address: 198.18.0.2")
+            appendLine("  port: 53")
+            appendLine("  network: 100.64.0.0")
+            appendLine("  netmask: 255.192.0.0")
+            appendLine("  cache-size: 10000")
         }
         try {
             cfgFile.writeText(yaml)
