@@ -4539,180 +4539,87 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     return@execute
                 }
 
-                // VPN MODE: choose the data-plane that matches what the user asked for.
-                //
-                // DNS-aware path — mirrors the reference app's 16:34 log:
-                //   [Tun] Whole-device: tunneling all apps, split lists ignored
-                //   [Tun] [attempt=...] Established mtu=1330 engine=HEV_TUN2SOCKS
-                //   [VpnService] HEV settings: ... mapdnsCache=10000 udp=udp
-                //   [Controller] Starting core at 127.0.0.1:1819
-                //   [AetherCore] ... socks5 server listening on 127.0.0.1:1819
-                //
-                // When a custom DNS is configured (or more generally when the
-                // user is in whole-device VPN — which is the entire branch we
-                // are already in), the Android TUN is bridged via TunEngine
-                // (Zeptun/Hev/Legacy, per user choice) to a SOCKS listener the
-                // core exposes, instead of handing the TUN fd directly to the
-                // Rust core (tun::bridge). The modem path is:
-                //   TUN → TunEngine → 127.0.0.1:1819 SOCKS → aether → WARP
-                // so UDP/53 aimed at any resolver goes through SOCKS ASSOCIATE
-                // and mapdns/real DNS behaves the same as in the reference.
-                // Without custom DNS the legacy NativeCore.start(fd) path is
-                // retained so a no-DNS session stays unchanged.
-                //
-                // Chain mode never reaches here, Psiphon/Tor/SHARD already
-                // returned above, so this is strictly WARP (MASQUE/WireGuard/
-                // WoW/MIM) on whole-device.
-                // Unconditionally via TunEngine for WARP (WireGuard/MASQUE/WoW)
-                // — exactly the reference path (TUN → TunEngine → 127.0.0.1:1819).
-                // No DNS gate: the reference does it for whole-device regardless
-                // of dns_servers presence, with split lists ignored on the TUN path.
-                // This makes WireGuard establish via the same engine and same
-                // mtu (1330) as the 16:34 reference log.
-                val useTunEngine = true
-                if (useTunEngine && !proxyMode) {
-                    val addresses = NativeCore.prepare(effectiveConfig)
-                    if (addresses.organization.isNotBlank()) {
-                        ConnectionLog.record("Zero Trust organization ${addresses.organization}")
-                    }
-                    ConnectionLog.record("Creating Android VPN interface (via ${'$'}{TunEngineManager.current(this).label})")
-                    // Build the TUN the same way as the native branch, then
-                    // bridge it via the selected TunEngine instead of via the
-                    // Rust core's tun::bridge (native fd path).
-                    val listenPort = CoreConfig.SOCKS_PORT
-                    // Chain outer legs use 1820; plain WARP uses 1819. We are
-                    // plain WARP, so 1819, matching socks::serve's default.
-                    val warpJson = org.json.JSONObject(effectiveConfig).apply {
-                        put("listen", "127.0.0.1:${'$'}listenPort")
-                    }.toString()
-                    // Store the SOCKS port so health probes dial it when the
-                    // core is in proxy-like mode (the proxy branch above).
-                    TunnelStatus.isNativeTunMode = false
-                    TunnelStatus.isProxyMode = false
-                    tun = Builder()
-                        .setSession("MSN-GUARD")
-                        .setMtu(1330)
-                        .applyTunnelAddresses(addresses)
-                        .applyDns(effectiveConfig, addresses)
-                        .applyGatewayProxy(effectiveConfig, addresses)
-                        .applyLanAccess(addresses)
-                        .applyIranBypass()
-                        .applySplitTunneling()
-                        .establish() ?: error("Android could not establish the VPN interface")
-                    vpnModeActive.set(true)
-                    // Start TunEngine → 127.0.0.1:1819 before the core.
-                    // Use this PacketFd-bearing TUN, not chain constants.
-                    if (!TunEngineManager.start(this, tun!!, listenPort, mtu = 1330)) {
-                        ConnectionLog.record("TunEngine bridge failed — running native TUN for this attempt")
-                        TunEngineManager.stop(this)
-                        tun?.close(); tun = null
-                        vpnModeActive.set(false)
-                        // Rebuild TUN and run native path inline instead of
-                        // throwing — the outer catch would otherwise report a
-                        // setup failure and drop connected, making the next
-                        // startTunnel appear dead.
-                        val fbAddresses = NativeCore.prepare(effectiveConfig)
-                        if (fbAddresses.organization.isNotBlank()) {
-                            ConnectionLog.record("Zero Trust organization ${fbAddresses.organization}")
-                        }
-                        tun = Builder()
-                            .setSession("MSN-GUARD")
-                            .setMtu(1330)
-                            .applyTunnelAddresses(fbAddresses)
-                            .applyDns(effectiveConfig, fbAddresses)
-                            .applyGatewayProxy(effectiveConfig, fbAddresses)
-                            .applyLanAccess(fbAddresses)
-                            .applyIranBypass()
-                            .applySplitTunneling()
-                            .establish() ?: error("Android could not establish the VPN interface")
-                        ConnectionLog.record("Scanning gateways for VPN (native fallback)")
-                        TunnelStatus.isNativeTunMode = true
-                        startWatchdog()
-                        val fbResult = NativeCore.start(effectiveConfig, tun!!.fd)
-                        val fbDiedOnItsOwn = !stopRequested.get()
-                        if (fbResult != 0 && !stopRequested.get()) {
-                            val fbDetail = NativeCore.lastError().ifBlank { "Tunnel exited with code ${'$'}fbResult" }
-                            ConnectionLog.record("Native tunnel exited: ${'$'}fbDetail")
-                            if (startedWithExitPin) {
-                                clearExitPin("the pinned endpoint failed")
-                                startedWithExitPin = false
-                                storedConfig = unpinnedStoredConfig ?: storedConfig
-                            }
-                            if (!willAutoReconnect()) sendStatus(STATUS_FAILED, fbDetail)
-                        } else if (stopRequested.get()) {
-                            if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting\u2026"))
-                            else sendStatus(STATUS_DISCONNECTED)
-                        } else {
-                            ConnectionLog.record("Native tunnel stopped unexpectedly")
-                            if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
-                        }
-                        nativeExitWasUnexpected = fbDiedOnItsOwn
-                    } else {
-                    ConnectionLog.record("TunEngine ${'$'}{TunEngineManager.current(this).label} bridging TUN → 127.0.0.1:${'$'}listenPort")
+                // VPN MODE: unified TunEngine
+                // TUN → TunEngine (Hev/Zeptun/Legacy per user choice) → 127.0.0.1:1819 SOCKS → WARP.
+                // So DNS and all UDP go via SOCKS ASSOCIATE + mapdns via SOCKS ASSOCIATE + mapdns.
+                val addresses = NativeCore.prepare(effectiveConfig)
+                if (addresses.organization.isNotBlank()) {
+                    ConnectionLog.record("Zero Trust organization ${addresses.organization}")
+                }
+                val warpListen = "127.0.0.1:${CoreConfig.SOCKS_PORT}"
+                val warpJson = org.json.JSONObject(effectiveConfig).apply { put("listen", warpListen) }.toString()
+                ConnectionLog.record("Creating Android VPN interface (via ${TunEngineManager.current(this).label})")
+                tun = Builder()
+                    .setSession("MSN-GUARD")
+                    .setMtu(1330)
+                    .applyTunnelAddresses(addresses)
+                    .applyDns(effectiveConfig, addresses)
+                    .applyGatewayProxy(effectiveConfig, addresses)
+                    .applyLanAccess(addresses)
+                    .applyIranBypass()
+                    .applySplitTunneling()
+                    .establish() ?: error("Android could not establish the VPN interface")
+                vpnModeActive.set(true)
+                TunnelStatus.isNativeTunMode = false
+                TunnelStatus.isProxyMode = false
+                if (!TunEngineManager.start(this, tun!!, CoreConfig.SOCKS_PORT, mtu = 1330)) {
+                    ConnectionLog.record("TunEngine failed — falling back to native TUN")
+                    try { TunEngineManager.stop(this) } catch (_: Throwable) {}
+                    tun?.close(); tun = null; vpnModeActive.set(false)
+                    val fbAddr = NativeCore.prepare(effectiveConfig)
+                    tun = Builder().setSession("MSN-GUARD").setMtu(1330).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
+                    ConnectionLog.record("Scanning gateways for VPN (native fallback)")
+                    TunnelStatus.isNativeTunMode = true; vpnModeActive.set(true); startWatchdog()
+                    val fbResult = NativeCore.start(effectiveConfig, tun!!.fd)
+                    val fbDead = !stopRequested.get()
+                    if (fbResult != 0 && !stopRequested.get()) {
+                        val d = NativeCore.lastError().ifBlank { "Tunnel exited with code $fbResult" }
+                        ConnectionLog.record("Native tunnel exited: $d")
+                        if (startedWithExitPin) { clearExitPin("the pinned endpoint failed"); startedWithExitPin = false; storedConfig = unpinnedStoredConfig ?: storedConfig }
+                        if (!willAutoReconnect()) sendStatus(STATUS_FAILED, d)
+                    } else if (stopRequested.get()) {
+                        if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting…")) else sendStatus(STATUS_DISCONNECTED)
+                    } else { ConnectionLog.record("Native tunnel stopped unexpectedly"); if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly") }
+                    nativeExitWasUnexpected = fbDead
+                } else {
+                    ConnectionLog.record("TunEngine ${TunEngineManager.current(this).label} → $warpListen")
                     startWatchdog()
                     val result = NativeCore.startProxy(warpJson)
-                    val diedOnItsOwn = !stopRequested.get()
-                    // Own teardown: stop the engine we started.
-                    TunEngineManager.stop(this)
-                    vpnModeActive.set(false)
-                    TunnelStatus.isNativeTunMode = false
-                    if (result != 0 && !stopRequested.get()) {
-                        val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code ${'$'}result" }
-                        ConnectionLog.record("WARP (via SOCKS) exited: ${'$'}detail")
-                        if (startedWithExitPin) {
-                            clearExitPin("the pinned endpoint failed")
-                            startedWithExitPin = false
-                            storedConfig = unpinnedStoredConfig ?: storedConfig
-                        }
-                        if (!willAutoReconnect()) sendStatus(STATUS_FAILED, detail)
-                    } else if (stopRequested.get()) {
-                        if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting\u2026"))
-                        else sendStatus(STATUS_DISCONNECTED)
-                    } else {
-                        ConnectionLog.record("WARP tunnel (via SOCKS) stopped unexpectedly")
-                        if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
+
+                // Did the tunnel end on its own, i.e. without the user asking?
+                // That is the case auto-reconnect exists for, and it has to be
+                // decided here where the exit reason is still known.
+                val diedOnItsOwn = !stopRequested.get()
+                if (result != 0 && !stopRequested.get()) {
+                    val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code $result" }
+                    ConnectionLog.record("Native tunnel exited: $detail")
+                    // A pinned endpoint that failed its handshake is a fact
+                    // about that edge, not about the preference — drop the pin
+                    // NOW, before the auto-reconnect below retries, or the
+                    // retry would re-inject the same dead peer and loop on it
+                    // forever. The retry then connects unpinned (fresh scan).
+                    if (startedWithExitPin) {
+                        clearExitPin("the pinned endpoint failed")
+                        startedWithExitPin = false
+                        // storedConfig still carries the dead pin; the retry
+                        // must fall back to the clean original.
+                        storedConfig = unpinnedStoredConfig ?: storedConfig
                     }
-                    nativeExitWasUnexpected = diedOnItsOwn
+                    if (!willAutoReconnect()) sendStatus(STATUS_FAILED, detail)
+                } else if (stopRequested.get()) {
+                    // Same as the SOCKS branch above: no DISCONNECTED under a pending
+                    // reconnect, or the UI blinks "Not connected" mid-restart.
+                    if (reconnectRequested.get()) {
+                        sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting…"))
+                    } else {
+                        sendStatus(STATUS_DISCONNECTED)
+                    }
                 } else {
-                    val addresses = NativeCore.prepare(effectiveConfig)
-                    if (addresses.organization.isNotBlank()) {
-                        ConnectionLog.record("Zero Trust organization ${addresses.organization}")
-                    }
-                    ConnectionLog.record("Creating Android VPN interface")
-                    tun = Builder()
-                        .setSession("MSN-GUARD")
-                        .setMtu(1330)
-                        .applyTunnelAddresses(addresses)
-                        .applyDns(effectiveConfig, addresses)
-                        .applyGatewayProxy(effectiveConfig, addresses)
-                        .applyLanAccess(addresses)
-                        .applyIranBypass()
-                        .applySplitTunneling()
-                        .establish() ?: error("Android could not establish the VPN interface")
-                    ConnectionLog.record("Scanning gateways for VPN")
-                    TunnelStatus.isNativeTunMode = true
-                    startWatchdog()
-                    val result = NativeCore.start(effectiveConfig, tun!!.fd)
-                    val diedOnItsOwn = !stopRequested.get()
-                    if (result != 0 && !stopRequested.get()) {
-                        val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code ${'$'}result" }
-                        ConnectionLog.record("Native tunnel exited: ${'$'}detail")
-                        if (startedWithExitPin) {
-                            clearExitPin("the pinned endpoint failed")
-                            startedWithExitPin = false
-                            storedConfig = unpinnedStoredConfig ?: storedConfig
-                        }
-                        if (!willAutoReconnect()) sendStatus(STATUS_FAILED, detail)
-                    } else if (stopRequested.get()) {
-                        if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting\u2026"))
-                        else sendStatus(STATUS_DISCONNECTED)
-                    } else {
-                        ConnectionLog.record("Native tunnel stopped unexpectedly")
-                        if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
-                    }
-                    nativeExitWasUnexpected = diedOnItsOwn
+                    ConnectionLog.record("Native tunnel stopped unexpectedly")
+                    if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
                 }
-            }
+                nativeExitWasUnexpected = diedOnItsOwn
+                }
             } catch (error: Exception) {
                 val detail = NativeCore.lastError().ifBlank { error.message ?: "Tunnel setup failed" }
                 Log.e(LOG_TAG, "Tunnel failed: $detail", error)
@@ -4741,9 +4648,6 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // would loop. Reported and left to the user.
                 nativeExitWasUnexpected = false
             } finally {
-                // WARP via SOCKS owns a TunEngine bridging TUN→SOCKS; ensure it
-                // is torn down even when startProxy throws before the inline stop.
-                try { TunEngineManager.stop(this) } catch (_: Throwable) {}
                 NativeCore.detach()
                 // The SHARD listener raised for identity provisioning has done
                 // its job by now — the core either registered through it and
