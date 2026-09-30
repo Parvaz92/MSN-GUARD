@@ -119,6 +119,12 @@ class MainActivity : Activity() {
      * purpose — the service already knows how to raise one transport, and the
      * decision of *which* to raise is exactly what this screen owns.
      */
+    // Consecutive handshook-but-empty WireGuard sessions on this device.
+    // Core cached this peer (lastconn) so every retry handshakes the same
+    // edge and the UI's own gate keeps tearing it down — from the user's
+    // side it loops forever on Verifying. After N fails, evict the cached
+    // peer so the next retry actually scans.
+    private var consecutiveFakeWireguard = 0
     private var autoScanIndex = -1
     /**
      * The transport selected before the scan started, restored if the whole ladder
@@ -1199,6 +1205,7 @@ class MainActivity : Activity() {
                     if (request != verifyRequest) return@runOnUiThread
                     if (moved) {
                         ConnectionLog.record("Tunnel is passing traffic — verified from inside the tunnel")
+                        consecutiveFakeWireguard = 0
                         showConnected()
                         // Latency is cosmetic, so a failure here must not undo a
                         // verification that already succeeded on real bytes.
@@ -1236,6 +1243,7 @@ class MainActivity : Activity() {
                 if (request != verifyRequest) return@runOnUiThread
                 if (verified != null) {
                     ConnectionLog.record("Reachability probe passed in $attempts attempt(s) — ${verified.first}")
+                    consecutiveFakeWireguard = 0
                     showConnected()
                     chipLatency.text = Strings.tf("Latency %s ms", verified.second.toInt())
                     // Second opinion, from inside the tunnel. A probe that rode
@@ -1311,6 +1319,31 @@ class MainActivity : Activity() {
         suppressNextDisconnectedPaint = true
         startService(Intent(this, MsnGuardVpnService::class.java)
             .setAction(MsnGuardVpnService.ACTION_DISCONNECT))
+        // Count consecutive handshook-but-empty failures. The core's own
+        // cooldown needs the tunnel to exit with an error; here the tunnel
+        // DID handshake and the UI tore it down, so the core never cools
+        // this peer — it will retry the same cached edge forever.
+        // After two in a row on WireGuard, evict the cached peer so the
+        // next retry scans fresh instead of re-validating the same edge.
+        if (selectedProtocol == Protocol.WIREGUARD) {
+            consecutiveFakeWireguard++
+            ConnectionLog.record("Fake WireGuard $consecutiveFakeWireguard/2 on this peer")
+            if (consecutiveFakeWireguard >= 2) {
+                consecutiveFakeWireguard = 0
+                ConnectionLog.record("Evicting cached WireGuard endpoint — will scan fresh")
+                MsnGuardVpnService.clearStaleWireguardCache(this)
+                // Do NOT advance the ladder yet: give the same rung one more
+                // try with a fresh scan before moving to MASQUE. The service
+                // already stopped; reconnect through the same protocol.
+                sessionHandler.postDelayed({
+                    if (isFinishing || isDestroyed) return@postDelayed
+                    connect(configJson())
+                }, 600)
+                return
+            }
+        } else {
+            consecutiveFakeWireguard = 0
+        }
         // A rung that handshook but carried nothing is exactly the Hamrah-e-Aval
         // WireGuard case the Auto Scan exists for, and it is the reason the ladder
         // is driven from this screen: the service thinks that session succeeded.

@@ -848,6 +848,20 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         const val EXTRA_NOTIFICATION_IP = "notification_ip"
         const val EXTRA_NOTIFICATION_PING = "notification_ping"
 
+        fun clearStaleWireguardCache(context: Context) {
+            try {
+                val base = java.io.File(context.filesDir, "aether.toml")
+                val name = base.nameWithoutExtension
+                val ext = base.extension
+                val wireguardLastconn = java.io.File(context.filesDir, "$name-lastconn.$ext")
+                if (wireguardLastconn.exists()) wireguardLastconn.delete()
+                val masqueCache = java.io.File(context.filesDir, "masque-gateway-cache.json")
+                if (masqueCache.exists()) masqueCache.delete()
+                android.util.Log.i(LOG_TAG, "evicted stale wireguard cache")
+            } catch (_: Exception) {}
+        }
+
+
         /**
          * Country the tunnel exits in, for the notification's second line.
          *
@@ -6097,21 +6111,47 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     }
 
     private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses): Builder {
-        // Keep custom resolvers (e.g. 111.88.96.50 Iranian private) OFF the TUN.
-        // TUN has 0.0.0.0/0, so anything published there routes INTO the tunnel
-        // and is asked via the tunnel egress (foreign Cloudflare edge) — unreachable
-        // for an Iran-only resolver, which stalls DNS and then the whole data plane.
-        // Custom list is still carried inside the tunnel via AETHER_DNS → socks.rs
-        // resolver_addresses, which is how the HEV/mapdns reference does it.
         val raw = JSONObject(config).optString("dns_servers").trim()
-        val hasCustom = raw.isNotEmpty()
-        val fallback = listOf("1.1.1.1", "8.8.8.8")
-        fallback.forEach { runCatching { addDnsServer(InetAddress.getByName(it)) } }
-        if (addresses.ipv6.isNotBlank()) {
-            runCatching { addDnsServer(InetAddress.getByName("2606:4700:4700::1111")) }
-            runCatching { addDnsServer(InetAddress.getByName("2001:4860:4860::8888")) }
+        val customs = ArrayList<java.net.InetAddress>()
+        val seen = HashSet<String>()
+        if (raw.isNotEmpty()) {
+            raw.split(',', ';', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() }.forEach { token ->
+                // Accept bare IP, IP:port, [v6] and [v6]:port — port is ignored for TUN.
+                var host = token.trim()
+                if (host.startsWith("[")) {
+                    host = host.substringAfter("[").substringBefore("]")
+                } else if (host.count { it == ':' } > 1 && !host.contains('.')) {
+                    // bare v6 without brackets — keep as is
+                } else if (host.contains(":")) {
+                    host = host.substringBefore(":")
+                }
+                host = host.trim().removePrefix("[").removeSuffix("]")
+                if (host.isEmpty()) return@forEach
+                try {
+                    val addr = java.net.InetAddress.getByName(host)
+                    val key = addr.hostAddress ?: host
+                    if (seen.add(key)) customs.add(addr)
+                } catch (_: Exception) {}
+            }
         }
-        ConnectionLog.record(if (hasCustom) "DNS: TUN public resolvers (custom $raw via tunnel)" else "DNS: TUN public resolvers")
+        // Device queries the TUN resolvers in order — custom first, so an
+        // Iran-only resolver (e.g. 111.88.96.50) is asked via the tunnel.
+        // Public fallback stays behind it so DNS still answers when the
+        // custom resolver is unreachable from a foreign egress.
+        customs.forEach { runCatching { addDnsServer(it) } }
+        val fallback = listOf("1.1.1.1", "8.8.8.8")
+        fallback.forEach { ip ->
+            if (customs.none { it.hostAddress == ip }) runCatching { addDnsServer(java.net.InetAddress.getByName(ip)) }
+        }
+        if (addresses.ipv6.isNotBlank()) {
+            if (customs.none { it.hostAddress == "2606:4700:4700::1111" }) runCatching { addDnsServer(java.net.InetAddress.getByName("2606:4700:4700::1111")) }
+            if (customs.none { it.hostAddress == "2001:4860:4860::8888" }) runCatching { addDnsServer(java.net.InetAddress.getByName("2001:4860:4860::8888")) }
+        }
+        if (customs.isNotEmpty()) {
+            ConnectionLog.record("DNS: custom ${customs.joinToString(", ") { it.hostAddress ?: it.toString() }} + fallback")
+        } else {
+            ConnectionLog.record("DNS: TUN public resolvers")
+        }
         return this
     }
 }
