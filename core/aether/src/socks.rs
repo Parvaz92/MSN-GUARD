@@ -863,6 +863,10 @@ async fn handle_udp_associate(
     let expected_ip = expected_udp_source(control_peer, &requested);
 
     let relay = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
+    // The relay lives on the same process that owns the TUN, so Android would
+    // otherwise route its traffic back through it. protect() is what every
+    // other outbound socket in the core gets; without it the UDP relay loops.
+    let _ = crate::platform::protect_socket(&relay);
     let relay_addr = relay.local_addr()?;
     reply_bound(&mut sock, relay_addr).await?;
 
@@ -870,6 +874,7 @@ async fn handle_udp_associate(
     let (sender, mut from_stack) = udp.into_split();
 
     let direct_relay = UdpSocket::bind("0.0.0.0:0").await?;
+    let _ = crate::platform::protect_socket(&direct_relay);
 
     let mut client: Option<SocketAddr> = None;
     let mut refused: u64 = 0;

@@ -4549,11 +4549,12 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 val warpListen = "127.0.0.1:${CoreConfig.SOCKS_PORT}"
                 val warpJson = org.json.JSONObject(effectiveConfig).apply { put("listen", warpListen) }.toString()
                 ConnectionLog.record("Creating Android VPN interface (via ${TunEngineManager.current(this).label})")
+                val activeEngine = TunEnginePref.get(this)
                 tun = Builder()
                     .setSession("MSN-GUARD")
                     .setMtu(1330)
                     .applyTunnelAddresses(addresses)
-                    .applyDns(effectiveConfig, addresses)
+                    .applyDns(effectiveConfig, addresses, activeEngine)
                     .applyGatewayProxy(effectiveConfig, addresses)
                     .applyLanAccess(addresses)
                     .applyIranBypass()
@@ -4567,7 +4568,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     try { TunEngineManager.stop(this) } catch (_: Throwable) {}
                     tun?.close(); tun = null; vpnModeActive.set(false)
                     val fbAddr = NativeCore.prepare(effectiveConfig)
-                    tun = Builder().setSession("MSN-GUARD").setMtu(1330).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
+                    tun = Builder().setSession("MSN-GUARD").setMtu(1330).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr, TunEnginePref.LEGACY).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
                     ConnectionLog.record("Scanning gateways for VPN (native fallback)")
                     TunnelStatus.isNativeTunMode = true; vpnModeActive.set(true); startWatchdog()
                     val fbResult = NativeCore.start(effectiveConfig, tun!!.fd)
@@ -6121,7 +6122,26 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             addresses.gatewayProxy.contains("172.18.")
     }
 
-    private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses): Builder {
+    /**
+     * TUN resolvers.
+     *
+     * With Hev the engine runs its own mapdns on 198.18.0.2, so that synthetic
+     * address is the ONLY resolver published on the interface — a real server
+     * listed here would be queried raw over SOCKS UDP, and an Iran-only
+     * resolver is unreachable from a foreign WARP egress, so the device would
+     * stall on it before trying anything else.
+     *
+     * Zeptun/Legacy have no mapdns: the real resolvers go on the interface and
+     * the engine forwards the UDP/53 traffic over SOCKS. Custom first, then
+     * public fallback, so DNS still answers when a custom resolver is
+     * unreachable from a foreign egress.
+     */
+    private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses, engine: String): Builder {
+        if (engine == TunEnginePref.HEV) {
+            runCatching { addDnsServer(java.net.InetAddress.getByName(HevEngine.MAP_DNS_ADDRESS)) }
+            ConnectionLog.record("DNS: engine=Hev → mapdns ${HevEngine.MAP_DNS_ADDRESS} only (custom resolvers go to the core)")
+            return this
+        }
         val raw = JSONObject(config).optString("dns_servers").trim()
         val customs = ArrayList<java.net.InetAddress>()
         val seen = HashSet<String>()

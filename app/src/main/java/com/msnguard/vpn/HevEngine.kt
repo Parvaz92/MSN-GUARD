@@ -19,6 +19,13 @@ import java.io.File
  */
 object HevEngine : TunEngine {
     override val label: String = "Hev"
+
+    /**
+     * Synthetic address Hev's mapdns answers on. The VPN Builder publishes this
+     * as the interface's only resolver, and Hev maps it back to domain names.
+     */
+    const val MAP_DNS_ADDRESS = "198.18.0.2"
+
     @Volatile private var lastConfigPath: String? = null
 
     override val isRunning: Boolean get() = try { hev.htproxy.TProxyService.TProxyIsRunning() } catch (_: Throwable) { false }
