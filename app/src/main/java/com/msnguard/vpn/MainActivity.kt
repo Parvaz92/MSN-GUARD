@@ -6247,7 +6247,7 @@ class MainActivity : Activity() {
             // entry just is not shaped the way the transport needs. Reject those
             // here, before the network call, with the reason.
             for (entry in entries) {
-                CoreConfig.validateDnsEntry("udp", entry)?.let { problem ->
+                CoreConfig.validateDnsEntry("mixed", entry)?.let { problem ->
                     field.error = "$entry: $problem"
                     return@createSettingsButton
                 }

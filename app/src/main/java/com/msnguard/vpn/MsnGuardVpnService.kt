@@ -4550,6 +4550,16 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 val warpJson = org.json.JSONObject(effectiveConfig).apply { put("listen", warpListen) }.toString()
                 ConnectionLog.record("Creating Android VPN interface (via ${TunEngineManager.current(this).label})")
                 val activeEngine = TunEnginePref.get(this)
+                // BadVPN tun2socks reaches its udpgw rendezvous (127.0.0.1:7300) by
+                // issuing a SOCKS CONNECT to it, and aether would relay that through
+                // the tunnel where nothing listens on 7300 — so DNS dies and every
+                // name-based site fails while IP-only apps (Telegram) still work.
+                // Route BadVPN through WarpUdpgwFront, which answers that CONNECT
+                // itself and relays the rest to aether (which still applies the
+                // routing rules). Zeptun and Hev use their own mapdns and never
+                // touch udpgw, so they keep talking to aether directly.
+                val legacyFrontUp = activeEngine == TunEnginePref.LEGACY && WarpUdpgwFront.start(CoreConfig.SOCKS_PORT)
+                val socksForEngine = if (legacyFrontUp) WarpUdpgwFront.LISTEN_PORT else CoreConfig.SOCKS_PORT
                 tun = Builder()
                     .setSession("MSN-GUARD")
                     .setMtu(1330)
@@ -4563,7 +4573,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 vpnModeActive.set(true)
                 TunnelStatus.isNativeTunMode = false
                 TunnelStatus.isProxyMode = false
-                if (!TunEngineManager.start(this, tun!!, CoreConfig.SOCKS_PORT, mtu = 1330)) {
+                if (!TunEngineManager.start(this, tun!!, socksForEngine, mtu = 1330)) {
                     ConnectionLog.record("TunEngine failed — falling back to native TUN")
                     try { TunEngineManager.stop(this) } catch (_: Throwable) {}
                     tun?.close(); tun = null; vpnModeActive.set(false)
@@ -4753,6 +4763,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         TorManager.stop()
         stopPsiphonTunnel()
         NativeCore.stop()
+        // The WARP path also borrows WarpUdpgwFront for BadVPN's udpgw
+        // rendezvous, so it has to come down here too — leaving it bound across
+        // a reconnect would fail the next start() with "already running" and
+        // silently drop the front again.
+        WarpUdpgwFront.stop()
         TunnelStatus.isNativeTunMode = false
         // AI Mode's Smart DNS Split runs inside the Rust core's TUN bridge, so
         // it dies with NativeCore.stop() above. No userspace DNS server here.
