@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::future::Future;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -153,7 +154,7 @@ impl TcpConn {
         self.data_in
             .send(DataIn::Tcp(self.id, data))
             .await
-            .map_err(|_| AetherError::Other("netstack closed".into()))?
+            .map_err(|_| AetherError::Other("netstack closed".into()))
     }
 
     pub async fn close(&self) {
@@ -168,22 +169,16 @@ impl TcpConn {
         id: usize,
         data: Vec<u8>,
     ) -> std::task::Poll<Result<()>> {
-        use futures::Sink;
-        use std::task::Poll;
-        // poll_ready on the Sink impl of &Sender reserves capacity and
-        // registers the waker, so returning Pending here is a real wait.
-        match Pin::new(&self.data_in).poll_ready(cx) {
-            Poll::Ready(Ok(())) => match self.data_in.try_send(DataIn::Tcp(id, data)) {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Poll::Pending,
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    Poll::Ready(Err(AetherError::Other("netstack closed".into())))
-                }
-            },
-            Poll::Ready(Err(_)) => {
-                Poll::Ready(Err(AetherError::Other("netstack closed".into())))
-            }
-            Poll::Pending => Poll::Pending,
+        // `Sender::send` registers the channel's waker while it waits for
+        // capacity, so polling it here turns Pending into a real wait instead
+        // of a busy loop.
+        let mut fut = self.data_in.send(DataIn::Tcp(id, data));
+        match Pin::new(&mut fut).poll(cx) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(
+                AetherError::Other("netstack closed".into()),
+            )),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -191,15 +186,13 @@ impl TcpConn {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        use futures::Sink;
-        use std::task::Poll;
-        match Pin::new(&self.data_in).poll_ready(cx) {
-            Poll::Ready(Ok(())) => {
-                let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
-                Poll::Ready(Ok(()))
+        let mut fut = self.data_in.send(DataIn::TcpClose(self.id));
+        match Pin::new(&mut fut).poll(cx) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Err(_)) => {
+                std::task::Poll::Ready(Err(io::Error::other("netstack closed")))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::other("netstack closed"))),
-            Poll::Pending => Poll::Pending,
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -257,20 +250,13 @@ impl TcpSender {
         cx: &mut std::task::Context<'_>,
         data: Vec<u8>,
     ) -> std::task::Poll<Result<()>> {
-        use futures::Sink;
-        use std::task::Poll;
-        match Pin::new(&self.data_in).poll_ready(cx) {
-            Poll::Ready(Ok(())) => match self.data_in.try_send(DataIn::Tcp(self.id, data)) {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Poll::Pending,
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    Poll::Ready(Err(AetherError::Other("netstack closed".into())))
-                }
-            },
-            Poll::Ready(Err(_)) => {
-                Poll::Ready(Err(AetherError::Other("netstack closed".into())))
-            }
-            Poll::Pending => Poll::Pending,
+        let mut fut = self.data_in.send(DataIn::Tcp(self.id, data));
+        match Pin::new(&mut fut).poll(cx) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(
+                AetherError::Other("netstack closed".into()),
+            )),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -278,15 +264,13 @@ impl TcpSender {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        use futures::Sink;
-        use std::task::Poll;
-        match Pin::new(&self.data_in).poll_ready(cx) {
-            Poll::Ready(Ok(())) => {
-                let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
-                Poll::Ready(Ok(()))
+        let mut fut = self.data_in.send(DataIn::TcpClose(self.id));
+        match Pin::new(&mut fut).poll(cx) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Ready(Err(_)) => {
+                std::task::Poll::Ready(Err(io::Error::other("netstack closed")))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::other("netstack closed"))),
-            Poll::Pending => Poll::Pending,
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
