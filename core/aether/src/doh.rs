@@ -56,7 +56,7 @@ impl DohServer {
             let (h, rest) = rest.split_once(']')?;
             let port = rest.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
             (h.trim(), port)
-        } else if authority.rcontains(':') && authority.matches(':').count() > 1 {
+        } else if authority.matches(':').count() > 1 {
             // bare v6 — no port
             (authority, None)
         } else {
@@ -138,7 +138,7 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
         .map_err(|e| AetherError::Other(format!("doh: send request: {e}")))?;
 
     send_stream
-        .send_data(query.into(), true)
+        .send_data(bytes::Bytes::from(query), true)
         .map_err(|e| AetherError::Other(format!("doh: send body: {e}")))?;
 
     let response = resp_fut
