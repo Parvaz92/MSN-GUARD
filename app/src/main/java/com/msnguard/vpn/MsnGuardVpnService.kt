@@ -6142,6 +6142,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             ConnectionLog.record("DNS: engine=Hev → mapdns ${HevEngine.MAP_DNS_ADDRESS} only (custom resolvers go to the core)")
             return this
         }
+        if (engine == TunEnginePref.ZEPTUN) {
+            runCatching { addDnsServer(java.net.InetAddress.getByName(HevEngine.MAP_DNS_ADDRESS)) }
+            ConnectionLog.record("DNS: engine=Zeptun → mapdns ${HevEngine.MAP_DNS_ADDRESS} only (custom resolvers go to the engine)")
+            return this
+        }
         val raw = JSONObject(config).optString("dns_servers").trim()
         val customs = ArrayList<java.net.InetAddress>()
         val seen = HashSet<String>()

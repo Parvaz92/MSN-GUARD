@@ -6,12 +6,14 @@ import android.os.ParcelFileDescriptor
  * Zeptun 1.1.1 engine.
  *
  * Takes the TUN fd + SOCKS port and builds a minimal TOML that mirrors the
- * badvpn path but leverages Zeptun's strengths:
+ * Hev path but leverages Zeptun's strengths:
  *  - userspace stack (no kernel NAT) so elastic queues + GSO work
- *  - DNS hijack + fake-ip disabled — Android's Builder already publishes the
- *    resolvers, and Zeptun will carry those UDP/53 queries via SOCKS like any
- *    other UDP. Hijack is unnecessary and would double-NAT queries already
- *    aimed at Tun2SocksManager's router address.
+ *  - DNS: hijack + fake-ip are ON. The Builder publishes only the synthetic
+ *    fake-ip resolver (HevEngine.MAP_DNS_ADDRESS), Zeptun answers it from its
+ *    own fake-ip table, and real resolvers are handed to the engine here so
+ *    it resolves the domain itself over SOCKS. Carrying a bare UDP/53 query
+ *    for an Iran-only server (e.g. 111.88.96.50) out of a foreign WARP
+ *    egress never gets an answer, which is exactly what killed UDP DNS.
  *  - protect callback is handled inside libzeptun-jni.so via
  *    VpnService.protect(int) reflection, so upstream sockets bypass the TUN
  *    without the Kotlin side having to do anything.
@@ -22,6 +24,35 @@ object ZeptunEngine : TunEngine {
     @Volatile private var lastToml: String = ""
 
     override val isRunning: Boolean get() = running
+
+    /**
+     * Custom resolvers the user set (dns_servers preference), followed by the
+     * public fallbacks the TUN had before. Same parsing rules as
+     * MsnGuardVpnService.applyDns so one field works everywhere.
+     */
+    private fun customResolverList(): List<String> {
+        val raw = runCatching { AppContext.get()!!.profiled().getString("dns_servers", null)?.trim().orEmpty() }
+            .getOrDefault("")
+        val out = ArrayList<String>()
+        if (raw.isNotEmpty()) {
+            raw.split(',', ';', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() }.forEach { token ->
+                var host = token
+                if (host.startsWith("[")) {
+                    host = host.substringAfter("[").substringBefore("]")
+                } else if (host.count { it == ':' } > 1 && !host.contains('.')) {
+                    // bare v6 without brackets — keep as is
+                } else if (host.contains(":")) {
+                    host = host.substringBefore(":")
+                }
+                host = host.trim().removePrefix("[").removeSuffix("]")
+                if (host.isNotEmpty() && host !in out) out.add(host)
+            }
+        }
+        for (fallback in listOf("1.1.1.1", "8.8.8.8")) {
+            if (fallback !in out) out.add(fallback)
+        }
+        return out
+    }
 
     override fun start(fd: ParcelFileDescriptor, socksPort: Int, mtu: Int, dnsOnly: Boolean): Boolean {
         if (running) return true
@@ -34,6 +65,13 @@ object ZeptunEngine : TunEngine {
             try { dup.close() } catch (_: Exception) {}
             return false
         }
+
+        // Custom resolvers the user set, to the engine. Zeptun's [dns].upstream
+        // takes ONE address, so the first custom entry wins (that is the
+        // Iran-only server the user actually wants). If none is set, the public
+        // fallback is used so resolution still works.
+        val upstream = customResolverList().firstOrNull() ?: "1.1.1.1"
+        ConnectionLog.record("Zeptun DNS upstream=$upstream (hijack+fake_ip, range 198.18.0.0/15)")
 
         // Minimal TOML: device is the supplied fd, stack is userspace,
         // handler is socks5 at 127.0.0.1:port. auto_route is OFF because the
@@ -58,6 +96,19 @@ object ZeptunEngine : TunEngine {
             appendLine("udp = true")
             appendLine("icmp = \"auto\"")
             appendLine()
+            // DNS: hijack + fake-ip. The Builder publishes only the synthetic
+            // fake-ip resolver (198.18.0.2, inside Zeptun's default
+            // 198.18.0.0/15 fake range), Zeptun answers it from its own
+            // fake-ip table, and the real resolver is named here so the engine
+            // resolves the domain itself over SOCKS. A bare UDP/53 query for an
+            // Iran-only server (e.g. 111.88.96.50) leaving a foreign WARP
+            // egress never gets an answer — that is what killed UDP DNS.
+            appendLine("[dns]")
+            appendLine("hijack = true")
+            appendLine("fake_ip = true")
+            appendLine("upstream = \"$upstream\"")
+            appendLine("cache_size = 10000")
+            appendLine()
             appendLine("[handler]")
             appendLine("kind = \"socks5\"")
             appendLine()
@@ -70,10 +121,6 @@ object ZeptunEngine : TunEngine {
             appendLine()
             appendLine("[route]")
             appendLine("auto_route = false")
-            appendLine()
-            appendLine("[dns]")
-            appendLine("hijack = false")
-            appendLine("fake_ip = false")
         }
         lastToml = toml
         return try {
