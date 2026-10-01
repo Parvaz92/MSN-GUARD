@@ -6152,6 +6152,16 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         val seen = HashSet<String>()
         if (raw.isNotEmpty()) {
             raw.split(',', ';', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() }.forEach { token ->
+                // Encrypted entries are meaningless to Android's TUN resolver: it
+                // speaks plain UDP/53 and cannot parse a scheme. They are handled
+                // by the core, so skip them here rather than feeding "tls" to
+                // InetAddress.getByName and silently dropping the entry.
+                val loweredToken = token.lowercase()
+                if (loweredToken.startsWith("tls://") || loweredToken.startsWith("dot://") ||
+                    loweredToken.startsWith("https://") || loweredToken.startsWith("doh:")
+                ) {
+                    return@forEach
+                }
                 // Accept bare IP, IP:port, [v6] and [v6]:port — port is ignored for TUN.
                 var host = token.trim()
                 if (host.startsWith("[")) {

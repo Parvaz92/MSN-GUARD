@@ -6034,8 +6034,8 @@ class MainActivity : Activity() {
         val fields = mutableMapOf<String, EditText>()
 
         addDnsField(content, Strings.t("DNS"), CUSTOM_DNS,
-            Strings.t("Bare IP addresses, optionally with a port. The default port is 53."),
-            Strings.t("1.1.1.1, 10.202.10.202:53")) { fields[CUSTOM_DNS] = it }
+            Strings.t("IP (default port 53), or tls://IP (DoT, 853), or https://IP/path (DoH, 443)."),
+            Strings.t("1.1.1.1, tls://1.1.1.1, https://1.1.1.1/dns-query")) { fields[CUSTOM_DNS] = it }
 
         content.addView(createSettingsButton(Strings.t("Save")) {
             // Commit the typed text before anything else reads it.
@@ -6045,7 +6045,7 @@ class MainActivity : Activity() {
                 val entries = raw.split(',', ';', ' ', '\n')
                     .map(String::trim).filter(String::isNotEmpty).distinct()
                 for (entry in entries) {
-                    CoreConfig.validateDnsEntry("udp", entry)?.let { problem ->
+                    CoreConfig.validateDnsEntry("mixed", entry)?.let { problem ->
                         field.error = "$entry: $problem"
                         return@createSettingsButton
                     }

@@ -36,6 +36,17 @@ object ZeptunEngine : TunEngine {
         val out = ArrayList<String>()
         if (raw.isNotEmpty()) {
             raw.split(',', ';', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() }.forEach { token ->
+                // Encrypted entries (tls://, dot://, https://) are passed
+                // through untouched: the scheme is what the core keys on and
+                // the port belongs to it (853/443), so stripping it would
+                // corrupt the entry. Plain entries keep the old host-only
+                // normalisation below.
+                if (token.startsWith("tls://") || token.startsWith("dot://") ||
+                    token.startsWith("https://")
+                ) {
+                    if (token !in out) out.add(token)
+                    return@forEach
+                }
                 var host = token
                 if (host.startsWith("[")) {
                     host = host.substringAfter("[").substringBefore("]")

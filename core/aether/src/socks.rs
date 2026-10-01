@@ -335,6 +335,57 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
 }
 
 pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
+    // DNS-over-TLS (tls://) and DNS-over-HTTPS (https://) are handled by their
+    // own modules. They are tried first because they are the user's explicit
+    // choice; a failure falls through to the plain UDP resolvers below, so
+    // adding either can never break the plain path.
+    //
+    // Each attempt is bounded: a custom resolver is often reachable only from
+    // an Iranian egress, and from a foreign one the TCP connect would otherwise
+    // hang until the stack's own timeout — on every lookup, since this runs per
+    // connection. The bound is short enough to fall through to UDP quickly,
+    // long enough for a real handshake on a warm connection.
+    let timeout = std::time::Duration::from_millis(4000);
+
+    // A server that just failed is unlikely to recover in the next few
+    // seconds, and this resolver runs on every single connection — without a
+    // cooldown, one unreachable DoT server would add its full timeout to the
+    // startup of every app the user opens. Back off hard for a while, then try
+    // again. The plain UDP path is unaffected.
+    for server in dot::dot_servers() {
+        if dot::is_backing_off(&server) {
+            continue;
+        }
+        match tokio::time::timeout(timeout, dot::resolve_a(stack, &server, name)).await {
+            Ok(Ok(ip)) => return Ok(ip),
+            Ok(Err(e)) => {
+                log::debug!("dot {name} via {} failed: {e}", server.addr);
+                dot::mark_failure(&server);
+            }
+            Err(_) => {
+                log::debug!("dot {name} via {} timed out", server.addr);
+                dot::mark_failure(&server);
+            }
+        }
+    }
+
+    for server in doh::doh_servers() {
+        if doh::is_backing_off(&server) {
+            continue;
+        }
+        match tokio::time::timeout(timeout, doh::resolve_a(stack, &server, name)).await {
+            Ok(Ok(ip)) => return Ok(ip),
+            Ok(Err(e)) => {
+                log::debug!("doh {name} via {} failed: {e}", server.host);
+                doh::mark_failure(&server);
+            }
+            Err(_) => {
+                log::debug!("doh {name} via {} timed out", server.host);
+                doh::mark_failure(&server);
+            }
+        }
+    }
+
     let udp = stack.open_udp().await?;
     let (sender, mut from_stack) = udp.into_split();
     let outcome = dns_exchange(&sender, &mut from_stack, name).await;
@@ -349,6 +400,16 @@ pub(crate) fn resolver_addresses() -> Vec<SocketAddr> {
     for token in configured.split([',', ' ', ';']) {
         let entry = token.trim();
         if entry.is_empty() {
+            continue;
+        }
+        // tls:// and https:// entries are DoT/DoH and are handled by their own
+        // modules; they are not SocketAddr-shaped, so they would be dropped
+        // here anyway. Skip them explicitly so such an entry is not a silent
+        // no-op.
+        if entry.starts_with("tls://")
+            || entry.starts_with("dot://")
+            || entry.starts_with("https://")
+        {
             continue;
         }
         let parsed = entry.parse::<SocketAddr>().ok().or_else(|| {
@@ -427,7 +488,7 @@ async fn dns_exchange(
     Err(last)
 }
 
-const QTYPE_A: u16 = 1;
+pub(crate) const QTYPE_A: u16 = 1;
 
 fn build_dns_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     let mut q = Vec::with_capacity(32 + name.len());
@@ -497,6 +558,28 @@ pub(crate) fn dns_response_matches(
         return false;
     }
     u16::from_be_bytes([resp[pos], resp[pos + 1]]) == expected_qtype
+}
+
+// ── DoT wrappers ──
+// dns.rs's dot module reuses these three; they are byte-for-byte the same code
+// as the private versions above, so the DoT path and the UDP path can never
+// drift in how they build or read a query.
+
+pub(crate) fn build_dns_query_public(name: &str, qtype: u16) -> (Vec<u8>, u16) {
+    build_dns_query(name, qtype)
+}
+
+pub(crate) fn dns_response_matches_public(
+    resp: &[u8],
+    expected_id: u16,
+    expected_name: &str,
+    expected_qtype: u16,
+) -> bool {
+    dns_response_matches(resp, expected_id, expected_name, expected_qtype)
+}
+
+pub(crate) fn parse_dns_a_public(resp: &[u8]) -> Option<IpAddr> {
+    parse_dns_a(resp)
 }
 
 fn parse_dns_a(resp: &[u8]) -> Option<IpAddr> {

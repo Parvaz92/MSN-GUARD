@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -151,11 +152,65 @@ impl TcpConn {
         self.data_in
             .send(DataIn::Tcp(self.id, data))
             .await
-            .map_err(|_| AetherError::Other("netstack closed".into()))
+            .map_err(|_| AetherError::Other("netstack closed".into()))?
     }
 
     pub async fn close(&self) {
         let _ = self.data_in.send(DataIn::TcpClose(self.id)).await;
+    }
+
+    /// Send a chunk without awaiting — for the AsyncWrite adapter, which must
+    /// drive the channel from a poll context.
+    pub fn poll_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        id: usize,
+        data: Vec<u8>,
+    ) -> std::task::Poll<Result<()>> {
+        use std::task::Poll;
+        match self.data_in.poll_ready(cx) {
+            Poll::Ready(Ok(())) => match self.data_in.try_send(DataIn::Tcp(id, data)) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Poll::Pending,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Poll::Ready(Err(AetherError::Other("netstack closed".into())))
+                }
+            },
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(AetherError::Other("netstack closed".into())))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub fn poll_close(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        match self.data_in.poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::other("netstack closed"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn take_inbound(&mut self) -> mpsc::Receiver<Vec<u8>> {
+        std::mem::replace(&mut self.from_stack, mpsc::channel(1).1)
+    }
+
+    /// Non-blocking close, for use in Drop. Returns Full when the channel is
+    /// saturated (the stack will still tear the connection down) and Closed
+    /// when the stack is already gone.
+    pub fn try_send_close(&self) -> std::result::Result<(), tokio::sync::mpsc::error::TrySendError<DataIn>> {
+        self.data_in.try_send(DataIn::TcpClose(self.id))
     }
 
     pub fn into_split(self) -> (TcpSender, mpsc::Receiver<Vec<u8>>) {
@@ -175,6 +230,10 @@ pub struct TcpSender {
 }
 
 impl TcpSender {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
         self.data_in
             .send(DataIn::Tcp(self.id, data))
@@ -184,6 +243,53 @@ impl TcpSender {
 
     pub async fn close(&self) {
         let _ = self.data_in.send(DataIn::TcpClose(self.id)).await;
+    }
+
+    /// Send a chunk without awaiting — for the AsyncWrite adapter, which must
+    /// drive the channel from a poll context.
+    pub fn poll_send(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        data: Vec<u8>,
+    ) -> std::task::Poll<Result<()>> {
+        use std::task::Poll;
+        match self.data_in.poll_ready(cx) {
+            Poll::Ready(Ok(())) => match self.data_in.try_send(DataIn::Tcp(self.id, data)) {
+                Ok(()) => Poll::Ready(Ok(())),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Poll::Pending,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Poll::Ready(Err(AetherError::Other("netstack closed".into())))
+                }
+            },
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(AetherError::Other("netstack closed".into())))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub fn poll_close(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        match self.data_in.poll_ready(cx) {
+            Poll::Ready(Ok(())) => {
+                let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::other("netstack closed"))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Non-blocking close, for use in Drop. Returns Full when the channel is
+    /// saturated (the stack will still tear the connection down) and Closed
+    /// when the stack is already gone.
+    pub fn try_send_close(
+        &self,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::TrySendError<DataIn>> {
+        self.data_in.try_send(DataIn::TcpClose(self.id))
     }
 }
 

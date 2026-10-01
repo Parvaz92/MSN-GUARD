@@ -478,6 +478,33 @@ object CoreConfig {
                     if (!isValidDnsHost(host)) return "\"$host\" is not an IP or hostname"
                 }
             }
+            "mixed" -> {
+                // The combined field the DNS page shows: plain UDP, DoT and DoH
+                // entries side by side. Each entry is validated by the rules of
+                // its own transport, so a tls:// entry is checked as DoT and a
+                // bare IP as UDP — rather than being rejected outright, which
+                // is what the plain-UDP branch does to a prefixed entry.
+                val lowered = raw.lowercase()
+                when {
+                    lowered.startsWith("tls://") || lowered.startsWith("dot://") -> {
+                        val body = raw.substring(lowered.indexOf("//") + 2)
+                        val (host, port) = splitDnsHostPort(body, 853)
+                        if (!isValidDnsHost(host)) return "\"$host\" is not an IP or hostname"
+                        if (port !in 1..65535) return "port $port is out of range"
+                    }
+                    lowered.startsWith("https://") -> {
+                        val after = raw.substring(8)
+                        val hostPart = after.substringBefore('/').substringBefore('?')
+                        val host = hostPortHost(hostPart)
+                        if (!isValidDnsHost(host)) return "\"$host\" is not an IP or hostname"
+                    }
+                    else -> {
+                        val (host, port) = splitDnsHostPort(raw, 53)
+                        if (!isValidDnsHost(host)) return "\"$host\" is not an IP or hostname"
+                        if (port !in 1..65535) return "port $port is out of range"
+                    }
+                }
+            }
             else -> {
                 // Plain UDP speaks neither prefix. A tls:// entry here is silently
                 // handed to Android's resolver, which cannot parse it and drops

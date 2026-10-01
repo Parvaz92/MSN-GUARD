@@ -63,3 +63,4 @@ keystore.jks
 keystore.env
 *.env
 make-release.py
+gh_2.62.0_linux_amd64/

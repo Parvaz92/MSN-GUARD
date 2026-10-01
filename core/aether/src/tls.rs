@@ -238,3 +238,87 @@ pub fn decode_ech_config_list(b64: &str) -> Result<Vec<u8>> {
         .decode(b64.trim())
         .map_err(|e| AetherError::Ech(e.to_string()))
 }
+
+/// Run a DNS-over-TLS (RFC 7858) handshake over an arbitrary async stream.
+///
+/// The stream comes from the tunnel's userspace stack, so the resolver is
+/// reached through the tunnel egress — not through a protected socket that
+/// would bypass it. Verification is deliberately lenient: the plain UDP path
+/// has no authentication either, the address came from the user's own config,
+/// and a strict chain check against a resolver presenting an unrelated cert
+/// would turn a working resolver into a hard failure.
+pub async fn connect_dot<S>(sni: &str, stream: S) -> Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut builder =
+        boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
+            .map_err(|e| AetherError::Tls(e.to_string()))?;
+
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+
+    // GREASE keeps the ClientHello looking like a normal browser's, which
+    // matters on the same networks the tunnel itself is trying to blend into.
+    builder.set_grease_enabled(true);
+
+    // Verification is deliberately lenient: the plain UDP path has no
+    // authentication either, the address came from the user's own config, and
+    // a strict chain check against a resolver presenting an unrelated cert
+    // would turn a working resolver into a hard failure. This has to be set on
+    // the context builder — ConnectConfiguration only has set_verify_hostname,
+    // and boring keeps chain verification on unless the mode is cleared here.
+    builder.set_verify(SslVerifyMode::NONE);
+
+    let connector = builder.build();
+    let mut config = connector
+        .configure()
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+
+    config.set_verify_hostname(false);
+    config.set_use_server_name_indication(true);
+
+    tokio_boring::connect(config, sni, stream)
+        .await
+        .map_err(|e| AetherError::Tls(format!("dot handshake with {sni}: {e}")))
+}
+
+/// TLS handshake for DNS-over-HTTPS. Identical to DoT except it negotiates
+/// HTTP/2 (RFC 9113 requires ALPN for a conforming h2 client) — the h2 client
+/// layered on top refuses to speak without it.
+pub async fn connect_doh<S>(host: &str, stream: S) -> Result<tokio_boring::SslStream<S>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut builder =
+        boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
+            .map_err(|e| AetherError::Tls(e.to_string()))?;
+
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    builder.set_grease_enabled(true);
+    // h2: ALPN is mandatory, advertise it in the ClientHello.
+    builder
+        .set_alpn_protos(b"\x02h2")
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    builder.set_verify(SslVerifyMode::NONE);
+
+    let connector = builder.build();
+    let mut config = connector
+        .configure()
+        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    config.set_verify_hostname(false);
+    config.set_use_server_name_indication(true);
+
+    tokio_boring::connect(config, host, stream)
+        .await
+        .map_err(|e| AetherError::Tls(format!("doh handshake with {host}: {e}")))
+}
