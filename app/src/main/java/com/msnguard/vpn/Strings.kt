@@ -608,6 +608,7 @@ object Strings {
         "Sanctioned sites often open on some countries' exits and not others" to Triple("Sanctioned sites often open on some countries' exits and not others", "سایت‌های تحریمی اغلب روی خروجی بعضی کشورها باز می‌شوند و بعضی نه", "受制裁网站通常只在部分国家的出口可用"),
         "Preferred exit country cleared — the edge chooses" to Triple("Preferred exit country cleared — the edge chooses", "ترجیح کشور خروجی پاک شد — لبه انتخاب می‌کند", "已清除首选出口国家 — 由边缘节点决定"),
         "Custom DNS" to Triple("Custom DNS", "DNS سفارشی", "自定义 DNS"),
+        "Custom DNS needs the Zeptun or Hev Tun2Socks engine. Change the TUN engine first." to Triple("Custom DNS needs the Zeptun or Hev Tun2Socks engine. Change the TUN engine first.", "DNS سفارشی فقط با موتور Zeptun یا Hev Tun2Socks کار می‌کند. اول موتور TUN را عوض کن.", "自定义 DNS 需要使用 Zeptun 或 Hev Tun2Socks 引擎。请先切换 TUN 引擎。"),
         "Resolvers the tunnel answers DNS from, comma-separated. Plain UDP; leave blank for automatic." to Triple("Resolvers the tunnel answers DNS from, comma-separated. Plain UDP; leave blank for automatic.", "سرورهایی که تونل DNS را از آن‌ها می‌گیرد، با کاما جدا کنید. UDP ساده؛ خالی = خودکار.", "隧道 DNS 解析来源，逗号分隔。纯 UDP；留空为自动。"),
         "Custom DNS cleared — the default resolvers answer" to Triple("Custom DNS cleared — the default resolvers answer", "DNS سفارشی پاک شد — resolverهای پیش‌فرض جواب می‌دهند", "已清除自定义 DNS — 使用默认解析器"),
         "Real fetch test" to Triple("Real fetch test", "تست باز کردن واقعی", "真实抓取测试"),

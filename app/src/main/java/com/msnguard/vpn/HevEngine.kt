@@ -18,7 +18,7 @@ import java.io.File
  * synthetic 198.18.0.2 address; everything else is plain SOCKS UDP.
  */
 object HevEngine : TunEngine {
-    override val label: String = "Hev"
+    override val label: String = "Hev Tun2Socks"
 
     /**
      * Synthetic address Hev's mapdns answers on. The VPN Builder publishes this

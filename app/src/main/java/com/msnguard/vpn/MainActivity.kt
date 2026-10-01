@@ -3933,8 +3933,16 @@ class MainActivity : Activity() {
             ).apply { topMargin = dp(9) })
             // v2.0.0: the AI Mode row is gone.
             dnsRow = navRow(Strings.t("Custom DNS"), customDnsLabel()) {
-                openDnsScreen()
+                if (!dnsEngineSupported()) {
+                    toastShort(Strings.t("Custom DNS needs the Zeptun or Hev Tun2Socks engine. Change the TUN engine first."))
+                } else {
+                    openDnsScreen()
+                }
             }
+            // Custom DNS only functions on the fake-ip engines. On BadVPN the
+            // resolver goes on the TUN as a bare IP and an Iran-only server can
+            // never answer from a foreign egress, so the row is inert there.
+            dnsRow!!.setDisabledAppearance(!dnsEngineSupported())
             body.addView(dnsRow!!, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(9) })
@@ -5021,6 +5029,17 @@ class MainActivity : Activity() {
     /** Label for the TUN engine row. */
     private fun tunEngineLabel(): String = TunEnginePref.label(TunEnginePref.get(this), this)
 
+    /**
+     * Custom DNS only works on the engines that own a fake-ip table — Zeptun
+     * and Hev. On BadVPN the resolver is published on the TUN as a bare IP and
+     * an Iran-only server cannot answer from a foreign egress, so the editor
+     * is locked there.
+     */
+    private fun dnsEngineSupported(): Boolean = when (TunEnginePref.get(this)) {
+        TunEnginePref.ZEPTUN, TunEnginePref.HEV -> true
+        else -> false
+    }
+
     private fun chooseTunEngine() {
         if (TunnelStatus.isActive()) {
             toastShort(Strings.t("Disconnect first to change the TUN engine"))
@@ -5037,6 +5056,9 @@ class MainActivity : Activity() {
         ) { chosen ->
             preferences().edit().putString(TunEnginePref.KEY, chosen).apply()
             tunEngineRow?.setValue(tunEngineLabel())
+            // The DNS editor is engine-gated, so its row has to follow the
+            // engine here or it stays greyed-out/enabled from the old value.
+            dnsRow?.setDisabledAppearance(!dnsEngineSupported())
             ConnectionLog.record("TUN engine set to " + TunEnginePref.label(chosen, this) + " \u2014 applies on the next connect")
             toastShort(Strings.t("TUN engine will apply on the next connect"))
         }

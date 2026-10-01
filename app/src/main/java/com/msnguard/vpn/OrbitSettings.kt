@@ -192,6 +192,18 @@ class OrbitSettingsRow(
         setOnClickListener { onClick() }
     }
 
+    /**
+     * Greyed-out row. Used for settings that only apply under a specific TUN
+     * engine: the click listener is kept (the user still needs to be told WHY
+     * it is inert), so this only changes the look — pass the explanation toast
+     * in the listener itself.
+     */
+    fun setDisabledAppearance(disabled: Boolean) {
+        alpha = if (disabled) 0.45f else 1f
+        titleView.alpha = if (disabled) 0.65f else 1f
+        valueView.alpha = if (disabled) 0.65f else 1f
+    }
+
     /** Presses sink inward: the highlight and shadow swap places. */
     override fun setPressed(pressed: Boolean) {
         super.setPressed(pressed)

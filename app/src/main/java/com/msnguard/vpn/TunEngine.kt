@@ -34,13 +34,13 @@ object TunEnginePref {
     }
     fun label(key: String, ctx: Context): String = when (key) {
         ZEPTUN -> "Zeptun"
-        HEV    -> "Hev"
-        else   -> "Legacy"
+        HEV    -> "Hev Tun2Socks"
+        else   -> "BadVPN Tun2Socks"
     }
     fun description(key: String): String = when (key) {
-        ZEPTUN -> "Zeptun 1.1.1 — io_uring/GSO, DNS hijack"
-        HEV    -> "Hev — mapdns 198.18.0.2"
-        else   -> "badvpn tun2socks — udpgw"
+        ZEPTUN -> "High speed & low latency · Next-gen kernel engine"
+        HEV    -> "Lightweight & stable · Low battery consumption"
+        else   -> "High compatibility · Best for older Android versions"
     }
 }
 
