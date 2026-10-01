@@ -172,8 +172,8 @@ impl TcpConn {
         // `Sender::send` registers the channel's waker while it waits for
         // capacity, so polling it here turns Pending into a real wait instead
         // of a busy loop.
-        let mut fut = self.data_in.send(DataIn::Tcp(id, data));
-        match Pin::new(&mut fut).poll(cx) {
+        let mut fut = Box::pin(self.data_in.send(DataIn::Tcp(id, data)));
+        match fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(
                 AetherError::Other("netstack closed".into()),
@@ -186,8 +186,8 @@ impl TcpConn {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        let mut fut = self.data_in.send(DataIn::TcpClose(self.id));
-        match Pin::new(&mut fut).poll(cx) {
+        let mut fut = Box::pin(self.data_in.send(DataIn::TcpClose(self.id)));
+        match fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Ready(Err(_)) => {
                 std::task::Poll::Ready(Err(io::Error::other("netstack closed")))
@@ -250,8 +250,8 @@ impl TcpSender {
         cx: &mut std::task::Context<'_>,
         data: Vec<u8>,
     ) -> std::task::Poll<Result<()>> {
-        let mut fut = self.data_in.send(DataIn::Tcp(self.id, data));
-        match Pin::new(&mut fut).poll(cx) {
+        let mut fut = Box::pin(self.data_in.send(DataIn::Tcp(self.id, data)));
+        match fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(
                 AetherError::Other("netstack closed".into()),
@@ -264,8 +264,8 @@ impl TcpSender {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        let mut fut = self.data_in.send(DataIn::TcpClose(self.id));
-        match Pin::new(&mut fut).poll(cx) {
+        let mut fut = Box::pin(self.data_in.send(DataIn::TcpClose(self.id)));
+        match fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
             std::task::Poll::Ready(Err(_)) => {
                 std::task::Poll::Ready(Err(io::Error::other("netstack closed")))

@@ -352,36 +352,36 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
     // cooldown, one unreachable DoT server would add its full timeout to the
     // startup of every app the user opens. Back off hard for a while, then try
     // again. The plain UDP path is unaffected.
-    for server in dot::dot_servers() {
-        if dot::is_backing_off(&server) {
+    for server in crate::dot::dot_servers() {
+        if crate::dot::is_backing_off(&server) {
             continue;
         }
-        match tokio::time::timeout(timeout, dot::resolve_a(stack, &server, name)).await {
+        match tokio::time::timeout(timeout, crate::dot::resolve_a(stack, &server, name)).await {
             Ok(Ok(ip)) => return Ok(ip),
             Ok(Err(e)) => {
                 log::debug!("dot {name} via {} failed: {e}", server.addr);
-                dot::mark_failure(&server);
+                crate::dot::mark_failure(&server);
             }
             Err(_) => {
                 log::debug!("dot {name} via {} timed out", server.addr);
-                dot::mark_failure(&server);
+                crate::dot::mark_failure(&server);
             }
         }
     }
 
-    for server in doh::doh_servers() {
-        if doh::is_backing_off(&server) {
+    for server in crate::doh::doh_servers() {
+        if crate::doh::is_backing_off(&server) {
             continue;
         }
-        match tokio::time::timeout(timeout, doh::resolve_a(stack, &server, name)).await {
+        match tokio::time::timeout(timeout, crate::doh::resolve_a(stack, &server, name)).await {
             Ok(Ok(ip)) => return Ok(ip),
             Ok(Err(e)) => {
                 log::debug!("doh {name} via {} failed: {e}", server.host);
-                doh::mark_failure(&server);
+                crate::doh::mark_failure(&server);
             }
             Err(_) => {
                 log::debug!("doh {name} via {} timed out", server.host);
-                doh::mark_failure(&server);
+                crate::doh::mark_failure(&server);
             }
         }
     }
