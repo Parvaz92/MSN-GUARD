@@ -372,7 +372,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
     // 30s cooldown and the user sees "sites did not load at first, then they
     // did". Give DoH the time the protocol actually needs.
     let dot_timeout = std::time::Duration::from_millis(4000);
-    let doh_timeout = std::time::Duration::from_millis(9000);
+    let doh_timeout = std::time::Duration::from_millis(18000);
 
     // A server that just failed is unlikely to recover in the next few
     // seconds, and this resolver runs on every single connection — without a
@@ -406,7 +406,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
 
     for server in crate::doh::doh_servers() {
         if crate::doh::is_backing_off(&server) {
-            log::info!("doh {name} skipped {} (cooldown)", server.host);
+            log::warn!("doh {name} skipped {} (cooldown)", server.host);
             continue;
         }
         // Cache first: without this the device pays UDP (hostname) + TCP +
@@ -519,12 +519,10 @@ pub(crate) async fn dns_exchange_doh_hostname(
     host: &str,
 ) -> Result<IpAddr> {
     // A hostname DoH resolver lives at the domain itself (cloudflare-dns.com, …).
-    // On a 5 s RTT edge every round trip costs, so the normal 1.8 s budget
-    // times out a resolver that is perfectly reachable — the failure then
-    // lands DoH in a 30 s cooldown and every name silently falls through to
-    // plain UDP. The DoH budget is already 9 s for this reason; its hostname
-    // step needs room too, matching the outer timeout so the two agree.
-    dns_exchange_with(sender, from_stack, host, Duration::from_millis(8500)).await
+    // Keep its UDP-hostname budget clearly under the outer DoH timeout so the
+    // DoH stack handshake (TCP+TLS+h2) still has time after this resolves.
+    // DoH's outer timeout is 9 s; leave it room.
+    dns_exchange_with(sender, from_stack, host, Duration::from_millis(5000)).await
 }
 
 pub(crate) async fn dns_exchange_with(

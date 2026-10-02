@@ -105,7 +105,27 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
         // Hostname DoH entry (e.g. https://cloudflare-dns.com/dns-query).
         // Resolve it via the tunnel's UDP path first — same mechanism DoT uses,
         // same egress, and the only way the hostname is reachable at all.
-        let ip = resolve_doh_hostname_via_udp(stack, &server.host).await?;
+        let before_hostname = std::time::Instant::now();
+        let ip = match resolve_doh_hostname_via_udp(stack, &server.host).await {
+            Ok(ip) => {
+                let ms = before_hostname.elapsed().as_millis();
+                if ms > 1500 {
+                    log::info!(
+                        "doh: hostname {} → {ip} ({ms}ms) — resolving {name}",
+                        server.host
+                    );
+                }
+                ip
+            }
+            Err(e) => {
+                log::warn!(
+                    "doh: hostname {} failed ({ms}ms): {e} — resolving {name}",
+                    server.host,
+                    ms = before_hostname.elapsed().as_millis()
+                );
+                return Err(e);
+            }
+        };
         std::net::SocketAddr::new(ip, server.addr.port())
     } else {
         server.addr
