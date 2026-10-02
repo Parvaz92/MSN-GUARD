@@ -335,6 +335,24 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
 }
 
 pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
+    // Announce the resolver set once per process so a log that shows no
+    // `doh …` or `dot …` lines is unambiguous: either no encrypted resolver
+    // was configured, or it was configured but never got a lookup. Without
+    // this the two are indistinguishable from the app log alone.
+    use std::sync::OnceLock;
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    if ANNOUNCED.set(()).is_ok() {
+        let dots = crate::dot::dot_servers();
+        let dohs = crate::doh::doh_servers();
+        if !dots.is_empty() || !dohs.is_empty() {
+            log::info!(
+                "resolvers: {} doh, {} dot configured",
+                dohs.len(),
+                dots.len()
+            );
+        }
+    }
+
     // DNS-over-TLS (tls://) and DNS-over-HTTPS (https://) are handled by their
     // own modules. They are tried first because they are the user's explicit
     // choice; a failure falls through to the plain UDP resolvers below, so
@@ -388,6 +406,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
 
     for server in crate::doh::doh_servers() {
         if crate::doh::is_backing_off(&server) {
+            log::info!("doh {name} skipped {} (cooldown)", server.host);
             continue;
         }
         // Cache first: without this the device pays UDP (hostname) + TCP +
@@ -491,6 +510,29 @@ pub(crate) async fn dns_exchange_public(
     from_stack: &mut mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     name: &str,
 ) -> Result<IpAddr> {
+    dns_exchange_with(sender, from_stack, name, Duration::from_millis(1800)).await
+}
+
+pub(crate) async fn dns_exchange_doh_hostname(
+    sender: &UdpSender,
+    from_stack: &mut mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    host: &str,
+) -> Result<IpAddr> {
+    // A hostname DoH resolver lives at the domain itself (cloudflare-dns.com, …).
+    // On a 5 s RTT edge every round trip costs, so the normal 1.8 s budget
+    // times out a resolver that is perfectly reachable — the failure then
+    // lands DoH in a 30 s cooldown and every name silently falls through to
+    // plain UDP. The DoH budget is already 9 s for this reason; its hostname
+    // step needs room too, matching the outer timeout so the two agree.
+    dns_exchange_with(sender, from_stack, host, Duration::from_millis(8500)).await
+}
+
+pub(crate) async fn dns_exchange_with(
+    sender: &UdpSender,
+    from_stack: &mut mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+    name: &str,
+    per_server_timeout: Duration,
+) -> Result<IpAddr> {
     let mut last = AetherError::Other("dns timeout".into());
 
     for server in resolver_addresses() {
@@ -500,7 +542,7 @@ pub(crate) async fn dns_exchange_public(
             continue;
         }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(1800);
+        let deadline = tokio::time::Instant::now() + per_server_timeout;
 
         loop {
             let resp = match tokio::time::timeout_at(deadline, from_stack.recv()).await {

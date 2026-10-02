@@ -226,7 +226,7 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
 async fn resolve_doh_hostname_via_udp(stack: &StackHandle, host: &str) -> Result<std::net::IpAddr> {
     let udp = stack.open_udp().await?;
     let (sender, mut rx) = udp.into_split();
-    let r = crate::socks::dns_exchange_public(&sender, &mut rx, host).await;
+    let r = crate::socks::dns_exchange_doh_hostname(&sender, &mut rx, host).await;
     sender.close().await;
     r
 }
