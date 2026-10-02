@@ -162,7 +162,7 @@ object WarpUdpgwFront {
     @Synchronized
     fun stop() {
         if (!running.getAndSet(false)) return
-        associations.values.forEach { it.close() }
+        associations.values.forEach { closeQuietly(it.udp) }
         associations.clear()
         closeQuietly(serverSocket)
         serverSocket = null
@@ -362,19 +362,21 @@ object WarpUdpgwFront {
 
     // ----------------------------------------------------------------- udpgw
 
-    private data class Association(
+    private class Association(
         val udp: DatagramSocket,
         val relayHost: InetAddress,
         val relayPort: Int,
-        @Volatile var lastUsed: Long,
-    )
+        lastUsed: Long,
+    ) {
+        val lastUsed = java.util.concurrent.atomic.AtomicLong(lastUsed)
+    }
 
     private val associations = ConcurrentHashMap<Int, Association>()
     private val udpgwLock = Any()
 
     private fun serveUdpgw(socket: Socket, input: DataInputStream, output: OutputStream) {
         record("$TAG udpgw stream up — UDP via aether SOCKS $upstreamPort")
-        associations.values.forEach { it.close() }
+        associations.values.forEach { closeQuietly(it.udp) }
         associations.clear()
 
         val reaper = Thread({
@@ -387,8 +389,8 @@ object WarpUdpgwFront {
                 if (associations.isEmpty()) continue
                 val now = System.currentTimeMillis()
                 associations.entries.removeAll { entry ->
-                    val stale = now - entry.value.lastUsed > ASSOCIATION_IDLE_MS
-                    if (stale) entry.value.close()
+                    val stale = now - entry.value.lastUsed.get() > ASSOCIATION_IDLE_MS
+                    if (stale) closeQuietly(entry.value.udp)
                     stale
                 }
             }
@@ -419,7 +421,7 @@ object WarpUdpgwFront {
                     // The client is reusing this conid for a different flow. The old
                     // association's relay binding is wrong now, so drop it and let
                     // the code below build a fresh one.
-                    associations.remove(conid)?.close()
+                    associations.remove(conid)?.let { a -> closeQuietly(a.udp) }
                 }
 
                 val isIpv6 = flags and FLAG_IPV6 != 0
@@ -441,8 +443,9 @@ object WarpUdpgwFront {
                     if (associations.size >= MAX_ASSOCIATIONS) {
                         // Evict the least recently used rather than refusing: a
                         // refusal is a silently dead flow to the app.
-                        associations.entries.minByOrNull { it.value.lastUsed }?.let {
-                            associations.remove(it.key)?.close()
+                        val victim = associations.entries.minByOrNull { it.value.lastUsed }
+                        if (victim != null) {
+                            associations.remove(victim.key)?.let { a -> closeQuietly(a.udp) }
                         }
                     }
                     val fresh = openAssociation(conid, output, isIpv6, address) ?: return@run null
@@ -450,7 +453,7 @@ object WarpUdpgwFront {
                     fresh
                 } ?: continue
 
-                association.lastUsed = System.currentTimeMillis()
+                association.lastUsed.set(System.currentTimeMillis())
                 val datagram = encapsulateSocks5(destination, destinationPort, payload)
                 try {
                     association.udp.send(
@@ -460,12 +463,12 @@ object WarpUdpgwFront {
                         )
                     )
                 } catch (e: Exception) {
-                    associations.remove(conid)?.close()
+                    associations.remove(conid)?.let { a -> closeQuietly(a.udp) }
                 }
             }
         } catch (_: Throwable) {
         } finally {
-            associations.values.forEach { it.close() }
+            associations.values.forEach { closeQuietly(it.udp) }
             associations.clear()
             closeQuietly(socket)
         }
@@ -552,6 +555,7 @@ object WarpUdpgwFront {
             // it back on the shared stream. The control socket is held open for the
             // lifetime of the association — aether tears the association down when
             // the control connection closes, and this listener goes with it.
+            val lastSeen = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis())
             Thread({
                 val buf = ByteArray(UDP_BUFFER)
                 try {
@@ -559,7 +563,7 @@ object WarpUdpgwFront {
                         val packet = DatagramPacket(buf, buf.size)
                         udp.receive(packet)
                         val payload = decapsulateSocks5(buf, packet.length) ?: continue
-                        lastUsed = System.currentTimeMillis()
+                        lastSeen.set(System.currentTimeMillis())
                         writeUdpgwReply(conid, isIpv6, clientAddress, payload, output)
                     }
                 } catch (_: Throwable) {
@@ -570,7 +574,7 @@ object WarpUdpgwFront {
                 }
             }, "warp-udpgw-relay").apply { isDaemon = true }.start()
 
-            Association(udp, relayHost, relayPort, System.currentTimeMillis())
+            Association(udp, relayHost, relayPort, lastSeen.get())
         } catch (_: Throwable) {
             closeQuietly(control)
             null
@@ -692,27 +696,9 @@ object WarpUdpgwFront {
         }
     }
 
-    private fun closeQuietly(socket: java.io.Closeable?) {
+    private fun closeQuietly(closeable: java.io.Closeable?) {
         try {
-            socket?.close()
-        } catch (_: Exception) {}
-    }
-
-    private fun closeQuietly(socket: Socket?) {
-        try {
-            socket?.close()
-        } catch (_: Exception) {}
-    }
-
-    private fun closeQuietly(socket: ServerSocket?) {
-        try {
-            socket?.close()
-        } catch (_: Exception) {}
-    }
-
-    private fun closeQuietly(socket: DatagramSocket?) {
-        try {
-            socket?.close()
+            closeable?.close()
         } catch (_: Exception) {}
     }
 }
