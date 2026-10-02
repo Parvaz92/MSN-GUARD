@@ -100,6 +100,7 @@ impl DohServer {
 
 /// Resolve a name over DNS-over-HTTPS. Returns the first A record.
 pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> Result<std::net::IpAddr> {
+    let started = std::time::Instant::now();
     let addr = if server.addr.ip().to_string() == "0.0.0.0" {
         // Hostname DoH entry (e.g. https://cloudflare-dns.com/dns-query).
         // Resolve it via the tunnel's UDP path first — same mechanism DoT uses,
@@ -110,6 +111,18 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
         server.addr
     };
     let stream = StackStream::open(stack, addr).await?;
+
+    // Mirrors the DoT module: the first lookup against a resolver the user
+    // typed by hand deserves a visible line, otherwise a DoH failure looks
+    // identical to "DoH is working" in the app log.
+    if started.elapsed() > std::time::Duration::from_millis(2500) {
+        log::info!(
+            "doh: slow setup {host} ({ms}ms) — resolving {name}",
+            host = server.host,
+            ms = started.elapsed().as_millis(),
+            name = name
+        );
+    }
 
     let (query, id) = crate::socks::build_dns_query_public(name, crate::socks::QTYPE_A);
 

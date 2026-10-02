@@ -345,7 +345,16 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
     // hang until the stack's own timeout — on every lookup, since this runs per
     // connection. The bound is short enough to fall through to UDP quickly,
     // long enough for a real handshake on a warm connection.
-    let timeout = std::time::Duration::from_millis(4000);
+    //
+    // DoH needs more room than DoT: a hostname entry resolves its own name via
+    // UDP first, then opens a TCP connection, a TLS handshake AND an h2
+    // handshake before the query even leaves. That is four round trips on a
+    // WARP edge already answering at 400-800ms, so a 4s budget times out a
+    // resolver that is working perfectly — the failure lands the server in a
+    // 30s cooldown and the user sees "sites did not load at first, then they
+    // did". Give DoH the time the protocol actually needs.
+    let dot_timeout = std::time::Duration::from_millis(4000);
+    let doh_timeout = std::time::Duration::from_millis(9000);
 
     // A server that just failed is unlikely to recover in the next few
     // seconds, and this resolver runs on every single connection — without a
@@ -356,7 +365,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
         if crate::dot::is_backing_off(&server) {
             continue;
         }
-        match tokio::time::timeout(timeout, crate::dot::resolve_a(stack, &server, name)).await {
+        match tokio::time::timeout(dot_timeout, crate::dot::resolve_a(stack, &server, name)).await {
             Ok(Ok(ip)) => return Ok(ip),
             Ok(Err(e)) => {
                 log::debug!("dot {name} via {} failed: {e}", server.addr);
@@ -373,7 +382,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
         if crate::doh::is_backing_off(&server) {
             continue;
         }
-        match tokio::time::timeout(timeout, crate::doh::resolve_a(stack, &server, name)).await {
+        match tokio::time::timeout(doh_timeout, crate::doh::resolve_a(stack, &server, name)).await {
             Ok(Ok(ip)) => return Ok(ip),
             Ok(Err(e)) => {
                 log::debug!("doh {name} via {} failed: {e}", server.host);

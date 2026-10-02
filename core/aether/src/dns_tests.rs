@@ -57,9 +57,37 @@ mod tests {
     }
 
     #[test]
-    fn doh_rejects_hostname_without_ip() {
-        // A hostname needs a lookup; deferred to the plain resolver.
-        assert!(DohServer::parse("https://dns.example/dns-query").is_none());
+    fn doh_keeps_hostname_and_defers_resolution() {
+        // A hostname entry (https://dns.example/dns-query) must be KEPT — it is
+        // resolved at query time via the tunnel's UDP path, the same way DoT
+        // handles tls://host. Dropping it here would make hostname DoH a silent
+        // no-op, which is exactly the bug this guard prevents.
+        let s = DohServer::parse("https://dns.example/dns-query").unwrap();
+        assert_eq!(s.host, "dns.example");
+        assert_eq!(s.path, "/dns-query");
+        assert_eq!(s.addr.port(), 443);
+        // The address itself is a placeholder until resolve_a fills it in.
+        assert_eq!(s.addr.ip().to_string(), "0.0.0.0");
+    }
+
+    #[test]
+    fn doh_keeps_cloudflare_family_hostname() {
+        // The real entry from the bug report: hostname + no path.
+        let s = DohServer::parse("https://cloudflare-dns.com").unwrap();
+        assert_eq!(s.host, "cloudflare-dns.com");
+        assert_eq!(s.path, "/dns-query");
+    }
+
+    #[test]
+    fn doh_keeps_two_different_hostnames() {
+        // Two hostname entries used to collapse into one because both got the
+        // same 0.0.0.0 placeholder and dedup keyed on the address alone.
+        std::env::set_var(
+            "AETHER_DNS",
+            "https://one.example/dns-query, https://two.example/dns-query",
+        );
+        let dohs = doh_servers();
+        assert_eq!(dohs.len(), 2);
     }
 
     #[test]
