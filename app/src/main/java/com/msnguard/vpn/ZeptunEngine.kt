@@ -66,6 +66,10 @@ object ZeptunEngine : TunEngine {
     }
 
     private fun firstZeptunCompatibleUpstream(): String {
+        // Zeptun's [dns].upstream takes ONE plain UDP address. Encrypted
+        // entries (tls://, https://) cannot go there — Zeptun has no DoT/DoH
+        // client — but they must not silently win the slot either: skip them
+        // and keep looking for a plain entry the engine can actually use.
         for (entry in customResolverList()) {
             val low = entry.lowercase()
             if (low.startsWith("tls://") || low.startsWith("dot://")) {
@@ -73,7 +77,7 @@ object ZeptunEngine : TunEngine {
                 val looksIp = body.matches(Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+.*")) || body.startsWith("[")
                 if (!looksIp) continue
             }
-            if (low.startsWith("https://")) continue
+            if (low.startsWith("https://") || low.startsWith("doh:")) continue
             return entry
         }
         return "1.1.1.1"
@@ -95,6 +99,15 @@ object ZeptunEngine : TunEngine {
         // takes ONE address, so the first custom entry wins (that is the
         // Iran-only server the user actually wants). If none is set, the public
         // fallback is used so resolution still works.
+        //
+        // Encrypted entries (tls://, https://) are deliberately NOT passed here:
+        // Zeptun speaks plain UDP/53 only, so it cannot reach a DoT/DoH server
+        // itself. They stay in AETHER_DNS, which the aether core reads on its
+        // own leg — every name Zeptun hands up as a domain is resolved by
+        // aether's socks5 server, and that is where DoT/DoH actually run.
+        // Falling back to 1.1.1.1 below when only encrypted entries exist is
+        // what keeps name resolution alive; the encrypted path is not bypassed
+        // because it never went through this field.
         val upstream = firstZeptunCompatibleUpstream()
         ConnectionLog.record("Zeptun DNS upstream=$upstream (hijack+fake_ip, range 198.18.0.0/15)")
 
