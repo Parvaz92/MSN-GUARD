@@ -443,7 +443,7 @@ object WarpUdpgwFront {
                     if (associations.size >= MAX_ASSOCIATIONS) {
                         // Evict the least recently used rather than refusing: a
                         // refusal is a silently dead flow to the app.
-                        val victim = associations.entries.minByOrNull { it.value.lastUsed }
+                        val victim = associations.entries.minByOrNull { it.value.lastUsed.get() }
                         if (victim != null) {
                             associations.remove(victim.key)?.let { a -> closeQuietly(a.udp) }
                         }
