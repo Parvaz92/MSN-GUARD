@@ -23,7 +23,34 @@ object ZeptunEngine : TunEngine {
     @Volatile private var running: Boolean = false
     @Volatile private var lastToml: String = ""
 
+    // The raw fd we detached from the dup and handed to libzeptun (see start()).
+    // detachFd() strips ownership from the ParcelFileDescriptor, so this number is
+    // ours alone to close — nobody else knows it exists. See stop().
+    @Volatile private var ownedFd: Int = -1
+
     override val isRunning: Boolean get() = running
+
+    /**
+     * Close the fd we detached in [start].
+     *
+     * libzeptun dups the fd it is given (inside zeptun_create_from_toml and
+     * zeptun_set_device_fd) and closes only its own copies when it stops; the
+     * original we detached is never closed by it. Left open, the TUN interface
+     * outlives the service and the VPN key stays in the status bar after a
+     * disconnect ("app says disconnected, key icon still there"). This is the
+     * last reference once the engine has stopped, which is what takes the
+     * interface down.
+     */
+    private fun closeOwnedFd() {
+        val fd = ownedFd
+        ownedFd = -1
+        if (fd < 0) return
+        try {
+            ParcelFileDescriptor.adoptFd(fd).close()
+        } catch (_: Throwable) {
+            // Already gone (or never established) — nothing to release.
+        }
+    }
 
     /**
      * Custom resolvers the user set (dns_servers preference), followed by the
@@ -94,6 +121,9 @@ object ZeptunEngine : TunEngine {
             try { dup.close() } catch (_: Exception) {}
             return false
         }
+        // Remember it so stop() can release it — detachFd() handed us sole
+        // ownership, and libzeptun only ever closes its own dup.
+        ownedFd = rawFd
 
         // Custom resolvers the user set, to the engine. Zeptun's [dns].upstream
         // takes ONE address, so the first custom entry wins (that is the
@@ -179,17 +209,29 @@ object ZeptunEngine : TunEngine {
             } else {
                 ConnectionLog.record("Zeptun start failed rc=$rc toml:\n$toml")
                 running = false
+                // Release the detached fd: nothing else owns it, and a failed
+                // start would otherwise leave the TUN interface — and the VPN
+                // key — up with no engine behind it.
+                closeOwnedFd()
                 false
             }
         } catch (e: Throwable) {
             ConnectionLog.record("Zeptun start exception: ${e.message}")
             running = false
+            closeOwnedFd()
             false
         }
     }
 
     override fun stop() {
-        if (!running) return
+        if (!running) {
+            // Even on this path the detached fd must be released: a start that
+            // returned non-zero could still have created libzeptun's dup, but
+            // ours is unconditionally ours, and leaving it open is exactly the
+            // "key icon stays" symptom.
+            closeOwnedFd()
+            return
+        }
         try {
             dev.zeptun.Zeptun.nativeStop()
             ConnectionLog.record("Zeptun stopped")
@@ -197,6 +239,12 @@ object ZeptunEngine : TunEngine {
             ConnectionLog.record("Zeptun stop error: ${e.message}")
         } finally {
             running = false
+            // nativeStop has unwound its side by now (stop() is called off the
+            // engine's own thread and this is the last reference to the TUN),
+            // so closing here is what takes the interface — and the status-bar
+            // key — down. Adopting the raw int is safe: detachFd() made us the
+            // sole owner and nothing else ever touches this number.
+            closeOwnedFd()
         }
     }
 }
