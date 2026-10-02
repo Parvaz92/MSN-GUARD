@@ -6329,7 +6329,14 @@ class MainActivity : Activity() {
         Thread {
             val results = ArrayList<String>()
             for (entry in entries) {
-                val ok = probeUdp(entry)
+                val ok = try {
+                    val low = entry.lowercase()
+                    when {
+                        low.startsWith("tls://") || low.startsWith("dot://") -> probeDot(entry)
+                        low.startsWith("https://") || low.startsWith("doh:") -> probeDoh(entry)
+                        else -> probeUdp(entry)
+                    }
+                } catch (_: Exception) { false }
                 results.add(if (ok) Strings.tf("%s: OK", entry) else Strings.tf("%s: unreachable", entry))
             }
             val okCount = results.count { it.contains("OK") }
@@ -6347,6 +6354,68 @@ class MainActivity : Activity() {
      * response (even NXDOMAIN proves the server is answering DNS).
      */
     private fun probeDns(entry: String): Boolean = try { probeUdp(entry) } catch (_: Exception) { false }
+
+    private fun probeDot(entry: String): Boolean {
+        val body = entry.trim().removePrefix("tls://").removePrefix("dot://")
+            .removePrefix("TLS://").removePrefix("DOT://").trim()
+        val (host, port) = splitHostPort(body, 853)
+        val query = dnsProbeQuery()
+        return probeDnsStream(host, port, query, tls = true)
+    }
+
+    private fun probeDoh(entry: String): Boolean {
+        // Keep the probe simple: GET https://host/path?dns=<base64url(query)>
+        // is understood by all public DoH servers; POST+octet-stream is a
+        // second flavour some operators disable.
+        val raw = entry.trim()
+        val urlText = when {
+            raw.startsWith("https://", ignoreCase = true) -> raw.trim()
+            raw.startsWith("doh:", ignoreCase = true) -> raw.substringAfter(":").trim()
+            else -> raw.trim()
+        }
+        val query = dnsProbeQuery()
+        val b64 = android.util.Base64.encodeToString(query, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+        val urlStr = if ("?" in urlText) "$urlText&dns=$b64" else "$urlText?dns=$b64"
+        return try {
+            val conn = (java.net.URL(urlStr).openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 5000
+                readTimeout = 5000
+                setRequestProperty("accept", "application/dns-message")
+            }
+            val code = conn.responseCode
+            conn.disconnect()
+            code in 200..299
+        } catch (_: Exception) { false }
+    }
+
+    private fun probeDnsStream(host: String, port: Int, query: ByteArray, tls: Boolean): Boolean {
+        return try {
+            val sock: java.net.Socket = if (tls) {
+                val ctx = javax.net.ssl.SSLContext.getInstance("TLS")
+                ctx.init(null, null, null)
+                ctx.socketFactory.createSocket(host, port) as javax.net.ssl.SSLSocket
+            } else java.net.Socket()
+            sock.use { s ->
+                s.soTimeout = 5000
+                if (!tls) s.connect(java.net.InetSocketAddress(host, port), 5000)
+                val out = s.getOutputStream()
+                val inp = s.getInputStream()
+                val framed = if (tls) {
+                    // RFC 7858 framing
+                    val f = ByteArray(2 + query.size)
+                    f[0] = ((query.size shr 8) and 0xFF).toByte()
+                    f[1] = (query.size and 0xFF).toByte()
+                    query.copyInto(f, 2)
+                    f
+                } else query
+                out.write(framed); out.flush()
+                val buf = ByteArray(512)
+                val n = inp.read(buf)
+                n != null && n >= 2
+            }
+        } catch (_: Exception) { false }
+    }
 
     private fun probeUdp(entry: String): Boolean {
         val (host, port) = splitHostPort(entry, 53)
