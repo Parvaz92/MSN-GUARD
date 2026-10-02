@@ -388,7 +388,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
 
     let udp = stack.open_udp().await?;
     let (sender, mut from_stack) = udp.into_split();
-    let outcome = dns_exchange(&sender, &mut from_stack, name).await;
+    let outcome = dns_exchange_public(&sender, &mut from_stack, name).await;
     sender.close().await;
     outcome
 }
@@ -449,7 +449,7 @@ pub(crate) fn resolver_addresses() -> Vec<SocketAddr> {
     servers
 }
 
-async fn dns_exchange(
+pub(crate) async fn dns_exchange_public(
     sender: &UdpSender,
     from_stack: &mut mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     name: &str,

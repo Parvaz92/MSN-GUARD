@@ -65,6 +65,20 @@ object ZeptunEngine : TunEngine {
         return out
     }
 
+    private fun firstZeptunCompatibleUpstream(): String {
+        for (entry in customResolverList()) {
+            val low = entry.lowercase()
+            if (low.startsWith("tls://") || low.startsWith("dot://")) {
+                val body = entry.substringAfter("://").substringBefore("#").trim()
+                val looksIp = body.matches(Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+.*")) || body.startsWith("[")
+                if (!looksIp) continue
+            }
+            if (low.startsWith("https://")) continue
+            return entry
+        }
+        return "1.1.1.1"
+    }
+
     override fun start(fd: ParcelFileDescriptor, socksPort: Int, mtu: Int, dnsOnly: Boolean): Boolean {
         if (running) return true
         val dup = try { fd.dup() } catch (e: Exception) {
@@ -81,7 +95,7 @@ object ZeptunEngine : TunEngine {
         // takes ONE address, so the first custom entry wins (that is the
         // Iran-only server the user actually wants). If none is set, the public
         // fallback is used so resolution still works.
-        val upstream = customResolverList().firstOrNull() ?: "1.1.1.1"
+        val upstream = firstZeptunCompatibleUpstream()
         ConnectionLog.record("Zeptun DNS upstream=$upstream (hijack+fake_ip, range 198.18.0.0/15)")
 
         // Minimal TOML: device is the supplied fd, stack is userspace,

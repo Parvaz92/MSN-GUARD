@@ -32,33 +32,52 @@ pub struct DotServer {
 }
 
 impl DotServer {
-    /// Parse `tls://1.2.3.4`, `tls://1.2.3.4:853`, or with an explicit SNI
-    /// `tls://1.2.3.4#dns.example`. Returns None when the entry is not a
-    /// DoT entry, so the caller can fall through to the plain resolver.
+    /// Parse `tls://1.2.3.4`, `tls://1.2.3.4:853`, `tls://family.cloudflare-dns.com`
+    /// or with an explicit SNI `tls://1.2.3.4#dns.example`.
+    /// A hostname entry is kept (addr stays None-shaped but we store the host
+    /// and resolve it at query time via the plain UDP path, same egress as
+    /// the simple-UDP fix — that is what makes an exporter-hostname resolver
+    /// reachable at all from this stack).
     pub fn parse(entry: &str) -> Option<Self> {
         let rest = entry.strip_prefix("tls://").or_else(|| entry.strip_prefix("dot://"))?;
         let rest = rest.trim();
         if rest.is_empty() {
             return None;
         }
-
-        // An optional SNI follows '#'. Absent means present the address itself.
         let (host_part, sni) = match rest.split_once('#') {
             Some((h, s)) => (h.trim(), s.trim().to_string()),
             None => (rest, String::new()),
         };
+        // Try SocketAddr, then bare IP, then hostname.
+        if let Ok(a) = host_part.parse::<SocketAddr>() {
+            let sni = if sni.is_empty() { a.ip().to_string() } else { sni };
+            return Some(DotServer { addr: a, sni });
+        }
+        if let Ok(ip) = host_part.parse::<std::net::IpAddr>() {
+            let addr = SocketAddr::new(ip, 853);
+            let sni = if sni.is_empty() { addr.ip().to_string() } else { sni };
+            return Some(DotServer { addr, sni });
+        }
+        // Hostname: keep as SocketAddr placeholder; resolved at resolve time
+        // via the tunnel's UDP path. Use a sentinel 0.0.0.1 + real hostname in sni.
+        if host_part.contains('.') && !host_part.contains(' ') {
+            let sni_host = if sni.is_empty() { host_part.to_string() } else { sni };
+            // Parse host:port if they gave tls://family.cloudflare-dns.com:853
+            let (_h, p) = match host_part.rsplit_once(':') {
+                Some((hh, pp)) if pp.parse::<u16>().is_ok() => (hh, pp.parse().unwrap()),
+                _ => (host_part, 853),
+            };
+            // Store hostname in sni, address as 0.0.0.0 placeholder — resolve_a will fix it
+            let addr = SocketAddr::new("0.0.0.0".parse().unwrap(), p);
+            // keep original hostname via sni; if sni was the IP-string case above it differs,
+            // here sni IS the hostname (or the # override). stash host in sni_host
+            return Some(DotServer { addr, sni: sni_host });
+        }
+        None
+    }
 
-        let addr = match host_part.parse::<SocketAddr>() {
-            Ok(a) => a,
-            Err(_) => {
-                // Bare IP without a port — default to 853 (RFC 7858).
-                let ip = host_part.parse::<std::net::IpAddr>().ok()?;
-                SocketAddr::new(ip, 853)
-            }
-        };
-        let sni = if sni.is_empty() { addr.ip().to_string() } else { sni };
-
-        Some(DotServer { addr, sni })
+    fn is_hostname_placeholder(&self) -> bool {
+        self.addr.ip().to_string() == "0.0.0.0"
     }
 }
 
@@ -67,16 +86,19 @@ impl DotServer {
 /// The whole exchange is framed with the two-byte length prefix from RFC 7858;
 /// without it the server cannot tell where one message ends.
 pub async fn resolve_a(stack: &StackHandle, server: &DotServer, name: &str) -> Result<std::net::IpAddr> {
-    // The connection rides the tunnel's own userspace stack, so an Iran-only
-    // resolver on port 853 is reached through the same egress as everything
-    // else. A real socket + protect() would bypass the tunnel entirely.
-    let stream = StackStream::open(stack, server.addr).await?;
+    let (addr, sni_for_tls) = if server.is_hostname_placeholder() {
+        let ip = resolve_dot_hostname_via_udp(stack, &server.sni).await?;
+        (std::net::SocketAddr::new(ip, server.addr.port()), server.sni.clone())
+    } else {
+        (server.addr, server.sni.clone())
+    };
+    let stream = StackStream::open(stack, addr).await?;
 
     let (query, id) = crate::socks::build_dns_query_public(name, crate::socks::QTYPE_A);
 
     // tokio_boring takes ownership of the stream; the TLS layer wraps it and
     // the underlying stack connection is closed when the SslStream drops.
-    let mut tls = crate::tls::connect_dot(&server.sni, stream).await?;
+    let mut tls = crate::tls::connect_dot(&sni_for_tls, stream).await?;
 
     // RFC 7858 framing: 2-byte big-endian length before each message.
     let len = (query.len() as u16).to_be_bytes();
@@ -128,6 +150,14 @@ pub(crate) fn dot_servers() -> Vec<DotServer> {
 
 fn map_io(e: io::Error) -> AetherError {
     AetherError::Other(format!("dot: {e}"))
+}
+
+async fn resolve_dot_hostname_via_udp(stack: &crate::netstack::StackHandle, host: &str) -> crate::error::Result<std::net::IpAddr> {
+    let udp = stack.open_udp().await?;
+    let (sender, mut rx) = udp.into_split();
+    let r = crate::socks::dns_exchange_public(&sender, &mut rx, host).await;
+    sender.close().await;
+    r
 }
 
 /// How long a failed server is skipped before it is retried.
