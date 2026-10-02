@@ -140,7 +140,10 @@ pub(crate) fn dot_servers() -> Vec<DotServer> {
     let mut out = Vec::new();
     for token in configured.split([',', ' ', ';']) {
         if let Some(server) = DotServer::parse(token) {
-            if !out.iter().any(|s: &DotServer| s.addr == server.addr) {
+            // Placeholder 0.0.0.0 is not unique per hostname, so dedup on
+            // (addr, sni) — otherwise two hostname DoT entries would
+            // collapse into one and the other would silently vanish.
+            if !out.iter().any(|s: &DotServer| s.addr == server.addr && s.sni == server.sni) {
                 out.push(server);
             }
         }

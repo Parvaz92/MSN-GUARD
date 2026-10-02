@@ -70,30 +70,46 @@ impl DohServer {
         }
 
         // DoH needs an IP to open the socket. The entry may be a hostname
-        // (https://dns.example/dns-query) — resolve it with the plain path
-        // before the first query, once, so the answer can be cached on the
-        // DohServer. Doing this here keeps resolve_a dumb.
-        let addr_ip: std::net::IpAddr = match host_part.parse() {
-            Ok(ip) => ip,
+        // (https://cloudflare-dns.com/dns-query) — resolve it via the tunnel's
+        // UDP path at query time, exactly the mechanism DoT uses now. Keeping
+        // the entry here (instead of dropping it) is what makes a hostname DoH
+        // resolver work at all through a foreign egress.
+        match host_part.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(DohServer {
+                addr: std::net::SocketAddr::new(ip, port.unwrap_or(443)),
+                host: host_part.to_string(),
+                path,
+            }),
             Err(_) => {
-                // A hostname needs a lookup the plain resolver has to do, and
-                // that lookup must not itself need DoH. Defer: the caller falls
-                // back to UDP, which resolves it.
-                return None;
+                // Hostname. We can't resolve synchronously here (parse is not
+                // async), so store a placeholder and let resolve_a do the
+                // lookup. Use 0.0.0.0 as the sentinel; the port is real.
+                if host_part.contains('.') && !host_part.contains(' ') {
+                    Some(DohServer {
+                        addr: std::net::SocketAddr::new("0.0.0.0".parse().unwrap(), port.unwrap_or(443)),
+                        host: host_part.to_string(),
+                        path,
+                    })
+                } else {
+                    None
+                }
             }
-        };
-
-        Some(DohServer {
-            addr: std::net::SocketAddr::new(addr_ip, port.unwrap_or(443)),
-            host: host_part.to_string(),
-            path,
-        })
+        }
     }
 }
 
 /// Resolve a name over DNS-over-HTTPS. Returns the first A record.
 pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> Result<std::net::IpAddr> {
-    let stream = StackStream::open(stack, server.addr).await?;
+    let addr = if server.addr.ip().to_string() == "0.0.0.0" {
+        // Hostname DoH entry (e.g. https://cloudflare-dns.com/dns-query).
+        // Resolve it via the tunnel's UDP path first — same mechanism DoT uses,
+        // same egress, and the only way the hostname is reachable at all.
+        let ip = resolve_doh_hostname_via_udp(stack, &server.host).await?;
+        std::net::SocketAddr::new(ip, server.addr.port())
+    } else {
+        server.addr
+    };
+    let stream = StackStream::open(stack, addr).await?;
 
     let (query, id) = crate::socks::build_dns_query_public(name, crate::socks::QTYPE_A);
 
@@ -181,6 +197,17 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
         .ok_or_else(|| AetherError::Other("doh: no A record in reply".into()))
 }
 
+/// Resolve a DoH hostname via the tunnel's plain UDP path — same egress as
+/// the simple-UDP DNS that already works, so a hostname DoH resolver is
+/// reachable through a foreign Cloudflare edge too.
+async fn resolve_doh_hostname_via_udp(stack: &StackHandle, host: &str) -> Result<std::net::IpAddr> {
+    let udp = stack.open_udp().await?;
+    let (sender, mut rx) = udp.into_split();
+    let r = crate::socks::dns_exchange_public(&sender, &mut rx, host).await;
+    sender.close().await;
+    r
+}
+
 /// How long a failed server is skipped before it is retried.
 const BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -219,7 +246,11 @@ pub(crate) fn doh_servers() -> Vec<DohServer> {
     let mut out = Vec::new();
     for token in configured.split([',', ' ', ';']) {
         if let Some(server) = DohServer::parse(token) {
-            if !out.iter().any(|s: &DohServer| s.addr == server.addr) {
+            // Placeholder 0.0.0.0 is not unique per hostname, so dedup on
+            // the host+path too — otherwise two different https://hostname
+            // entries would collapse into one and one would silently vanish.
+            let key = (server.host.as_str(), server.path.as_str());
+            if !out.iter().any(|s| (s.host.as_str(), s.path.as_str()) == key) {
                 out.push(server);
             }
         }
