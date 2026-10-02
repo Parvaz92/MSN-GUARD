@@ -244,11 +244,49 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
 /// That is why the UDP-simple fix and the DoT fix are the model — they are
 /// the same egress, the same socket family, the same stack.
 async fn resolve_doh_hostname_via_udp(stack: &StackHandle, host: &str) -> Result<std::net::IpAddr> {
+    // Cheap win on a slow edge: the DoH server's own hostname never changes
+    // across the session. Without this every single name lookup pays an extra
+    // UDP round trip (10 s on this edge, see log 9) before the TCP/TLS/h2
+    // handshake even starts.
+    if let Some(ip) = cached_hostname(host) {
+        if crate::socks::resolver_addresses().is_empty() {
+            // UDP fallback path still there, so the cached IP is usable
+        }
+        log::debug!("doh: hostname {host} hit {ip} (cache)");
+        return Ok(ip);
+    }
     let udp = stack.open_udp().await?;
     let (sender, mut rx) = udp.into_split();
     let r = crate::socks::dns_exchange_doh_hostname(&sender, &mut rx, host).await;
     sender.close().await;
+    if let Ok(ip) = r {
+        remember_hostname(host, ip);
+    }
     r
+}
+
+fn hostname_cache() -> &'static Mutex<std::collections::HashMap<String, (std::net::IpAddr, Instant)>> {
+    use std::sync::OnceLock;
+    static C: OnceLock<Mutex<std::collections::HashMap<String, (std::net::IpAddr, Instant)>>> =
+        OnceLock::new();
+    C.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cached_hostname(host: &str) -> Option<std::net::IpAddr> {
+    let now = Instant::now();
+    hostname_cache()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(host).filter(|(_, exp)| *exp > now).map(|(ip, _)| *ip))
+}
+
+fn remember_hostname(host: &str, ip: std::net::IpAddr) {
+    let _ = hostname_cache().lock().map(|mut m| {
+        if m.len() > 32 {
+            m.clear();
+        }
+        m.insert(host.to_string(), (ip, Instant::now() + CACHE_TTL));
+    });
 }
 
 /// How long a successful lookup is reused, and how long a failed server is
