@@ -406,7 +406,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
 
     for server in crate::doh::doh_servers() {
         if crate::doh::is_backing_off(&server) {
-            log::warn!("doh {name} skipped {} (cooldown)", server.host);
+            log::debug!("doh {name} skipped {} (cooldown)", server.host);
             continue;
         }
         // Cache first: without this the device pays UDP (hostname) + TCP +
@@ -415,9 +415,7 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
         // edge needs that long and every name pays it. The plain UDP path
         // has no cache here either, but UDP is one round trip, not four.
         if let Some(hit) = crate::doh::cached_answer(&server, name) {
-            // info so the user can see the path is alive; the redactor
-            // still hides the payload address behind the reversible tokens.
-            log::info!("doh {name} hit {hit} via {}", server.host);
+            log::info!("doh {name} → {hit} via {} (cache)", server.host);
             return Ok(hit);
         }
         let before = std::time::Instant::now();
