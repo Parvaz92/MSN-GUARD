@@ -250,7 +250,7 @@ pub(crate) fn doh_servers() -> Vec<DohServer> {
             // the host+path too — otherwise two different https://hostname
             // entries would collapse into one and one would silently vanish.
             let key = (server.host.as_str(), server.path.as_str());
-            if !out.iter().any(|s| (s.host.as_str(), s.path.as_str()) == key) {
+            if !out.iter().any(|s: &DohServer| (s.host.as_str(), s.path.as_str()) == key) {
                 out.push(server);
             }
         }
