@@ -324,7 +324,23 @@ async fn reply_bound(sock: &mut TcpStream, bound: SocketAddr) -> Result<()> {
 
 async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
     match target {
-        Target::Ip(ip) => Ok(ip),
+        Target::Ip(ip) => {
+            // Diagnostic: with Zeptun fake-ip, most lookups arrive as Ip(fake),
+            // so dns_resolve is never reached and DoH never fires. Log it once
+            // so the user can see whether their browsing is going through DoH
+            // or is being swallowed by the fake-ip table.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                let tuned = crate::doh::doh_servers().len() + crate::dot::dot_servers().len();
+                if tuned > 0 {
+                    log::info!(
+                        "resolve: first SOCKS target was Ip({ip}) — encrypted DNS only runs on Domain targets; fake-ip may be swallowing lookups"
+                    );
+                }
+            }
+            Ok(ip)
+        }
         Target::Domain(name) => {
             if let Ok(ip) = name.parse::<IpAddr>() {
                 return Ok(ip);
