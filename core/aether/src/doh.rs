@@ -130,6 +130,9 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
 
     // h2 drives the TLS stream from its own connection future; this task owns
     // it and is aborted when resolve_a returns so the stack connection closes.
+    // Mirrors the DoT path: success → info (so a DoH failure does not look like
+    // "DoH is not there"), stall → info marked slow so the user sees "DoH
+    // did fire, just after the edge warmed up".
     let (h2_send, h2_conn) = h2::client::Builder::new()
         .initial_window_size(crate::sysprofile::h2_stream_window_bytes())
         .initial_connection_window_size(crate::sysprofile::h2_connection_window_bytes())
@@ -212,7 +215,14 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
 
 /// Resolve a DoH hostname via the tunnel's plain UDP path — same egress as
 /// the simple-UDP DNS that already works, so a hostname DoH resolver is
-/// reachable through a foreign Cloudflare edge too.
+/// reachable through a foreign Cloudflare edge too. Tuned the same way as DoT:
+/// bounded, with a quick fallback so a slow Iran-only resolver does not stall
+/// the whole name lookup.
+///
+/// Note: tls::connect_doh itself uses a TCP stack connection, so the UDP
+/// lookup here + the TCP for DoH are both inside the userspace stack.
+/// That is why the UDP-simple fix and the DoT fix are the model — they are
+/// the same egress, the same socket family, the same stack.
 async fn resolve_doh_hostname_via_udp(stack: &StackHandle, host: &str) -> Result<std::net::IpAddr> {
     let udp = stack.open_udp().await?;
     let (sender, mut rx) = udp.into_split();
@@ -221,8 +231,53 @@ async fn resolve_doh_hostname_via_udp(stack: &StackHandle, host: &str) -> Result
     r
 }
 
-/// How long a failed server is skipped before it is retried.
+/// How long a successful lookup is reused, and how long a failed server is
+/// skipped. DoH pays UDP+TCP+TLS+h2 per cold lookup — four round trips on a
+/// slow edge — so it is the one resolver here that genuinely benefits from
+/// remembering an answer. Cache the success, not the failure.
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 const BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-name answer cache. A DoH handshake is four round trips; without this,
+/// every connection on the device re-asks the same domain and the user sees
+/// "sites did not load for the first few seconds" while the edge warms up.
+fn answer_cache() -> &'static Mutex<std::collections::HashMap<String, (std::net::IpAddr, Instant)>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, (std::net::IpAddr, Instant)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A cached answer that is still fresh, if any. Same shape as the DoT module's
+/// needs: a hit avoids the whole handshake, a miss costs it once.
+pub(crate) fn cached_answer(server: &DohServer, name: &str) -> Option<std::net::IpAddr> {
+    let now = Instant::now();
+    answer_cache()
+        .lock()
+        .ok()
+        .and_then(|map| {
+            map.get(&format!("{}|{name}", server.host))
+                .filter(|(_, exp)| *exp > now)
+                .map(|(ip, _)| *ip)
+        })
+}
+
+/// Record a successful lookup so the next one is instant.
+pub(crate) fn remember_answer(server: &DohServer, name: &str, ip: std::net::IpAddr) {
+    use std::collections::HashMap;
+    let _ = answer_cache().lock().map(|mut map| {
+        // Bound the cache the way the tun2socks one does: clear wholesale at a
+        // size cap rather than paying for eviction bookkeeping per insert.
+        if map.len() > 512 {
+            map.clear();
+        }
+        map.insert(
+            format!("{}|{name}", server.host),
+            (ip, Instant::now() + CACHE_TTL),
+        );
+        let _: &HashMap<String, (std::net::IpAddr, Instant)> = &map;
+    });
+}
 
 fn backoff_state() -> &'static Mutex<std::collections::HashMap<std::net::SocketAddr, Instant>> {
     use std::sync::OnceLock;

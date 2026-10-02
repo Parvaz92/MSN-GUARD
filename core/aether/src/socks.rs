@@ -365,14 +365,22 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
         if crate::dot::is_backing_off(&server) {
             continue;
         }
+        let before = std::time::Instant::now();
         match tokio::time::timeout(dot_timeout, crate::dot::resolve_a(stack, &server, name)).await {
-            Ok(Ok(ip)) => return Ok(ip),
+            Ok(Ok(ip)) => {
+                log::info!(
+                    "dot {name} → {ip} via {} ({ms}ms)",
+                    server.addr,
+                    ms = before.elapsed().as_millis()
+                );
+                return Ok(ip);
+            }
             Ok(Err(e)) => {
-                log::debug!("dot {name} via {} failed: {e}", server.addr);
+                log::warn!("dot {name} via {} failed: {e} ({ms}ms)", server.addr, ms = before.elapsed().as_millis());
                 crate::dot::mark_failure(&server);
             }
             Err(_) => {
-                log::debug!("dot {name} via {} timed out", server.addr);
+                log::warn!("dot {name} via {} timed out after {ms}ms", server.addr, ms = before.elapsed().as_millis());
                 crate::dot::mark_failure(&server);
             }
         }
@@ -382,14 +390,34 @@ pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAdd
         if crate::doh::is_backing_off(&server) {
             continue;
         }
+        // Cache first: without this the device pays UDP (hostname) + TCP +
+        // TLS + h2 on every single name lookup the browser fires. That is
+        // why the first few seconds after connecting looked stalled — the
+        // edge needs that long and every name pays it. The plain UDP path
+        // has no cache here either, but UDP is one round trip, not four.
+        if let Some(hit) = crate::doh::cached_answer(&server, name) {
+            // info so the user can see the path is alive; the redactor
+            // still hides the payload address behind the reversible tokens.
+            log::info!("doh {name} hit {hit} via {}", server.host);
+            return Ok(hit);
+        }
+        let before = std::time::Instant::now();
         match tokio::time::timeout(doh_timeout, crate::doh::resolve_a(stack, &server, name)).await {
-            Ok(Ok(ip)) => return Ok(ip),
+            Ok(Ok(ip)) => {
+                crate::doh::remember_answer(&server, name, ip);
+                log::info!(
+                    "doh {name} → {ip} via {} ({ms}ms)",
+                    server.host,
+                    ms = before.elapsed().as_millis()
+                );
+                return Ok(ip);
+            }
             Ok(Err(e)) => {
-                log::debug!("doh {name} via {} failed: {e}", server.host);
+                log::warn!("doh {name} via {} failed: {e} ({ms}ms)", server.host, ms = before.elapsed().as_millis());
                 crate::doh::mark_failure(&server);
             }
             Err(_) => {
-                log::debug!("doh {name} via {} timed out", server.host);
+                log::warn!("doh {name} via {} timed out after {ms}ms", server.host, ms = before.elapsed().as_millis());
                 crate::doh::mark_failure(&server);
             }
         }
