@@ -4866,20 +4866,29 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             return
         }
 
-        // The WARP transports (WireGuard, MASQUE, WoW, the chain's outer leg) are
-        // the only ones that end without a connected.set(false) of their own
-        // above: their tunnel runs on the worker thread and the `finally` there
-        // drops the latch when the core exits. But that is asynchronous —
-        // NativeCore.stop() sets the flag and returns, and the core takes a moment
-        // to unwind. A disconnect that immediately follows another connect (the
-        // Auto Scan ladder's handover is 1.5 s) can reach startTunnel's
-        // `connected.compareAndSet(false, true)` guard before the worker's
-        // finally has run, so the guard rejects the new session and the next
-        // rung — which can be SHARD, needing no core at all — never starts. It
-        // then reports "did not carry traffic", because nothing was ever running.
-        // Drop the latch here too. Idempotent: the finally runs the same set.
+        // WARP transports (WireGuard / MASQUE / WoW / Gool / MIM / the chain's
+        // outer leg) — the only branch that previously ended without closing
+        // `tun` or stopping the service here. The worker's `finally` was the
+        // sole owner of `connected`, `tun` and `stopSelf()` on this path.
+        // `NativeCore.stop()` is asynchronous: it sets the flag and returns
+        // while the core unwinds. A user Disconnect arriving right after
+        // Connect therefore left the TUN established and the VPN key on screen
+        // while the data path was already dead — reported as "key stays, no
+        // internet" (Zeptun/Hev only, because BadVPN/SHARD/Tor return early
+        // via their own branches above and were fine).
+        // Fix: synchronously close the TUN and tear down the service here,
+        // just like every other stopTunnel branch. The worker's finally remains
+        // the second closer — both tun?.close() and connected are idempotent —
+        // so no double-free.
+        tun?.close()
+        tun = null
+        vpnModeActive.set(false)
         connected.set(false)
         if (notify) sendStatus(STATUS_DISCONNECTED)
+        if (teardownService) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     private fun rebuildKillSwitchVpn() {
