@@ -166,20 +166,31 @@ async fn resolve_dot_hostname_via_udp(stack: &crate::netstack::StackHandle, host
 /// How long a failed server is skipped before it is retried.
 const BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn backoff_state() -> &'static Mutex<std::collections::HashMap<SocketAddr, Instant>> {
+fn backoff_state() -> &'static Mutex<std::collections::HashMap<String, Instant>> {
     use std::sync::OnceLock;
-    static STATE: OnceLock<Mutex<std::collections::HashMap<SocketAddr, Instant>>> = OnceLock::new();
+    static STATE: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn backoff_key(server: &DotServer) -> String {
+    if server.addr.ip().to_string() == "0.0.0.0" {
+        // hostname placeholder — key on the authority so two different
+        // hostnames don't share one backoff slot
+        format!("{}:{}", server.sni, server.addr.port())
+    } else {
+        server.addr.to_string()
+    }
 }
 
 /// True while a failed server is still in its cooldown, so `dns_resolve`
 /// skips it instead of paying its timeout on every connection.
 pub(crate) fn is_backing_off(server: &DotServer) -> bool {
     let now = Instant::now();
+    let key = backoff_key(server);
     backoff_state()
         .lock()
         .map(|map| {
-            map.get(&server.addr)
+            map.get(&key)
                 .is_some_and(|until| *until > now)
         })
         .unwrap_or(false)
@@ -189,5 +200,5 @@ pub(crate) fn is_backing_off(server: &DotServer) -> bool {
 pub(crate) fn mark_failure(server: &DotServer) {
     let _ = backoff_state()
         .lock()
-        .map(|mut map| map.insert(server.addr, Instant::now() + BACKOFF));
+        .map(|mut map| map.insert(backoff_key(server), Instant::now() + BACKOFF));
 }

@@ -279,20 +279,33 @@ pub(crate) fn remember_answer(server: &DohServer, name: &str, ip: std::net::IpAd
     });
 }
 
-fn backoff_state() -> &'static Mutex<std::collections::HashMap<std::net::SocketAddr, Instant>> {
+fn backoff_state() -> &'static Mutex<std::collections::HashMap<String, Instant>> {
     use std::sync::OnceLock;
-    static STATE: OnceLock<Mutex<std::collections::HashMap<std::net::SocketAddr, Instant>>> =
+    static STATE: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
         OnceLock::new();
     STATE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Same key shape as DotServer's (addr, sni): for a hostname entry the
+/// placeholder 0.0.0.0 would collapse every host into one slot, so we key on
+/// the host authority instead. An IP entry keeps its full SocketAddr so two
+/// different IPs are still independent.
+fn backoff_key(server: &DohServer) -> String {
+    if server.addr.ip().to_string() == "0.0.0.0" {
+        format!("{}|{}", server.host, server.path)
+    } else {
+        format!("{}|{}", server.addr, server.path)
+    }
 }
 
 /// True while a failed server is still in its cooldown, so `dns_resolve`
 /// skips it instead of paying its timeout on every connection.
 pub(crate) fn is_backing_off(server: &DohServer) -> bool {
     let now = Instant::now();
+    let key = backoff_key(server);
     backoff_state()
         .lock()
-        .map(|map| map.get(&server.addr).is_some_and(|until| *until > now))
+        .map(|map| map.get(&key).is_some_and(|until| *until > now))
         .unwrap_or(false)
 }
 
@@ -300,7 +313,7 @@ pub(crate) fn is_backing_off(server: &DohServer) -> bool {
 pub(crate) fn mark_failure(server: &DohServer) {
     let _ = backoff_state()
         .lock()
-        .map(|mut map| map.insert(server.addr, Instant::now() + BACKOFF));
+        .map(|mut map| map.insert(backoff_key(server), Instant::now() + BACKOFF));
 }
 
 /// Every DoH endpoint the user configured, in the order they wrote them.
