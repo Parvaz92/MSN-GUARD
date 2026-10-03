@@ -325,10 +325,6 @@ async fn reply_bound(sock: &mut TcpStream, bound: SocketAddr) -> Result<()> {
 async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
     match target {
         Target::Ip(ip) => {
-            // Diagnostic: with Zeptun fake-ip, most lookups arrive as Ip(fake),
-            // so dns_resolve is never reached and DoH never fires. Log it once
-            // so the user can see whether their browsing is going through DoH
-            // or is being swallowed by the fake-ip table.
             use std::sync::atomic::{AtomicBool, Ordering};
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
@@ -351,21 +347,13 @@ async fn resolve(stack: &StackHandle, target: Target) -> Result<IpAddr> {
 }
 
 pub(crate) async fn dns_resolve(stack: &StackHandle, name: &str) -> Result<IpAddr> {
-    // Announce the resolver set once per process so a log that shows no
-    // `doh …` or `dot …` lines is unambiguous: either no encrypted resolver
-    // was configured, or it was configured but never got a lookup. Without
-    // this the two are indistinguishable from the app log alone.
     use std::sync::OnceLock;
     static ANNOUNCED: OnceLock<()> = OnceLock::new();
     if ANNOUNCED.set(()).is_ok() {
         let dots = crate::dot::dot_servers();
         let dohs = crate::doh::doh_servers();
         if !dots.is_empty() || !dohs.is_empty() {
-            log::info!(
-                "resolvers: {} doh, {} dot configured",
-                dohs.len(),
-                dots.len()
-            );
+            log::info!("resolvers: {} doh, {} dot configured", dohs.len(), dots.len());
         }
     }
 
