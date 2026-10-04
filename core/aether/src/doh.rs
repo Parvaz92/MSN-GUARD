@@ -94,6 +94,17 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
     } else {
         server.addr
     };
+    let key = pool_key(addr, &server.host, &server.path);
+
+    // A warm h2 connection answers in one round trip; the pool keeps one per
+    // (address, host, path) so only the first lookup pays TCP + TLS + h2.
+    if let Some(conn) = crate::dnspool::acquire(&key).await {
+        match query_doh(conn, server, name).await {
+            Ok(ip) => return Ok(ip),
+            Err(e) => log::debug!("doh: pooled connection unusable, reopening: {e}"),
+        }
+    }
+
     let stream = StackStream::open(stack, addr).await?;
     if started.elapsed() > std::time::Duration::from_millis(2500) {
         log::info!(
@@ -102,7 +113,6 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
             ms = started.elapsed().as_millis()
         );
     }
-    let (query, id) = crate::socks::build_dns_query_public(name, crate::socks::QTYPE_A);
     let tls = crate::tls::connect_doh(&server.host, stream).await?;
     let (h2_send, h2_conn) = h2::client::Builder::new()
         .initial_window_size(crate::sysprofile::h2_stream_window_bytes())
@@ -116,10 +126,45 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
             log::debug!("doh h2 connection ended: {e}");
         }
     });
-    let mut h2_send = h2_send
+    let h2_send = h2_send
         .ready()
         .await
         .map_err(|e| AetherError::Other(format!("doh: h2 ready: {e}")))?;
+    let guard = crate::dnspool::install_doh(key, h2_send, drive);
+    query_doh(guard, server, name).await
+}
+
+/// Pool key for a DoH resolver: the *resolved* address, the host (authority for
+/// the request and the TLS SNI) and the path. Two entries differing in any of
+/// the three are different resolvers and must not share a stream.
+fn pool_key(addr: std::net::SocketAddr, host: &str, path: &str) -> String {
+    format!("doh|{addr}|https://{host}{path}")
+}
+
+/// Run one A lookup over a pooled (or freshly installed) h2 connection.
+async fn query_doh(
+    mut conn: crate::dnspool::PooledConn,
+    server: &DohServer,
+    name: &str,
+) -> Result<std::net::IpAddr> {
+    let (query, id) = crate::socks::build_dns_query_public(name, crate::socks::QTYPE_A);
+    let outcome = exchange_doh(&mut conn, server, &query, id, name).await;
+    if outcome.is_ok() {
+        // Hand the live h2 connection back; an error drops it, which also ends
+        // the drive task and closes the stream.
+        crate::dnspool::release(conn);
+    }
+    outcome
+}
+
+async fn exchange_doh(
+    conn: &mut crate::dnspool::PooledConn,
+    server: &DohServer,
+    query: &[u8],
+    id: u16,
+    name: &str,
+) -> Result<std::net::IpAddr> {
+    let doh = conn.doh();
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://{}{}", server.host, server.path))
@@ -128,7 +173,8 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
         .header("user-agent", "MSN-Guard/1.0")
         .body(())
         .map_err(|e| AetherError::Other(format!("doh: build request: {e}")))?;
-    let (resp_fut, mut send_stream) = h2_send
+    let (resp_fut, mut send_stream) = doh
+        .send
         .send_request(request, false)
         .map_err(|e| AetherError::Other(format!("doh: send request: {e}")))?;
     send_stream
@@ -138,7 +184,6 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
         .await
         .map_err(|e| AetherError::Other(format!("doh: no response: {e}")))?;
     if !response.status().is_success() {
-        drive.abort();
         return Err(AetherError::Other(format!(
             "doh: {} returned status {}",
             server.host,
@@ -154,7 +199,6 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
             break;
         }
     }
-    let _ = drive.await;
     if buf.len() < 12 {
         return Err(AetherError::Other("doh: reply too short".into()));
     }

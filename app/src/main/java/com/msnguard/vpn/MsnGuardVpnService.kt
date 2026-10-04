@@ -4559,7 +4559,17 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // routing rules). Zeptun and Hev use their own mapdns and never
                 // touch udpgw, so they keep talking to aether directly.
                 val legacyFrontUp = activeEngine == TunEnginePref.LEGACY && WarpUdpgwFront.start(CoreConfig.SOCKS_PORT)
-                val socksForEngine = if (legacyFrontUp) WarpUdpgwFront.LISTEN_PORT else CoreConfig.SOCKS_PORT
+                // Encrypted DNS: SmartDnsFront answers the device's DNS itself over
+                // DoT/DoH on the WARP egress and relays every other byte to the core.
+                // Only for the engines whose mapdns/fake-ip cannot speak DoT or DoH —
+                // Legacy keeps its own path, and plain-UDP configs never start a front.
+                val smartDnsUp = activeEngine != TunEnginePref.LEGACY &&
+                    SmartDnsFront.start(this@MsnGuardVpnService, effectiveConfig, CoreConfig.SOCKS_PORT)
+                val socksForEngine = when {
+                    smartDnsUp -> SmartDnsConfig.SMART_DNS_FRONT_PORT
+                    legacyFrontUp -> WarpUdpgwFront.LISTEN_PORT
+                    else -> CoreConfig.SOCKS_PORT
+                }
                 tun = Builder()
                     .setSession("MSN-GUARD")
                     .setMtu(1330)
@@ -4758,6 +4768,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         regionPhase = false
         // Order matters: stop routing first so no more packets enter a tunnel
         // that is being torn down, then stop Psiphon itself.
+        SmartDnsFront.stop()
         TunEngineManager.stop(this)
         stopTrafficPolling()
         TorManager.stop()
@@ -6161,6 +6172,19 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * unreachable from a foreign egress.
      */
     private fun Builder.applyDns(config: String, addresses: NativeCore.TunnelAddresses, engine: String): Builder {
+        // Encrypted DNS (tls:// / https://) can never be spoken by Android's own
+        // TUN resolver — it does plain UDP/53 only. When the user configured any,
+        // the device is pointed at the in-process virtual resolver instead, which
+        // SmartDnsFront answers over DoT/DoH through the WARP egress. Plain UDP
+        // entries are unaffected and keep the path below exactly as before.
+        if (SmartDnsServers.hasEncrypted(config)) {
+            runCatching { addDnsServer(java.net.InetAddress.getByName(SmartDnsConfig.SMART_DNS_RESOLVER)) }
+            ConnectionLog.record(
+                "DNS: engine=$engine → virtual resolver ${SmartDnsConfig.SMART_DNS_RESOLVER} " +
+                    "(encrypted DNS is answered in-process over the tunnel)"
+            )
+            return this
+        }
         if (engine == TunEnginePref.HEV) {
             runCatching { addDnsServer(java.net.InetAddress.getByName(HevEngine.MAP_DNS_ADDRESS)) }
             ConnectionLog.record("DNS: engine=Hev → mapdns ${HevEngine.MAP_DNS_ADDRESS} only (custom resolvers go to the core)")

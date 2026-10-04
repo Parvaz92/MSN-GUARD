@@ -15,6 +15,10 @@ use crate::error::{AetherError, Result};
 use crate::netstack::StackHandle;
 use crate::stackstream::StackStream;
 
+/// DNS-over-TLS runs one query per TLS record, and the record stays readable
+/// only while the stream is. Keeping a connection in the pool across lookups
+/// means the second and later names pay one round trip instead of TCP + TLS.
+
 #[derive(Clone, Debug)]
 pub struct DotServer {
     pub addr: SocketAddr,
@@ -64,6 +68,13 @@ impl DotServer {
     }
 }
 
+/// Pool key for a DoT resolver: the *resolved* address plus the SNI, so a
+/// hostname entry whose IP changes lands in a different slot instead of reusing
+/// a connection opened to the old IP.
+fn pool_key(addr: SocketAddr, sni: &str) -> String {
+    format!("dot|{addr}|{sni}")
+}
+
 pub async fn resolve_a(stack: &StackHandle, server: &DotServer, name: &str) -> Result<std::net::IpAddr> {
     let (addr, sni) = if server.is_hostname_placeholder() {
         let ip = resolve_hostname(stack, &server.sni).await?;
@@ -71,12 +82,50 @@ pub async fn resolve_a(stack: &StackHandle, server: &DotServer, name: &str) -> R
     } else {
         (server.addr, server.sni.clone())
     };
+    let key = pool_key(addr, &sni);
+
+    // Reuse a live TLS stream when one is idle. `acquire` takes it out of the
+    // pool, so it is ours alone for this exchange; `release` puts it back.
+    if let Some(conn) = crate::dnspool::acquire(&key).await {
+        match query_dot(conn, name).await {
+            Ok(ip) => return Ok(ip),
+            // A reused stream that failed is dropped, and the fresh-open path
+            // below rebuilds it rather than backing off.
+            Err(e) => log::debug!("dot: pooled connection unusable, reopening: {e}"),
+        }
+    }
+
     let stream = StackStream::open(stack, addr).await?;
+    let tls = crate::tls::connect_dot(&sni, stream).await?;
+    let conn = crate::dnspool::install_dot(key, tls);
+    query_dot(conn, name).await
+}
+
+/// Run one A lookup over a pooled (or freshly installed) TLS stream.
+async fn query_dot(
+    mut conn: crate::dnspool::PooledConn,
+    name: &str,
+) -> Result<std::net::IpAddr> {
     let (query, id) = crate::socks::build_dns_query_public(name, crate::socks::QTYPE_A);
-    let mut tls = crate::tls::connect_dot(&sni, stream).await?;
+    let outcome = exchange_dot(&mut conn, &query, id, name).await;
+    if outcome.is_ok() {
+        // Only a stream that completed a clean exchange goes back in the pool.
+        crate::dnspool::release(conn);
+    }
+    outcome
+}
+
+/// Write a length-prefixed query and read one length-prefixed reply back.
+async fn exchange_dot(
+    conn: &mut crate::dnspool::PooledConn,
+    query: &[u8],
+    id: u16,
+    name: &str,
+) -> Result<std::net::IpAddr> {
+    let tls = conn.dot();
     let len = (query.len() as u16).to_be_bytes();
     tls.write_all(&len).await.map_err(map_io)?;
-    tls.write_all(&query).await.map_err(map_io)?;
+    tls.write_all(query).await.map_err(map_io)?;
     tls.flush().await.map_err(map_io)?;
     let mut hdr = [0u8; 2];
     tls.read_exact(&mut hdr).await.map_err(map_io)?;

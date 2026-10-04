@@ -27,6 +27,34 @@ object CoreConfig {
     const val CHAIN_SOCKS_PORT = 1820
 
     /**
+     * The loopback port [SmartDnsFront] listens on.
+     *
+     * Only one listener can occupy a port, so this must not duplicate anything
+     * that can be up at the same time. The internal block is contiguous:
+     * [SOCKS_PORT] 1819, [CHAIN_SOCKS_PORT] 1820, 1822/1823 Tor, 1824 xray under
+     * SHARD, 1825 [ShardSocksFront], 1826 the anytls sidecar, 1827
+     * [WarpUdpgwFront]. That leaves 1828 as the next free slot, and it is safe
+     * because this front only ever runs on the Hev/Zeptun WARP path, where none
+     * of those are bound.
+     */
+    const val SMART_DNS_FRONT_PORT = 1828
+
+    /**
+     * The virtual resolver advertised on the TUN when the user has encrypted DNS
+     * and the engine cannot speak it itself.
+     *
+     * Hev and Zeptun publish [HevEngine.MAP_DNS_ADDRESS] and hand the encrypted
+     * servers to the core instead, so a TUN resolver that works is one Android
+     * can actually reach AND whose answers the front can answer — which for
+     * `tls://`/`https://` entries means a synthetic address owned by this app,
+     * not a real server. 10.10.14.2 is an RFC1918 address inside the TUN's own
+     * subnet, so it is always routed through the tunnel and never out the modem,
+     * and it is a different range from Hev's 198.18.0.2, so the two resolvers can
+     * never be confused for each other in a log.
+     */
+    const val SMART_DNS_RESOLVER = "10.10.14.2"
+
+    /**
      * Which outer transport last carried the chain on this device.
      *
      * An index into [CHAIN_OUTER_LADDER]. The next connect starts there instead of
@@ -639,7 +667,7 @@ object CoreConfig {
      * 211xx/212xx blocks are the SHARD race's probe listeners. 7300 is udpgw,
      * and [HTTP_PROXY_PORT] is the LAN HTTP listener.
      */
-    private val RESERVED_PORTS = setOf(CHAIN_SOCKS_PORT, 1822, 1823, 1824, 1825, 1826, 1827, 7300, HTTP_PROXY_PORT)
+    private val RESERVED_PORTS = setOf(CHAIN_SOCKS_PORT, 1822, 1823, 1824, 1825, 1826, 1827, SMART_DNS_FRONT_PORT, 7300, HTTP_PROXY_PORT)
 
     /** The stored tunnel mode, defaulting to VPN. */
     fun tunnelMode(context: Context): String =

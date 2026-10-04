@@ -8,6 +8,7 @@ mod dns;
 mod dns_tests;
 mod doh;
 mod dot;
+mod dnspool;
 pub mod error;
 mod exitip;
 mod ffi;
