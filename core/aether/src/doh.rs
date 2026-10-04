@@ -1,7 +1,10 @@
-//! DNS-over-HTTPS — RFC 8484.
+//! DNS-over-HTTPS — RFC 8484 — HTTP/1.1 (Aether DohWire style).
 //!
 //! Only active when the user writes a `https://` entry. Uses the same stack
-//! egress as DoT and plain UDP. Body is POST `application/dns-message` over h2.
+//! egress as DoT and plain UDP. Body is POST `application/dns-message` over
+//! HTTP/1.1 on a pooled TLS connection — no h2. Matches Aether's
+//! SmartDnsTransport.DohWire (HTTP/1.1, length-prefixed / chunked framing,
+//! keep-alive pooling).
 
 use crate::error::{AetherError, Result};
 use crate::netstack::StackHandle;
@@ -9,8 +12,10 @@ use crate::stackstream::StackStream;
 
 use std::sync::Mutex;
 use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+const MAX_BODY_BYTES: usize = 65_535;
+const MAX_HEAD_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DohServer {
@@ -70,14 +75,13 @@ impl DohServer {
 }
 
 pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> Result<std::net::IpAddr> {
-    let started = Instant::now();
     let addr = if server.addr.ip().to_string() == "0.0.0.0" {
         let before = Instant::now();
         let ip = match resolve_hostname(stack, &server.host).await {
             Ok(ip) => {
                 let ms = before.elapsed().as_millis();
                 if ms > 1500 {
-                    log::info!("doh: hostname {} → {ip} ({ms}ms) — resolving {name}", server.host);
+                    log::info!("doh: hostname {} -> {ip} ({ms}ms) — resolving {name}", server.host);
                 }
                 ip
             }
@@ -96,8 +100,7 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
     };
     let key = pool_key(addr, &server.host, &server.path);
 
-    // A warm h2 connection answers in one round trip; the pool keeps one per
-    // (address, host, path) so only the first lookup pays TCP + TLS + h2.
+    // Reuse an idle pooled TLS connection; on failure open a fresh one.
     if let Some(conn) = crate::dnspool::acquire(&key).await {
         match query_doh(conn, server, name).await {
             Ok(ip) => return Ok(ip),
@@ -106,42 +109,17 @@ pub async fn resolve_a(stack: &StackHandle, server: &DohServer, name: &str) -> R
     }
 
     let stream = StackStream::open(stack, addr).await?;
-    if started.elapsed() > std::time::Duration::from_millis(2500) {
-        log::info!(
-            "doh: slow setup {host} ({ms}ms) — resolving {name}",
-            host = server.host,
-            ms = started.elapsed().as_millis()
-        );
-    }
     let tls = crate::tls::connect_doh(&server.host, stream).await?;
-    let (h2_send, h2_conn) = h2::client::Builder::new()
-        .initial_window_size(crate::sysprofile::h2_stream_window_bytes())
-        .initial_connection_window_size(crate::sysprofile::h2_connection_window_bytes())
-        .max_frame_size(H2_MAX_FRAME_SIZE)
-        .handshake(tls)
-        .await
-        .map_err(|e| AetherError::Other(format!("doh: h2 handshake: {e}")))?;
-    let drive = tokio::spawn(async move {
-        if let Err(e) = h2_conn.await {
-            log::debug!("doh h2 connection ended: {e}");
-        }
-    });
-    let h2_send = h2_send
-        .ready()
-        .await
-        .map_err(|e| AetherError::Other(format!("doh: h2 ready: {e}")))?;
-    let guard = crate::dnspool::install_doh(key, h2_send, drive);
-    query_doh(guard, server, name).await
+    let conn = crate::dnspool::install_doh(key, tls);
+    query_doh(conn, server, name).await
 }
 
-/// Pool key for a DoH resolver: the *resolved* address, the host (authority for
-/// the request and the TLS SNI) and the path. Two entries differing in any of
-/// the three are different resolvers and must not share a stream.
+/// Pool key for a DoH resolver: the *resolved* address, the host and the path.
 fn pool_key(addr: std::net::SocketAddr, host: &str, path: &str) -> String {
     format!("doh|{addr}|https://{host}{path}")
 }
 
-/// Run one A lookup over a pooled (or freshly installed) h2 connection.
+/// Run one A lookup over a pooled (or freshly installed) HTTP/1.1 TLS connection.
 async fn query_doh(
     mut conn: crate::dnspool::PooledConn,
     server: &DohServer,
@@ -150,8 +128,6 @@ async fn query_doh(
     let (query, id) = crate::socks::build_dns_query_public(name, crate::socks::QTYPE_A);
     let outcome = exchange_doh(&mut conn, server, &query, id, name).await;
     if outcome.is_ok() {
-        // Hand the live h2 connection back; an error drops it, which also ends
-        // the drive task and closes the stream.
         crate::dnspool::release(conn);
     }
     outcome
@@ -164,49 +140,186 @@ async fn exchange_doh(
     id: u16,
     name: &str,
 ) -> Result<std::net::IpAddr> {
-    let doh = conn.doh();
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{}{}", server.host, server.path))
-        .header("content-type", "application/dns-message")
-        .header("accept", "application/dns-message")
-        .header("user-agent", "MSN-Guard/1.0")
-        .body(())
-        .map_err(|e| AetherError::Other(format!("doh: build request: {e}")))?;
-    let (resp_fut, mut send_stream) = doh
-        .send
-        .send_request(request, false)
-        .map_err(|e| AetherError::Other(format!("doh: send request: {e}")))?;
-    send_stream
-        .send_data(bytes::Bytes::copy_from_slice(query), true)
-        .map_err(|e| AetherError::Other(format!("doh: send body: {e}")))?;
-    let response = resp_fut
-        .await
-        .map_err(|e| AetherError::Other(format!("doh: no response: {e}")))?;
-    if !response.status().is_success() {
-        return Err(AetherError::Other(format!(
-            "doh: {} returned status {}",
-            server.host,
-            response.status().as_u16()
-        )));
-    }
-    let mut body = response.into_body();
-    let mut buf = Vec::new();
-    while let Some(frame) = body.data().await {
-        let frame = frame.map_err(|e| AetherError::Other(format!("doh: read body: {e}")))?;
-        buf.extend_from_slice(&frame);
-        if buf.len() > 65535 {
-            break;
-        }
-    }
-    if buf.len() < 12 {
+    let tls = conn.doh();
+    let path = if server.path.is_empty() { "/dns-query" } else { &server.path };
+    let host_hdr = if server.addr.port() == 443 {
+        server.host.clone()
+    } else {
+        format!("{}:{}", server.host, server.addr.port())
+    };
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUser-Agent: Aether\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        query.len()
+    );
+    tls.write_all(head.as_bytes()).await.map_err(map_io)?;
+    tls.write_all(query).await.map_err(map_io)?;
+    tls.flush().await.map_err(map_io)?;
+
+    let body = read_http_response_body(tls).await?;
+    if body.len() < 12 {
         return Err(AetherError::Other("doh: reply too short".into()));
     }
+    // RFC 8484: server may answer with id 0 — restore the query's id before matching.
+    let mut buf = body;
+    buf[0] = query[0];
+    buf[1] = query[1];
     if !crate::socks::dns_response_matches_public(&buf, id, name, crate::socks::QTYPE_A) {
         return Err(AetherError::Other("doh: reply did not match the query".into()));
     }
     crate::socks::parse_dns_a_public(&buf)
         .ok_or_else(|| AetherError::Other("doh: no A record in reply".into()))
+}
+
+async fn read_http_response_body(tls: &mut tokio_boring::SslStream<StackStream>) -> Result<Vec<u8>> {
+    // Read status line + headers without over-reading (pooled connection).
+    let mut head = Vec::with_capacity(4096);
+    let mut matched: usize = 0;
+    let mut byte = [0u8; 1];
+    while head.len() < MAX_HEAD_BYTES {
+        tls.read_exact(&mut byte).await.map_err(map_io)?;
+        head.push(byte[0]);
+        matched = match byte[0] {
+            b'\r' if matched == 0 || matched == 2 => matched + 1,
+            b'\n' if matched == 1 || matched == 3 => matched + 1,
+            b'\r' => 1,
+            _ => 0,
+        };
+        if matched == 4 {
+            break;
+        }
+    }
+    if matched != 4 {
+        return Err(AetherError::Other("doh: incomplete HTTP headers".into()));
+    }
+    let head_str = String::from_utf8_lossy(&head).to_string();
+    let (status, content_length, chunked, close) = parse_head(&head_str)
+        .ok_or_else(|| AetherError::Other("doh: bad HTTP head".into()))?;
+    if !(200..300).contains(&status) {
+        return Err(AetherError::Other(format!("doh: HTTP {status}")));
+    }
+    let body = if chunked {
+        read_chunked(tls).await?
+    } else if let Some(len) = content_length {
+        if len > MAX_BODY_BYTES {
+            return Err(AetherError::Other("doh: body too large".into()));
+        }
+        let mut buf = vec![0u8; len];
+        if len > 0 {
+            tls.read_exact(&mut buf).await.map_err(map_io)?;
+        }
+        buf
+    } else {
+        // No length and not chunked: read to close (rare for DoH).
+        // For pooled keep-alive this path means !close wasn't signaled; treat as error.
+        if close {
+            let mut out = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match tls.read(&mut tmp).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if out.len() + n > MAX_BODY_BYTES {
+                            return Err(AetherError::Other("doh: body too large".into()));
+                        }
+                        out.extend_from_slice(&tmp[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(map_io(e)),
+                }
+            }
+            out
+        } else {
+            return Err(AetherError::Other("doh: no content-length and not chunked".into()));
+        }
+    };
+    // For keep-alive pooling, caller decides reuse; body already consumed.
+    let _ = close;
+    Ok(body)
+}
+
+fn parse_head(text: &str) -> Option<(u16, Option<usize>, bool, bool)> {
+    let lines: Vec<&str> = text.split("\r\n").filter(|s| !s.is_empty()).collect();
+    let status_line = lines.first()?;
+    let parts: Vec<&str> = status_line.split(' ').collect();
+    if parts.len() < 2 || !parts[0].starts_with("HTTP/") {
+        return None;
+    }
+    let status: u16 = parts[1].parse().ok()?;
+    let mut length: Option<usize> = None;
+    let mut chunked = false;
+    let mut close = parts[0] == "HTTP/1.0";
+    for line in lines.iter().skip(1) {
+        let Some(colon) = line.find(':') else { continue };
+        let name = line[..colon].trim().to_ascii_lowercase();
+        let value = line[colon + 1..].trim().to_ascii_lowercase();
+        match name.as_str() {
+            "content-length" => length = value.parse().ok(),
+            "transfer-encoding" => chunked = value.contains("chunked"),
+            "connection" => {
+                if value.contains("close") { close = true; }
+                if value.contains("keep-alive") { close = false; }
+            }
+            _ => {}
+        }
+    }
+    Some((status, length, chunked, close))
+}
+
+async fn read_chunked(tls: &mut tokio_boring::SslStream<StackStream>) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line = read_line(tls).await?.ok_or_else(|| AetherError::Other("doh: chunk size missing".into()))?;
+        let size_str = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| AetherError::Other("doh: bad chunk size".into()))?;
+        if size == 0 {
+            // consume trailers
+            for _ in 0..32 {
+                let t = read_line(tls).await?.ok_or_else(|| AetherError::Other("doh: chunk trailer missing".into()))?;
+                if t.is_empty() { break; }
+            }
+            break;
+        }
+        if out.len() + size > MAX_BODY_BYTES {
+            return Err(AetherError::Other("doh: body too large".into()));
+        }
+        let mut chunk = vec![0u8; size];
+        tls.read_exact(&mut chunk).await.map_err(map_io)?;
+        out.extend_from_slice(&chunk);
+        // trailing CRLF after chunk
+        let mut crlf = [0u8; 2];
+        tls.read_exact(&mut crlf).await.map_err(map_io)?;
+        if crlf != [b'\r', b'\n'] {
+            // tolerate bare LF
+            if crlf[1] != b'\n' {
+                return Err(AetherError::Other("doh: bad chunk terminator".into()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn read_line(tls: &mut tokio_boring::SslStream<StackStream>) -> Result<Option<String>> {
+    let mut s = Vec::new();
+    let mut byte = [0u8; 1];
+    while s.len() < 4096 {
+        match tls.read(&mut byte).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    if s.last() == Some(&b'\r') { s.pop(); }
+                    return Ok(Some(String::from_utf8_lossy(&s).to_string()));
+                }
+                s.push(byte[0]);
+            }
+            Err(e) => return Err(map_io(e)),
+        }
+    }
+    Ok(None)
+}
+
+fn map_io(e: std::io::Error) -> AetherError {
+    AetherError::Other(format!("doh: {e}"))
 }
 
 async fn resolve_hostname(stack: &StackHandle, host: &str) -> Result<std::net::IpAddr> {

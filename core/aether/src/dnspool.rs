@@ -1,7 +1,7 @@
 //! Idle-connection pool for the encrypted DNS resolvers (DoT / DoH).
 //!
 //! Without this, every name lookup opened its own TCP connection through the
-//! tunnel stack and paid a full TLS handshake — plus an h2 handshake for DoH —
+//! tunnel stack and paid a full TLS handshake — for DoH (HTTP/1.1) —
 //! on the critical path of every connection the device makes. On a WARP edge
 //! answering at 400-800ms that is three to four round trips per name, which is
 //! exactly the stall visible in the first seconds after connecting.
@@ -37,7 +37,7 @@ fn pool() -> &'static Mutex<PoolMap> {
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// One live TLS (+h2) connection to a resolver.
+/// One live TLS connection to a resolver.
 ///
 /// Owned by the pool when idle and by a single lookup when borrowed. Dropping it
 /// closes the stream: `SslStream` drops the `StackStream` underneath, whose
@@ -51,22 +51,12 @@ pub(crate) struct PooledConn {
 enum ConnInner {
     /// DNS-over-TLS: a ready `SslStream` over the tunnel's TCP channel.
     Dot(tokio_boring::SslStream<StackStream>),
-    /// DNS-over-HTTPS: an h2 client that can open request streams, plus the task
-    /// driving the connection. Dropping `drive` ends the connection, which is
-    /// how an idle DoH entry is reaped.
-    Doh(DohConn),
+    /// DNS-over-HTTPS: a pooled TLS stream for HTTP/1.1 POST (Aether DohWire).
+    /// Same shape as Dot — one query at a time, keep-alive when possible.
+    Doh(tokio_boring::SslStream<StackStream>),
     /// Test-only entry, for exercising pool semantics without a network.
     #[cfg(test)]
     Test,
-}
-
-/// The h2 half of a pooled DoH connection.
-pub(crate) struct DohConn {
-    /// Opens a new request stream on the live h2 connection.
-    pub send: h2::client::SendRequest<bytes::Bytes>,
-    /// Background task pumping the h2 connection. Owned by the pool entry, so an
-    /// idle DoH connection stays driven and a borrowed one cannot outlive it.
-    pub drive: tokio::task::JoinHandle<()>,
 }
 
 impl PooledConn {
@@ -74,30 +64,25 @@ impl PooledConn {
         PooledConn { key, inner: ConnInner::Dot(tls) }
     }
 
-    fn new_doh(
-        key: String,
-        send: h2::client::SendRequest<bytes::Bytes>,
-        drive: tokio::task::JoinHandle<()>,
-    ) -> Self {
-        PooledConn { key, inner: ConnInner::Doh(DohConn { send, drive }) }
+    fn new_doh(key: String, tls: tokio_boring::SslStream<StackStream>) -> Self {
+        PooledConn { key, inner: ConnInner::Doh(tls) }
     }
 
-    /// The DoT TLS stream. Panics if this entry is an h2 (DoH) connection — the
-    /// two resolver paths never share a key.
+    /// The DoT TLS stream. Panics if this entry is a DoH connection.
     pub(crate) fn dot(&mut self) -> &mut tokio_boring::SslStream<StackStream> {
         match &mut self.inner {
             ConnInner::Dot(tls) => tls,
-            ConnInner::Doh(_) => unreachable!("dot() on a doh pooled connection"),
+            ConnInner::Doh(tls) => tls,
             #[cfg(test)]
             ConnInner::Test => unreachable!("dot() on a test pooled connection"),
         }
     }
 
-    /// The DoH h2 client. Panics if this entry is a DoT connection.
-    pub(crate) fn doh(&mut self) -> &mut DohConn {
+    /// The DoH TLS stream (HTTP/1.1). Same bytes as DoT, different pool key.
+    pub(crate) fn doh(&mut self) -> &mut tokio_boring::SslStream<StackStream> {
         match &mut self.inner {
-            ConnInner::Doh(c) => c,
-            ConnInner::Dot(_) => unreachable!("doh() on a dot pooled connection"),
+            ConnInner::Doh(tls) => tls,
+            ConnInner::Dot(tls) => tls,
             #[cfg(test)]
             ConnInner::Test => unreachable!("doh() on a test pooled connection"),
         }
@@ -130,10 +115,9 @@ pub(crate) fn install_dot(
 /// Wrap a freshly handshaked DoH connection. See [`install_dot`].
 pub(crate) fn install_doh(
     key: String,
-    send: h2::client::SendRequest<bytes::Bytes>,
-    drive: tokio::task::JoinHandle<()>,
+    tls: tokio_boring::SslStream<StackStream>,
 ) -> PooledConn {
-    PooledConn::new_doh(key, send, drive)
+    PooledConn::new_doh(key, tls)
 }
 
 /// Return a connection that completed its exchange successfully.

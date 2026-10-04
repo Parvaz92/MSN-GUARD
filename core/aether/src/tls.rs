@@ -287,9 +287,8 @@ where
         .map_err(|e| AetherError::Tls(format!("dot handshake with {sni}: {e}")))
 }
 
-/// TLS handshake for DNS-over-HTTPS. Identical to DoT except it negotiates
-/// HTTP/2 (RFC 9113 requires ALPN for a conforming h2 client) — the h2 client
-/// layered on top refuses to speak without it.
+/// TLS handshake for DNS-over-HTTPS over HTTP/1.1 (Aether DohWire: one POST
+/// per query on a pooled keep-alive connection). No h2 layer.
 pub async fn connect_doh<S>(host: &str, stream: S) -> Result<tokio_boring::SslStream<S>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -305,9 +304,9 @@ where
         .set_max_proto_version(Some(SslVersion::TLS1_3))
         .map_err(|e| AetherError::Tls(e.to_string()))?;
     builder.set_grease_enabled(true);
-    // h2: ALPN is mandatory, advertise it in the ClientHello.
+    // DoH via HTTP/1.1 (Aether's DohWire): one POST per query, pooled TLS.
     builder
-        .set_alpn_protos(b"\x02h2")
+        .set_alpn_protos(b"\x08http/1.1")
         .map_err(|e| AetherError::Tls(e.to_string()))?;
     builder.set_verify(SslVerifyMode::NONE);
 
