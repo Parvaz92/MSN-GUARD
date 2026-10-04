@@ -74,6 +74,18 @@ data class ShardNode(
     val finalMask: String,
     /** `alpn`, comma-separated. Empty when absent. */
     val alpn: String,
+    /**
+     * `extra`, a raw JSON object. Empty when absent.
+     *
+     * Only xhttp nodes carry it, and only for `xmux` so far: the publisher's
+     * xhttp nodes ship `extra={"xmux":{"maxConnections":1,"maxReuseTimes":0}}`,
+     * which is how many HTTP requests share one connection on that transport.
+     * The fork reads `extra` as an override applied on top of `xhttpSettings`
+     * (infra/conf/transport_method.go, SplitHTTPConfig.Build), so it is copied
+     * verbatim the same way [finalMask] is: re-deriving xmux settings here would
+     * fork the publisher's tuning into a second place that drifts.
+     */
+    val extra: String,
     /** The `#fragment` label, decoded. Diagnostic only — never shown as-is. */
     val label: String,
 ) {
@@ -252,11 +264,14 @@ object ShardConfigs {
         val host = params["host"].orEmpty()
         val sni = params["sni"].orEmpty()
         val security = params["security"]?.lowercase(Locale.US).orEmpty().ifEmpty { "none" }
-        // Only ws is implemented. A node announcing anything else is dropped
-        // rather than run as ws, which would fail at the HTTP upgrade with a
-        // useless error.
+        // ws and xhttp are implemented. `ws` rides a WebSocket upgrade;
+        // `xhttp` rides plain HTTP/1.1-or-h2 requests, which is the shape that
+        // still crosses a firewall that killed UDP and capped WebSocket — see
+        // the xhttp branch in [outbound]. A node announcing anything else is
+        // dropped rather than forced onto a transport it did not ask for, which
+        // would fail at the handshake with a useless error.
         val network = params["type"]?.lowercase(Locale.US).orEmpty().ifEmpty { "tcp" }
-        if (network != "ws" && scheme != "anytls") return null
+        if (network != "ws" && network != "xhttp" && scheme != "anytls") return null
 
         // anytls:// is its own URI shape (docs/uri_scheme.md): password in the
         // userinfo, host[:port] with 443 as the default port, `sni` and
@@ -284,6 +299,7 @@ object ShardConfigs {
                 cipherSuites = "",
                 finalMask = "",
                 alpn = "",
+                extra = "",
                 label = label,
             )
         }
@@ -305,6 +321,7 @@ object ShardConfigs {
             cipherSuites = params["cs"].orEmpty(),
             finalMask = params["fm"].orEmpty(),
             alpn = params["alpn"].orEmpty(),
+            extra = params["extra"].orEmpty(),
             label = label,
         )
     } catch (_: Exception) {
@@ -417,7 +434,25 @@ object ShardConfigs {
                         // subscription sends, not what we used to hardcode.
                         put("fingerprint", node.fingerprint)
                         if (node.cipherSuites.isNotEmpty()) put("cipherSuites", node.cipherSuites)
-                        if (node.alpn.isNotEmpty()) {
+                        // ALPN is the one place xhttp and ws cannot share a value.
+                        //
+                        // The fork's splithttp dialer picks its HTTP version from
+                        // exactly one ALPN entry (decideHTTPVersion,
+                        // transport/internet/splithttp/dialer.go): one entry that
+                        // is not "http/1.1" or "h3" means HTTP/2, and zero entries
+                        // mean HTTP/2 as well. So the `http/1.1` the subscription
+                        // pins for a WebSocket node is correct there — the upgrade
+                        // is a 1.1 request — but on xhttp it would force the whole
+                        // tunnel onto 1.1 while the publisher's own recipe for the
+                        // current Iranian block is "XHTTP with alpn h2".
+                        //
+                        // Only override when the node did not say: an xhttp node
+                        // that ships its own `alpn` was tuned by whoever runs it,
+                        // and that verdict beats our default. ws nodes keep whatever
+                        // they always had, so nothing already in the field changes.
+                        if (node.network == "xhttp" && node.alpn.isEmpty()) {
+                            put("alpn", JSONArray().put("h2"))
+                        } else if (node.alpn.isNotEmpty()) {
                             put("alpn", JSONArray().apply { node.alpn.split(',').forEach { put(it.trim()) } })
                         }
                         // allowInsecure stays FALSE. These are other people's CDN
@@ -430,17 +465,42 @@ object ShardConfigs {
                     }
                 )
             }
-            put(
-                "wsSettings",
-                JSONObject().apply {
-                    put("path", node.path)
-                    // Independent "host", not headers.Host. The fork's
-                    // WebSocketConfig.Build() accepts the header form but calls
-                    // PrintDeprecatedFeatureWarning for it, which would put a
-                    // warning line in the user's log on every single connect.
-                    put("host", node.host)
-                }
-            )
+            if (node.network == "xhttp") {
+                put(
+                    "xhttpSettings",
+                    JSONObject().apply {
+                        put("path", node.path)
+                        put("host", node.host)
+                        // `mode` is not carried in the subscription, and the
+                        // fork's own default ("auto") is what a CDN-fronted node
+                        // wants: packet-up for small uploads, stream-up once a
+                        // flow grows. Sending "auto" explicitly is byte-identical
+                        // to omitting it (SplitHTTPConfig.Build), and it keeps
+                        // this object self-describing in the user's log.
+                        put("mode", "auto")
+                        // Verbatim, same rule as finalmask: `extra` is the
+                        // publisher's own override block and the fork applies it
+                        // on top of these fields, so anything we put here that
+                        // contradicts it would simply be overwritten — and
+                        // anything we invent would be ours to maintain.
+                        if (node.extra.isNotEmpty()) {
+                            put("extra", JSONObject(node.extra))
+                        }
+                    }
+                )
+            } else {
+                put(
+                    "wsSettings",
+                    JSONObject().apply {
+                        put("path", node.path)
+                        // Independent "host", not headers.Host. The fork's
+                        // WebSocketConfig.Build() accepts the header form but calls
+                        // PrintDeprecatedFeatureWarning for it, which would put a
+                        // warning line in the user's log on every single connect.
+                        put("host", node.host)
+                    }
+                )
+            }
         }
 
         return JSONObject().apply {
@@ -454,6 +514,16 @@ object ShardConfigs {
 
     /**
      * Connection multiplexing for [node], or null when it must not be used.
+     *
+     * ## Why xhttp does not need it, and gets it anyway
+     *
+     * XHTTP has its own multiplexer — `xmux`, configured through `extra` and
+     * applied by the fork inside the transport (transport/internet/splithttp,
+     * XmuxManager). Layering xray's SOCKS-side `mux` on top would be a second
+     * multiplexer for no benefit, so on xhttp this stays on for the same reason
+     * it does on ws — [ShardSocksFront] forwards UDP as XUDP, and the
+     * `xudpConcurrency`/`xudpProxyUDP443` pair below is what makes DNS answer on
+     * this transport. Neither is a transport choice; both ride the inbound.
      *
      * ## Why this is the single biggest speed win available here
      *
