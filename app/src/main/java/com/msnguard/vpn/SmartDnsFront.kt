@@ -945,7 +945,7 @@ object SmartDnsFront {
         )
         return SmartDnsResolver(
             servers = servers,
-            upstreamHost = UPSTREAM_HOST,
+            upstreamHost = "127.0.0.1",
             upstreamPort = upstreamPort,
             autoFailover = true,
             onPathChange = { path ->

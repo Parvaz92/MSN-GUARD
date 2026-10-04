@@ -4566,7 +4566,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 val smartDnsUp = activeEngine != TunEnginePref.LEGACY &&
                     SmartDnsFront.start(this@MsnGuardVpnService, effectiveConfig, CoreConfig.SOCKS_PORT)
                 val socksForEngine = when {
-                    smartDnsUp -> SmartDnsConfig.SMART_DNS_FRONT_PORT
+                    smartDnsUp -> CoreConfig.SMART_DNS_FRONT_PORT
                     legacyFrontUp -> WarpUdpgwFront.LISTEN_PORT
                     else -> CoreConfig.SOCKS_PORT
                 }
@@ -6178,9 +6178,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // SmartDnsFront answers over DoT/DoH through the WARP egress. Plain UDP
         // entries are unaffected and keep the path below exactly as before.
         if (SmartDnsServers.hasEncrypted(config)) {
-            runCatching { addDnsServer(java.net.InetAddress.getByName(SmartDnsConfig.SMART_DNS_RESOLVER)) }
+            runCatching { addDnsServer(java.net.InetAddress.getByName(CoreConfig.SMART_DNS_RESOLVER)) }
             ConnectionLog.record(
-                "DNS: engine=$engine → virtual resolver ${SmartDnsConfig.SMART_DNS_RESOLVER} " +
+                "DNS: engine=$engine → virtual resolver ${CoreConfig.SMART_DNS_RESOLVER} " +
                     "(encrypted DNS is answered in-process over the tunnel)"
             )
             return this

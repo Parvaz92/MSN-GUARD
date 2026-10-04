@@ -37,7 +37,7 @@ object CoreConfig {
      * because this front only ever runs on the Hev/Zeptun WARP path, where none
      * of those are bound.
      */
-    const val SMART_DNS_FRONT_PORT = 1828
+    const val SMART_DNS_FRONT_PORT = 1827
 
     /**
      * The virtual resolver advertised on the TUN when the user has encrypted DNS
