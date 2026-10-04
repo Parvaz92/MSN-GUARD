@@ -178,7 +178,7 @@ async fn exchange_doh(
         .send_request(request, false)
         .map_err(|e| AetherError::Other(format!("doh: send request: {e}")))?;
     send_stream
-        .send_data(bytes::Bytes::from(query), true)
+        .send_data(bytes::Bytes::copy_from_slice(query), true)
         .map_err(|e| AetherError::Other(format!("doh: send body: {e}")))?;
     let response = resp_fut
         .await
