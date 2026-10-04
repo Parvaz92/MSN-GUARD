@@ -6177,7 +6177,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // the device is pointed at the in-process virtual resolver instead, which
         // SmartDnsFront answers over DoT/DoH through the WARP egress. Plain UDP
         // entries are unaffected and keep the path below exactly as before.
-        if (SmartDnsServers.hasEncrypted(config)) {
+        if (SmartDnsServer.hasEncrypted(config)) {
             runCatching { addDnsServer(java.net.InetAddress.getByName(CoreConfig.SMART_DNS_RESOLVER)) }
             ConnectionLog.record(
                 "DNS: engine=$engine → virtual resolver ${CoreConfig.SMART_DNS_RESOLVER} " +

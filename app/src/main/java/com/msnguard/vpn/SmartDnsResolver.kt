@@ -170,6 +170,19 @@ data class SmartDnsServer(
         fun isIpv4(text: String): Boolean = IPV4.matches(text)
 
         /**
+         * True when the config carries at least one `tls://` or `https://` resolver —
+         * the two Android's own TUN resolver cannot speak. Decides whether the device
+         * is pointed at the in-process virtual resolver instead.
+         */
+        fun hasEncrypted(config: String): Boolean {
+            val raw = runCatching { org.json.JSONObject(config).optString("dns_servers").trim() }
+                .getOrDefault("")
+            if (raw.isEmpty()) return false
+            return parse(raw, Transport.DOT).isNotEmpty() ||
+                parse(raw, Transport.DOH).isNotEmpty()
+        }
+
+        /**
          * An IPv4 address that can actually be a resolver: not `0/8`, loopback `127/8`, link-local
          * `169.254/16`, CGNAT `100.64/10`, private `10/8` and `172.16/12` and `192.168/16`, or
          * `224` and up — multicast, reserved and the limited broadcast, none of which can answer a

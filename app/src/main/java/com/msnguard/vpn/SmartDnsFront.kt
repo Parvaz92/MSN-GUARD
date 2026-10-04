@@ -1048,10 +1048,8 @@ object SmartDnsFront {
         val relayHost: InetAddress,
         val relayPort: Int,
         /** What the client asked about, to reframe aether's replies with. */
-        @Volatile
-        var clientAddress: InetAddress = InetAddress.getByName("127.0.0.1")
-        @Volatile
-        var clientPort: Int = 0
+        var clientAddress: InetAddress = InetAddress.getByName("127.0.0.1"),
+        var clientPort: Int = 0,
     ) {
         @Volatile
         var lastUsed: Long = System.currentTimeMillis()
