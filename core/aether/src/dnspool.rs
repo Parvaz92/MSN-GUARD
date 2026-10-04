@@ -63,7 +63,7 @@ enum ConnInner {
 /// The h2 half of a pooled DoH connection.
 pub(crate) struct DohConn {
     /// Opens a new request stream on the live h2 connection.
-    pub send: h2::client::SendResponse<bytes::Bytes>,
+    pub send: h2::client::SendRequest<bytes::Bytes>,
     /// Background task pumping the h2 connection. Owned by the pool entry, so an
     /// idle DoH connection stays driven and a borrowed one cannot outlive it.
     pub drive: tokio::task::JoinHandle<()>,
@@ -76,7 +76,7 @@ impl PooledConn {
 
     fn new_doh(
         key: String,
-        send: h2::client::SendResponse<bytes::Bytes>,
+        send: h2::client::SendRequest<bytes::Bytes>,
         drive: tokio::task::JoinHandle<()>,
     ) -> Self {
         PooledConn { key, inner: ConnInner::Doh(DohConn { send, drive }) }
@@ -130,7 +130,7 @@ pub(crate) fn install_dot(
 /// Wrap a freshly handshaked DoH connection. See [`install_dot`].
 pub(crate) fn install_doh(
     key: String,
-    send: h2::client::SendResponse<bytes::Bytes>,
+    send: h2::client::SendRequest<bytes::Bytes>,
     drive: tokio::task::JoinHandle<()>,
 ) -> PooledConn {
     PooledConn::new_doh(key, send, drive)
