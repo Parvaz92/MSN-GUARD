@@ -1371,6 +1371,10 @@ class MainActivity : Activity() {
         addView(label(Strings.t("MSN-GUARD"), 13f, MUTED, TypefaceStyle.MEDIUM).apply {
             letterSpacing = spacing(0.14f)
         })
+        addView(label(appVersion(), 11f, MUTED).apply {
+            setSingleLine(true)
+            setPadding(dp(5), 0, 0, 0)
+        })
         addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f))
         addView(ImageView(this@MainActivity).apply {
             setImageResource(R.drawable.ic_settings)

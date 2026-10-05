@@ -19,7 +19,10 @@ use crate::masque::{self, Capsule, CapsuleParser};
 use crate::quic::{AssignedAddr, Control, Internals};
 use crate::tls;
 
-const H2_ALPN: &[u8] = b"\x02h2";
+/// ALPN: HTTP/2, then HTTP/1.1, as Chrome offers them; the edge picks HTTP/2, which the
+/// tunnel speaks. Listing h2 alone left no fallback, so a peer that negotiates by
+/// ALPN answered nothing and the handshake hung instead of being retried.
+const H2_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 const CHROME_GROUPS: &str = "P-256:X25519:P-384";
 static H2_FALLBACK: AtomicBool = AtomicBool::new(false);
 static H2_PREFERRED: AtomicBool = AtomicBool::new(false);

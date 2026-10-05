@@ -393,6 +393,15 @@ fn apply_runtime_options(options: &StartOptions) {
     }
     if options.h2_fragmentation == Some(true) {
         std::env::set_var("AETHER_MASQUE_H2_FRAGMENT", "1");
+        // Patterniha's recipe for the current Iranian block on H2:
+        // fragment + tlshello shape, applied here so the app never has to
+        // expose a second knob — picking H2 is the signal.
+        if std::env::var("AETHER_MASQUE_H2_FRAGMENT_SIZE").is_err() {
+            std::env::set_var("AETHER_MASQUE_H2_FRAGMENT_SIZE", "8-24");
+        }
+        if std::env::var("AETHER_MASQUE_H2_FRAGMENT_DELAY").is_err() {
+            std::env::set_var("AETHER_MASQUE_H2_FRAGMENT_DELAY", "5-15");
+        }
     } else {
         std::env::remove_var("AETHER_MASQUE_H2_FRAGMENT");
     }
