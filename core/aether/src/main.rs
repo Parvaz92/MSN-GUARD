@@ -2317,8 +2317,8 @@ async fn run_wireguard(
     let (mode_str, ip) = if forced.is_some() || quick.is_some() {
         (String::new(), prober::IpScan::V4)
     } else {
-        let mode_str = select_scan_mode_str().await;
-        let ip = select_ip_version().await;
+        let mode_str = select_scan_mode_str_or(options.scan_mode.label());
+        let ip = select_ip_version_or(options.ip_scan);
         (mode_str, ip)
     };
 
@@ -4011,6 +4011,30 @@ async fn select_ip_version() -> prober::IpScan {
         Some("3") => prober::IpScan::Both,
         _ => prober::IpScan::V4,
     }
+}
+
+/// Like [`select_ip_version`] but honours the app's UI choice on Android.
+///
+/// Android calls Aether through JNI with no TTY, so `prompt_line` would always
+/// return `None` and the caller would silently get `V4` no matter what the
+/// Scan Mode screen chose. The FFI path already parses the `ip_scan` field into
+/// `StartOptions.ip_scan`; this helper lets the WireGuard loop consume it.
+/// An explicit `AETHER_IP` env override still wins, matching the CLI helper.
+fn select_ip_version_or(caller: prober::IpScan) -> prober::IpScan {
+    if let Ok(v) = std::env::var("AETHER_IP") {
+        return prober::IpScan::parse(&v);
+    }
+    caller
+}
+
+/// Like [`select_scan_mode_str`] but honours the app's UI choice on Android.
+fn select_scan_mode_str_or(default: &str) -> String {
+    if let Ok(v) = std::env::var("AETHER_SCAN") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    default.to_string()
 }
 
 const MAX_CACHED_MASQUE_GATEWAYS: usize = 12;
