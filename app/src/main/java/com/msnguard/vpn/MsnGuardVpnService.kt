@@ -4561,18 +4561,38 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 val legacyFrontUp = activeEngine == TunEnginePref.LEGACY && WarpUdpgwFront.start(CoreConfig.SOCKS_PORT)
                 // Encrypted DNS: SmartDnsFront answers the device's DNS itself over
                 // DoT/DoH on the WARP egress and relays every other byte to the core.
-                // Only for the engines whose mapdns/fake-ip cannot speak DoT or DoH —
-                // Legacy keeps its own path, and plain-UDP configs never start a front.
+                // Only for the engines whose mapdns/fake-ip cannot speak DoT or DoH
+                // — and only when the user actually asked for encrypted DNS
+                // (tls:// / https://). In the common case the user has plain
+                // 1.1.1.1 + 8.8.8.8 there is no encrypted entry and routing
+                // every TCP through this loopback would be a pure overhead hop:
+                // Zeptun → 1827 → 1819 → WARP, one SOCKS parse + relay for each
+                // stream. The hop is kept only when it actually owns a job —
+                // encrypted DNS — otherwise the engines talk straight to aether
+                // as they did when Zeptun was fast (v2.1.9).
                 val smartDnsUp = activeEngine != TunEnginePref.LEGACY &&
+                    SmartDnsServer.hasEncrypted(effectiveConfig) &&
                     SmartDnsFront.start(this@MsnGuardVpnService, effectiveConfig, CoreConfig.SOCKS_PORT)
                 val socksForEngine = when {
                     smartDnsUp -> CoreConfig.SMART_DNS_FRONT_PORT
                     legacyFrontUp -> WarpUdpgwFront.LISTEN_PORT
                     else -> CoreConfig.SOCKS_PORT
                 }
+                // ── MTU: same for the Builder's VPN interface and the TunEngine.
+                //    SHARD is the only tunnel bound to 512 — its WebSocket leg
+                //    drops anything bigger. A WARP leg (like the one behind
+                //    Psiphon or Tor) is WireGuard/MASQUE+jumbo-safe, so pushing
+                //    it down to 512 would fragment every real page while helping
+                //    nothing, and since a2b07e1 1330 was cargo-culted from the
+                //    Zeptun preset — not measured against this path. Restored to
+                //    1420: under 1500, over 1280 (when WARP was fast as a native
+                //    TUN at v2.1.9), and leaves headroom for the SOCKS and WARP
+                //    headers that ride inside the TUN payload. The two must agree
+                //    — a 1500 TUN feeding a 1420 engine (or vice versa) still
+                //    asks the peer to carry more than the hop advertises.
                 tun = Builder()
                     .setSession("MSN-GUARD")
-                    .setMtu(1330)
+                    .setMtu(1420)
                     .applyTunnelAddresses(addresses)
                     .applyDns(effectiveConfig, addresses, activeEngine)
                     .applyGatewayProxy(effectiveConfig, addresses)
@@ -4583,7 +4603,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 vpnModeActive.set(true)
                 TunnelStatus.isNativeTunMode = false
                 TunnelStatus.isProxyMode = false
-                if (!TunEngineManager.start(this, tun!!, socksForEngine, mtu = 1330)) {
+                if (!TunEngineManager.start(this, tun!!, socksForEngine, mtu = 1420)) {
                     ConnectionLog.record("TunEngine failed — falling back to native TUN")
                     try { TunEngineManager.stop(this) } catch (_: Throwable) {}
                     tun?.close(); tun = null; vpnModeActive.set(false)

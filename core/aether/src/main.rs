@@ -231,8 +231,45 @@ pub async fn run_cli() -> Result<()> {
     options.wireguard_config_path = std::env::var("AETHER_WG_CONFIG").ok();
     options.masque_config_path = std::env::var("AETHER_MASQUE_CONFIG").ok();
     options.forced_peer = forced_peer;
-    options.scan_mode = select_scan_mode().await;
-    options.ip_scan = select_ip_version().await;
+    // ── scan_mode / ip_scan: the app's choice wins, the prompt is only a
+    //    terminal fallback ────────────────────────────────────────────────
+    // Both values were already parsed out of the FFI config by [load_fi]
+    // (see ffi.rs: `ScanMode::parse(&value.scan_mode)` and the same for
+    // ip_scan), which is where the app's UI selection lands. Overwriting them
+    // here unconditionally discarded that selection, and on Android stdin is
+    // never a TTY so `prompt_line` always returns None — meaning
+    // `select_ip_version()` could only ever yield IPv4. The IPv6 entry in the
+    // Scan Mode screen was therefore dead: the log read `ip=ipv4` no matter
+    // what the user picked. Same for scan mode, which the UI also exposes.
+    //
+    // The env vars stay the highest priority (they are how the CLI and tests
+    // override everything), and the interactive prompt is kept as the last
+    // resort so a bare terminal run with no config at all still asks. Only the
+    // middle layer is new: keep what the caller already chose.
+    {
+        use std::io::IsTerminal;
+        match std::env::var("AETHER_SCAN") {
+            Ok(v) => options.scan_mode = prober::ScanMode::parse(&v),
+            Err(_) => {
+                if std::io::stdin().is_terminal() {
+                    options.scan_mode = select_scan_mode().await;
+                }
+            }
+        }
+        match std::env::var("AETHER_IP") {
+            Ok(v) => options.ip_scan = prober::IpScan::parse(&v),
+            Err(_) => {
+                if std::io::stdin().is_terminal() {
+                    options.ip_scan = select_ip_version().await;
+                }
+            }
+        }
+        log::info!(
+            "[*] scan selection: mode={} ip={}",
+            options.scan_mode.label(),
+            options.ip_scan.label()
+        );
+    }
     options.obfuscation_profile = std::env::var("AETHER_NOIZE").ok();
     options.obfuscation_parameters = std::env::var("AETHER_NOIZE_PARAMETERS").ok();
     options.retry_obfuscation_profiles = std::env::var("AETHER_WG_NO_PROFILE_RETRY").is_err();
