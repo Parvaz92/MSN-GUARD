@@ -128,10 +128,39 @@ object CoreConfig {
         listenOverride: Int?,
         socksProxyForCore: String = "",
     ): String {
-        // Kept for the callers that still hand a JSON blob to NativeCore. The
-        // Aether 2.3.0 engine reads nothing from it — [env] is the config now.
-        env(context, protocol, listenOverride, socksProxyForCore)
-        return "{}"
+        val prefs = context.profiled()
+        fun text(key: String, fallback: String = "") =
+            prefs.getString(key, fallback)?.trim().orEmpty()
+        val effectiveProtocol = when {
+            protocol == null -> text("default_protocol", "wireguard")
+            protocol == "masque" && mimArmed(context) -> MIM_PROTOCOL
+            else -> protocol
+        }
+        return org.json.JSONObject().apply {
+            // The old core read these; the 2.3.0 job reads env, but sending them
+            // here keeps currentProtocol/protocol parsing and lastResult fallbacks
+            // working and avoids {} in logs/notifications.
+            put("protocol", effectiveProtocol)
+            put("config_path", java.io.File(context.filesDir, "aether.toml").absolutePath)
+            put("listen", if (listenOverride != null) "127.0.0.1:$listenOverride" else "${proxyBindHost(context)}:${sharedSocksPort(context)}")
+            put("scan_mode", text("default_scan_mode", "balanced"))
+            put("ip_scan", text("default_scan", "v4"))
+            // forwarded verbatim when present — keeps pin/SHARD-identity logic from breaking
+            if (socksProxyForCore.isNotBlank()) put("socks_proxy", socksProxyForCore)
+            text("manual_endpoint").ifBlank { null }?.let { put("forced_peer", it) }
+            text("manual_inner_endpoint").ifBlank { null }?.let { put("forced_inner_peer", it) }
+            put("obfuscation_profile", text("obfuscation_profile", "balanced"))
+            put("tls_curve_preset", text("tls_curve_preset", "chrome"))
+            put("wireguard_data_check", prefs.getBoolean("wireguard_data_check", true))
+            put("log_level", text("log_level", "info"))
+            put("perf_profile", text("perf_profile", "auto"))
+            put("h2_fragmentation", text("h2_fragmentation", "on") == "on")
+            put("mixed_case_sni", prefs.getBoolean("mixed_case_sni", false))
+            text("dns_servers").ifBlank { null }?.let { put("dns_servers", it) }
+            text("route_block").ifBlank { null }?.let { put("route_block", it) }
+            text("route_direct").ifBlank { null }?.let { put("route_direct", it) }
+            // AETHER_* is the live path from the next block; this JSON is just compat.
+        }.toString()
     }
 
     /**
@@ -287,12 +316,32 @@ object CoreConfig {
             out["AETHER_MASQUE_H2_FRAGMENT"] = "1"
         }
 
-        // Identity provisioning through SHARD. When the carrier has blocked the
-        // account API, this points the core's registration at a SOCKS listener
-        // that is already on the open internet, so a fresh install can obtain an
-        // identity it could not get from its own link. The engine reads a
-        // socks5:// URL in AETHER_UPSTREAM.
-        if (socksProxyForCore.isNotBlank()) {
+        // Distributed identity via ECH — EXACTLY as FCAE does.
+        // FCAE never raised SHARD and never set AETHER_UPSTREAM for a fresh
+        // install; its log says:
+        //   fetched ECHConfigList (71 bytes) for cloudflare-ech.com via udp://1.1.1.1:53
+        //   fetched ECHConfigList automatically for the WARP API (71 bytes)
+        //   registration went over ECH
+        // That path is inside the engine: with AETHER_ECH=auto the engine
+        // looks the ECHConfigList up over udp://1.1.1.1:53 for
+        // cloudflare-ech.com and offers it on the api.cloudflareclient.com
+        // ClientHello, so the register goes encrypted and is not named on the
+        // wire. On a filtered carrier it is the ONLY way the API answers.
+        // Enabling it is the whole fix for (1) and (3): the engine provisions
+        // on its own link, no SHARD session, no probe, no timeout.
+        if (socksProxyForCore.isBlank()) {
+            if (text("aether_ech", "").isBlank()) {
+                out["AETHER_ECH"] = "auto"
+            } else {
+                out["AETHER_ECH"] = text("aether_ech", "auto")
+            }
+            // Same for the AETHER_UPSTREAM comment above: with AETHER_ECH the
+            // carrier no longer dictates an uplink for the account API.
+            // AETHER_UPSTREAM is kept only for the two transports that have no
+            // account at all (Psiphon, Tor) and for the case a future setting
+            // explicitly wants a proxy — otherwise it stays unset, exactly as
+            // in the FCAE run whose log you sent.
+        } else if (socksProxyForCore.isNotBlank()) {
             out["AETHER_UPSTREAM"] = socksProxyForCore
         }
 

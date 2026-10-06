@@ -4124,26 +4124,12 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // to raise xray, so it cannot run on the main thread — ACTION_CONNECT
         // arrives there. Deferred into the worker below, which rebuilds
         // effectiveConfig once it knows the answer.
-        var needsIdentityProxy: String? = null
-        // currentProtocol is uppercased at line 4022 for use as a case-insensitive
-        // enum-like key, so compare against the lowercased form: this whole
-        // decision was silently dead code while it checked for "wireguard" against
-        // a string that can only ever contain "WIREGUARD".
-        val protocolLower = currentProtocol.lowercase()
-        if (protocolLower.contains("wireguard") ||
-            protocolLower.contains("masque") ||
-            protocolLower.contains("gool") ||
-            protocolLower.contains("warp") ||
-            // MIM is its own protocol string ("mim"), not a masque substring,
-            // so the clauses above never matched it. The whole SHARD-provisioning
-            // decision was unreachable for this transport: the core was left to
-            // register on its own link, which is exactly the blocked path the
-            // fallback exists for.
-            protocolLower.contains("mim")
-        ) {
-            // Computed inside the worker, see below.
-            needsIdentityProxy = DEFERRED_IDENTITY_PROXY
-        }
+        // Registration is ECH inside the engine itself (FCAE aether 2.3.0:
+        // `registration went over ECH` — the engine fetches the ECHConfigList
+        // for cloudflare-ech.com via udp://1.1.1.1:53 and never needs a SHARD
+        // uplink to reach the account API). No probe, no SHARD session, no
+        // timeout: the core provisions on its own link, exactly as in the FCAE
+        // log you sent.
         if (sessionExitCountry != null &&
             exitPinPeer == null &&
             !config.contains(CHAIN_PROTOCOL_MARKER) &&
@@ -4166,15 +4152,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 )
             }
         }
-        var effectiveConfig = if (exitPinPeer != null || needsIdentityProxy != null) {
+        var effectiveConfig = if (exitPinPeer != null) {
             runCatching {
                 val json = JSONObject(config)
-                exitPinPeer?.let { json.put("forced_peer", it) }
-                // DEFERRED_IDENTITY_PROXY is a placeholder, not an address: it
-                // only kept this branch open. The worker replaces it with the
-                // real SOCKS address (or drops it) once the probe is done.
-                needsIdentityProxy?.takeIf { it != DEFERRED_IDENTITY_PROXY }
-                    ?.let { json.put("socks_proxy", it) }
+                json.put("forced_peer", exitPinPeer)
                 json.toString()
             }.getOrElse { config }
         } else {
@@ -4442,25 +4423,6 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
 
         worker.execute {
             try {
-                // Resolve the deferred identity decision on this thread: the
-                // probe (and possibly raising xray) blocks, and ACTION_CONNECT
-                // calls startTunnel on the main thread.
-                if (needsIdentityProxy == DEFERRED_IDENTITY_PROXY) {
-                    sendStatus(STATUS_CONNECTING, Strings.t("Retrieving identity, please wait."), 10)
-                    needsIdentityProxy = provisionIdentityThroughShard(currentProtocol)
-                    effectiveConfig = if (exitPinPeer != null || needsIdentityProxy != null) {
-                        runCatching {
-                            val json = JSONObject(config)
-                            exitPinPeer?.let { json.put("forced_peer", it) }
-                            needsIdentityProxy?.let { json.put("socks_proxy", it) }
-                            json.toString()
-                        }.getOrElse { config }
-                    } else {
-                        config
-                    }
-                    storedConfig = effectiveConfig
-                }
-
                 ConnectionLog.record("Preparing $currentProtocol identity")
                 NativeCore.attach(this)
 
