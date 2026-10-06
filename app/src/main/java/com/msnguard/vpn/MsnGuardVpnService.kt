@@ -6048,6 +6048,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         packages.forEach { pkg ->
             try {
                 when (mode) {
+                    SplitTunnelSettings.Mode.ALL -> {
+                        // ALL is handled above and returns immediately.
+                    }
                     SplitTunnelSettings.Mode.INCLUDE -> {
                         addAllowedApplication(pkg)
                         addedCount++
