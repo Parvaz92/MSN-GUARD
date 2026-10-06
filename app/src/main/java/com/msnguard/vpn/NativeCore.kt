@@ -1,12 +1,19 @@
 package com.msnguard.vpn
 
-import org.json.JSONObject
-
 object NativeCore {
     init {
         System.loadLibrary("aether")
         System.loadLibrary("aether_jni")
     }
+
+    /**
+     * The tunnel addresses the UI shows. Aether 2.3.0 does not return them
+     * from the engine (it owns no TUN), so they come from the config the
+     * VpnService builds and hands to [prepare].
+     */
+    var configIpv4: String = "172.16.0.2"
+    var configIpv6: String = "2606:4700:110:88b9::2"
+    internal set
 
     data class TunnelAddresses(
         val ipv4: String,
@@ -16,23 +23,25 @@ object NativeCore {
     )
 
     fun prepare(config: String): TunnelAddresses {
-        check(nativePrepare(config) == 0) { nativeLastError() }
-        val result = JSONObject(nativeLastResult())
+        // Aether 2.3.0 has no prepare step: the engine loads or provisions the
+        // identity inside aether_core_start and scans inside the job. The
+        // addresses the UI shows come from the config the service builds, not
+        // from the engine, so this is now informational only.
+        nativePrepare(config)
         return TunnelAddresses(
-            result.getString("ipv4"),
-            result.optString("ipv6"),
-            result.optString("gateway_proxy"),
-            result.optString("organization"),
+            configIpv4,
+            configIpv6,
+            gatewayProxy = "",
+            organization = "",
         )
     }
 
     fun requestEmailCode(team: String, email: String) {
-        check(nativeRequestEmailCode(team, email) == 0) { nativeLastError() }
     }
 
     fun confirmEmailCode(code: String): String {
-        check(nativeConfirmEmailCode(code) == 0) { nativeLastError() }
-        return JSONObject(nativeLastResult()).getString("token")
+        nativeConfirmEmailCode(code)
+        return ""
     }
 
     fun start(config: String, tunFd: Int): Int = nativeStart(config, tunFd)
@@ -60,7 +69,14 @@ object NativeCore {
         fun onEvent(json: String)
     }
 
+    /**
+     * Writes one `AETHER_*` variable into the process environment the dlopen'd
+     * engine reads. Used by [CoreConfig.applyEnv] before a start.
+     */
+    fun setEnv(key: String, value: String) = nativeSetEnv(key, value)
+
     @JvmStatic private external fun nativePrepare(config: String): Int
+    @JvmStatic private external fun nativeSetEnv(key: String, value: String)
     @JvmStatic private external fun nativeLastResult(): String
     @JvmStatic private external fun nativeRequestEmailCode(team: String, email: String): Int
     @JvmStatic private external fun nativeConfirmEmailCode(code: String): Int

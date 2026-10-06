@@ -18,6 +18,7 @@ pub mod masque;
 pub mod masque_h2;
 pub mod netstack;
 pub mod noize;
+pub mod platform;
 pub mod prober;
 pub mod psiphon;
 pub mod quic;

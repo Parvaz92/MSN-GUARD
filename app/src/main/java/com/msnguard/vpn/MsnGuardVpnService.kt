@@ -3872,6 +3872,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             sendStatus(STATUS_CONNECTING, Strings.tf("Connecting %s…", Strings.t(label)))
 
             val config = CoreConfig.chainOuterJson(this, protocol)
+            // 2.3.0 config is the process environment, not the JSON blob. The
+            // outer leg must move the engine's SOCKS listener aside to
+            // CHAIN_SOCKS_PORT, which is what listenOverride does in [env].
+            CoreConfig.applyEnv(CoreConfig.env(this, protocol, CoreConfig.CHAIN_SOCKS_PORT))
             val started = runCatching {
                 // Provisions or loads this protocol's identity. MASQUE and WireGuard
                 // keep separate ones, and a failure here (a refused registration, no
@@ -4542,6 +4546,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // VPN MODE: unified TunEngine
                 // TUN → TunEngine (Hev/Zeptun/Legacy per user choice) → 127.0.0.1:1819 SOCKS → WARP.
                 // So DNS and all UDP go via SOCKS ASSOCIATE + mapdns via SOCKS ASSOCIATE + mapdns.
+                // Aether 2.3.0 reads its whole config from AETHER_*; install it before the
+                // engine starts. The engine owns no TUN — it publishes the SOCKS listener
+                // AETHER_SOCKS names and the TunEngine below bridges the VPN interface to it.
+                CoreConfig.applyEnv(
+                    CoreConfig.env(
+                        this@MsnGuardVpnService,
+                        effectiveConfig.substringAfter("\"protocol\":\"").substringBefore('"').ifBlank { null },
+                    ),
+                )
                 val addresses = NativeCore.prepare(effectiveConfig)
                 if (addresses.organization.isNotBlank()) {
                     ConnectionLog.record("Zero Trust organization ${addresses.organization}")

@@ -128,114 +128,224 @@ object CoreConfig {
         listenOverride: Int?,
         socksProxyForCore: String = "",
     ): String {
+        // Kept for the callers that still hand a JSON blob to NativeCore. The
+        // Aether 2.3.0 engine reads nothing from it — [env] is the config now.
+        env(context, protocol, listenOverride, socksProxyForCore)
+        return "{}"
+    }
+
+    /**
+     * The Aether 2.3.0 engine is configured entirely through its `AETHER_*`
+     * process environment — the same surface fcae-ffi's aether bridge projects
+     * a `FcaeConfig` onto (core/fcae-ffi/runtime/src/config.rs, `env_compat`).
+     * This builds that environment from the app's preferences, one key per
+     * option, and is what the VpnService installs before NativeCore.start().
+     */
+    fun env(
+        context: Context,
+        protocol: String? = null,
+        listenOverride: Int? = null,
+        socksProxyForCore: String = "",
+    ): Map<String, String> {
         val prefs = context.profiled()
         fun text(key: String, fallback: String = "") =
             prefs.getString(key, fallback)?.trim().orEmpty()
-        val manualObfuscation = JSONObject().apply {
-            text("obfuscation_jc").toIntOrNull()?.let { put("jc", it) }
-            text("obfuscation_jmin").toIntOrNull()?.let { put("jmin", it) }
-            text("obfuscation_jmax").toIntOrNull()?.let { put("jmax", it) }
-            putOpt("i1", text("obfuscation_i1").ifBlank { null })
-            putOpt("i2", text("obfuscation_i2").ifBlank { null })
+        fun bool(key: String, fallback: Boolean) = prefs.getBoolean(key, fallback)
+
+        // Fallback must match MainActivity's `savedProtocol()` and the tile's
+        // default. This is the value used before the user has ever picked
+        // anything, i.e. on a first connect — and WireGuard now leads the rail,
+        // so a disagreement here would build a MASQUE config under a UI showing
+        // WireGuard selected.
+        // Masque-over-masque: when the user armed the second hop, a MASQUE
+        // connect becomes a MIM connect. Rewritten here rather than by the
+        // callers so the tile, the dial and a quick reconnect cannot miss it.
+        val effectiveProtocol = if (
+            (protocol ?: text("default_protocol", "wireguard")) == "masque" &&
+            mimArmed(context)
+        ) {
+            MIM_PROTOCOL
+        } else {
+            protocol ?: text("default_protocol", "wireguard")
         }
 
-        return JSONObject().apply {
-            put("config_path", File(context.filesDir, "aether.toml").absolutePath)
-            // Identity provisioning through SHARD. When the carrier has blocked
-            // the account API, this points the core's registration at a SOCKS
-            // listener that is already on the open internet, so a fresh install
-            // can obtain an identity it could not get from its own link.
-            // Written by MsnGuardVpnService during the SHARD provision step and
-            // cleared again once it has an identity; absent on a normal connect.
-            takeIf { socksProxyForCore.isNotBlank() }?.put("socks_proxy", socksProxyForCore)
-            // Fallback must match MainActivity's `savedProtocol()` and the tile's
-            // default. This is the value used before the user has ever picked
-            // anything, i.e. on a first connect — and WireGuard now leads the rail,
-            // so a disagreement here would build a MASQUE config under a UI showing
-            // WireGuard selected.
-            // Masque-over-masque: when the user armed the second hop, a MASQUE
-            // connect becomes a MIM connect. Rewritten here rather than by the
-            // callers so the tile, the dial and a quick reconnect cannot miss
-            // it — the same reason the chain marker is passed as a protocol by
-            // the callers, but this one is a pure function of the MASQUE
-            // selection, so it belongs with the selection.
-            val effectiveProtocol = if (
-                (protocol ?: text("default_protocol", "wireguard")) == "masque" &&
-                mimArmed(context)
-            ) {
-                MIM_PROTOCOL
-            } else {
-                protocol ?: text("default_protocol", "wireguard")
+        val out = LinkedHashMap<String, String>()
+
+        // The identity file. The engine loads an existing one or provisions a
+        // fresh one next to it (`loaded existing warp identity from .../aether.toml`).
+        out["AETHER_CONFIG"] = File(context.filesDir, "aether.toml").absolutePath
+
+        // Masque's identity is a sibling of the WARP one, derived by the engine
+        // itself; no key is set so both live in filesDir.
+
+        // Which protocol carries the tunnel. The engine's own Protocol::parse
+        // maps wg/wireguard, gool/wiw/warp-in-warp, mim/m2/masque-in-masque,
+        // everything else -> masque.
+        out["AETHER_PROTOCOL"] = effectiveProtocol
+
+        // Where the core's own SOCKS listener goes.
+        //
+        // Three cases, and the first two are why this is not a constant any more:
+        //
+        //  - CHAINED OUTER LEG (listenOverride set): always loopback. It is an
+        //    internal pipe between the core and Psiphon/Tor inside this process,
+        //    and publishing it on the LAN would hand strangers the raw WARP leg.
+        //  - SOCKS TUNNEL TYPE on a WARP transport: the listener IS the product,
+        //    so it binds the user's port, and 0.0.0.0 when they asked to share it.
+        //  - VPN mode: the engine still binds it, and the host's TunEngine
+        //    bridges the Android VPN interface to it (the engine owns no TUN in
+        //    2.3.0), so this is the port TunEngine dials.
+        out["AETHER_SOCKS"] = if (listenOverride != null) {
+            // Internal pipe: loopback ALWAYS, whatever the sharing preference
+            // says. Publishing the chain's outer leg would hand anyone on the
+            // network the bare WARP tunnel with no Psiphon or Tor above it.
+            "127.0.0.1:$listenOverride"
+        } else {
+            "${proxyBindHost(context)}:${sharedSocksPort(context)}"
+        }
+
+        // HTTP CONNECT proxy, only when sharing is on and this session actually
+        // publishes a listener. Windows takes an HTTP proxy system-wide while
+        // SOCKS has to be set per application, so a shared tunnel needs both.
+        // Never on the chained outer leg, for the same reason its SOCKS stays on
+        // loopback.
+        if (listenOverride == null && proxyOnly(context) && lanSharingEnabled(context)) {
+            out["AETHER_HTTP_PROXY"] = "0.0.0.0:$HTTP_PROXY_PORT"
+        }
+
+        // Scan mode and IP family. The engine's ScanMode::parse takes
+        // turbo/fast, thorough/deep/pro, verified/proven/stealth/quiet,
+        // ironclad/real/verify/guaranteed, everything else -> balanced.
+        // IpScan::parse takes v6/ipv6/6, both/all/dual, everything else -> v4.
+        out["AETHER_SCAN"] = text("default_scan_mode", "balanced")
+        out["AETHER_IP"] = text("default_scan", "v4")
+
+        // Obfuscation (aethernoize). off/light/balanced/aggressive/firewall/gfw;
+        // the engine defaults wireguard to "firewall" and masque to "balanced".
+        text("obfuscation_profile").ifBlank { "balanced" }.let {
+            out["AETHER_NOIZE"] = it
+        }
+
+        // Manual obfuscation overrides. 2.3.0 exposes only the profile through
+        // AETHER_NOIZE; the jc/jmin/jmax knobs the old JSON config carried are
+        // profile-internal now, so a manual entry is dropped rather than sent
+        // to a variable the engine never reads.
+        // (kept intentionally empty: obfuscation_profile above is the knob)
+
+        // A manual peer pins ONE address, and it belongs to whichever transport
+        // the user entered it for. Handing it to the chain's ladder would send a
+        // MASQUE gateway to the WireGuard rung, where it cannot work — so the
+        // chain's outer legs always scan.
+        if (listenOverride == null) {
+            text("manual_endpoint").ifBlank { "" }.takeIf { it.isNotBlank() }?.let {
+                // The engine splits AETHER_PEER across protocols: AETHER_PEER is
+                // the masque peer, AETHER_WG_PEER the wireguard one. Set both so
+                // a manual endpoint reaches whichever transport the user picked.
+                out["AETHER_PEER"] = it
+                out["AETHER_WG_PEER"] = it
             }
-            put("protocol", effectiveProtocol)
-            // Where the core's own SOCKS listener goes.
-            //
-            // Three cases, and the first two are why this is not a constant any more:
-            //
-            //  - CHAINED OUTER LEG (listenOverride set): always loopback. It is an
-            //    internal pipe between the core and Psiphon/Tor inside this process,
-            //    and publishing it on the LAN would hand strangers the raw WARP leg.
-            //  - SOCKS TUNNEL TYPE on a WARP transport: the listener IS the product,
-            //    so it binds the user's port, and 0.0.0.0 when they asked to share it.
-            //    MASQUE/WireGuard/WoW reach `socks::serve` through the no-tun_fd
-            //    branch in main.rs, which is the same code path the chain's outer leg
-            //    has been using in the field.
-            //  - VPN mode: unused. The core takes the tun_fd branch and never binds,
-            //    but the field is still required by the deserializer.
-            if (listenOverride != null) {
-                // Internal pipe: loopback ALWAYS, whatever the sharing preference
-                // says. Publishing the chain's outer leg would hand anyone on the
-                // network the bare WARP tunnel with no Psiphon or Tor above it.
-                put("listen", "127.0.0.1:$listenOverride")
-            } else {
-                put("listen", "${proxyBindHost(context)}:${sharedSocksPort(context)}")
+            // The inner hop of a nested transport. Empty means "same as the
+            // outer", which is the behaviour every version before this had —
+            // so an unset field changes nothing for existing users.
+            text("manual_inner_endpoint").ifBlank { "" }.takeIf { it.isNotBlank() }?.let {
+                out["AETHER_WIW_INNER_PEER"] = it
+                out["AETHER_MIM_INNER_PEER"] = it
             }
-            // HTTP CONNECT proxy, only when sharing is on and this session actually
-            // publishes a listener. Windows takes an HTTP proxy system-wide while
-            // SOCKS has to be set per application, so a shared tunnel needs both.
-            // Never on the chained outer leg, for the same reason its SOCKS stays on
-            // loopback.
-            if (listenOverride == null && proxyOnly(context) && lanSharingEnabled(context)) {
-                put("http_proxy", "0.0.0.0:$HTTP_PROXY_PORT")
+        }
+
+        // MASQUE transport: HTTP/2 over TCP when the user asked for it (UDP/QUIC
+        // blocked or throttled), HTTP/3 over QUIC otherwise. The engine reads a
+        // truthy AETHER_MASQUE_HTTP2.
+        if (text("default_masque_transport", "h3") == "h2") {
+            out["AETHER_MASQUE_HTTP2"] = "1"
+        }
+
+        // TLS fingerprint. The engine applies Chrome's groups/ciphers when this
+        // is "chrome"; a custom list is passed through as-is.
+        text("tls_curve_preset").ifBlank { "chrome" }.let { preset ->
+            when (preset.lowercase()) {
+                "chrome" -> { /* the engine's own default is Chrome */ }
+                else -> {
+                    out["AETHER_TLS_GROUPS"] = preset
+                    out["AETHER_TLS_CIPHERS"] = preset
+                }
             }
-            put("scan_mode", text("default_scan_mode", "balanced"))
-            put("ip_scan", text("default_scan", "v4"))
-            put("endpoint_cache_path", File(context.filesDir, "masque-gateway-cache.json").absolutePath)
-            put("endpoint_discovery", text("endpoint_discovery", "cache"))
-            put("masque_transport", text("default_masque_transport", "h3"))
-            // A manual peer pins ONE address, and it belongs to whichever transport
-            // the user entered it for. Handing it to the chain's ladder would send a
-            // MASQUE gateway to the WireGuard rung, where it cannot work — so the
-            // chain's outer legs always scan.
-            if (listenOverride == null) {
-                putOpt("forced_peer", text("manual_endpoint").ifBlank { null })
-                // The inner hop of a nested transport. Empty means "same as the
-                // outer", which is the behaviour every version before this had —
-                // so an unset field changes nothing for existing users.
-                putOpt("forced_inner_peer", text("manual_inner_endpoint").ifBlank { null })
-            }
-            put("obfuscation_profile", text("obfuscation_profile", "balanced"))
-            putOpt("obfuscation_parameters", manualObfuscation.takeIf { it.length() > 0 }?.toString())
-            put("retry_obfuscation_profiles", prefs.getBoolean("retry_obfuscation_profiles", true))
-            put("tls_curve_preset", text("tls_curve_preset", "chrome"))
-            put("wireguard_data_check", prefs.getBoolean("wireguard_data_check", true))
-            put("log_level", text("log_level", "info"))
-            put("perf_profile", text("perf_profile", "auto"))
-            put("h2_fragmentation", text("h2_fragmentation", "on") == "on")
-            // Mixed-case SNI (L×Box spec 028): randomise the casing of the SNI
-            // hostname on every ClientHello. Off by default — it changes bytes
-            // on the wire, so it must be opt-in per network.
-            put("mixed_case_sni", prefs.getBoolean("mixed_case_sni", false))
-            putOpt("dns_servers", text("dns_servers").ifBlank { null })
-            putOpt("route_block", text("route_block").ifBlank { null })
-            putOpt("route_direct", text("route_direct").ifBlank { null })
-            putOpt("team", SecureStore.getSecret(context, "zero_trust_team").ifBlank { null })
-            putOpt("access_client_id", SecureStore.getSecret(context, "zero_trust_client_id").ifBlank { null })
-            putOpt("access_client_secret", SecureStore.getSecret(context, "zero_trust_client_secret").ifBlank { null })
-            putOpt("access_token", SecureStore.getSecret(context, "zero_trust_token").ifBlank { null })
-            putOpt("access_email", SecureStore.getSecret(context, "zero_trust_email").ifBlank { null })
-            put("gateway", prefs.getBoolean("zero_trust_gateway", false))
-        }.toString()
+        }
+
+        // WireGuard handshake + data-plane verification, the engine's own
+        // AETHER_WG_NO_DATA_CHECK is the inverse of the app's toggle.
+        if (!bool("wireguard_data_check", true)) {
+            out["AETHER_WG_NO_DATA_CHECK"] = "1"
+        }
+
+        out["AETHER_LOG_LEVEL"] = text("log_level", "info")
+        out["AETHER_PERF_PROFILE"] = text("perf_profile", "auto")
+
+        // H2 fragmentation. The engine reads a truthy AETHER_MASQUE_H2_FRAGMENT
+        // and a "lo-hi" size and delay range.
+        if (text("h2_fragmentation", "on") == "on") {
+            out["AETHER_MASQUE_H2_FRAGMENT"] = "1"
+        }
+
+        // Identity provisioning through SHARD. When the carrier has blocked the
+        // account API, this points the core's registration at a SOCKS listener
+        // that is already on the open internet, so a fresh install can obtain an
+        // identity it could not get from its own link. The engine reads a
+        // socks5:// URL in AETHER_UPSTREAM.
+        if (socksProxyForCore.isNotBlank()) {
+            out["AETHER_UPSTREAM"] = socksProxyForCore
+        }
+
+        // Zero Trust / Teams. The engine reads the team name and the Access
+        // credentials; a blank team means a personal account.
+        text("zero_trust_team").ifBlank { SecureStore.getSecret(context, "zero_trust_team") }
+            .ifBlank { "" }.takeIf { it.isNotBlank() }?.let { out["AETHER_TEAM"] = it }
+        SecureStore.getSecret(context, "zero_trust_client_id").ifBlank { "" }
+            .takeIf { it.isNotBlank() }?.let { out["AETHER_ACCESS_CLIENT_ID"] = it }
+        SecureStore.getSecret(context, "zero_trust_client_secret").ifBlank { "" }
+            .takeIf { it.isNotBlank() }?.let { out["AETHER_ACCESS_CLIENT_SECRET"] = it }
+        SecureStore.getSecret(context, "zero_trust_token").ifBlank { "" }
+            .takeIf { it.isNotBlank() }?.let { out["AETHER_ACCESS_TOKEN"] = it }
+        SecureStore.getSecret(context, "zero_trust_email").ifBlank { "" }
+            .takeIf { it.isNotBlank() }?.let { out["AETHER_ACCESS_EMAIL"] = it }
+
+        // Custom DNS. The engine takes a comma/space/semicolon list of
+        // resolvers, each a plain host or a tls://https:// URL.
+        text("dns_servers").ifBlank { "" }.takeIf { it.isNotBlank() }?.let {
+            out["AETHER_DNS"] = it
+        }
+
+        // Split routing: domains that must NOT take the tunnel, and hosts that
+        // must. The engine reads space/comma lists.
+        text("route_block").ifBlank { "" }.takeIf { it.isNotBlank() }?.let {
+            out["AETHER_ROUTE_BLOCK"] = it
+        }
+        text("route_direct").ifBlank { "" }.takeIf { it.isNotBlank() }?.let {
+            out["AETHER_ROUTE_DIRECT"] = it
+        }
+
+        // Mixed-case SNI (L×Box spec 028): randomise the casing of the SNI
+        // hostname on every ClientHello. Off by default — it changes bytes on
+        // the wire, so it must be opt-in per network. The engine reads a truthy
+        // AETHER_MASQUE_H2_FRAGMENT_SNI.
+        if (bool("mixed_case_sni", false)) {
+            out["AETHER_MASQUE_H2_FRAGMENT_SNI"] = "1"
+        }
+
+        return out
+    }
+
+    /**
+     * Installs [env] on this process so the Aether engine reads it.
+     *
+     * The engine is dlopen'd in-process and reads `std::env`. Java has no
+     * `setenv`, so the write goes through NativeCore.nativeSetEnv, which calls
+     * libc `setenv` — the JNI bridge then inherits it on
+     * `aether_core_start`. Call immediately before NativeCore.start(); a later
+     * start rewrites it wholesale, so nothing is ever left stale.
+     */
+    fun applyEnv(map: Map<String, String>) {
+        for ((key, value) in map) NativeCore.setEnv(key, value)
     }
 
     /**
