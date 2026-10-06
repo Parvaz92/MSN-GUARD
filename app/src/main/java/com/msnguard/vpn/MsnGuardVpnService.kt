@@ -2363,6 +2363,18 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // and the device would stay sealed after the user asked to stop.
                 killSwitchSealed.set(false)
                 cancelAutoReconnect()
+                // From the notification this must actually remove the row.
+                // Field report: the old code called stopTunnel() alone, which
+                // clears `connected`/`tun` but on several OEMs (MIUI/HyperOS)
+                // the foreground notification survives until `stopSelf()` is
+                // processed. If the user tapped Disconnect while the worker
+                // thread still held the session, the system kept the row with
+                // stale actions that then appeared to "do nothing". Defensively
+                // cancel the notification first, then tear down the data path.
+                try {
+                    getSystemService(NotificationManager::class.java)
+                        .cancel(NOTIFICATION_ID)
+                } catch (_: Exception) {}
                 stopTunnel()
             }
             ACTION_PAUSE -> {
@@ -2386,22 +2398,22 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             }
             ACTION_RECONNECT -> {
                 val config = storedConfig
-                if (config != null && (connected.get() || paused.get())) {
-                    // Clearing the pause latch here, not in stopTunnel: this is
-                    // the only path that exits the paused state. Left set, the
-                    // notification would go on showing Reconnect while the
-                    // session was already up.
-                    paused.set(false)
+                // The notification's Reconnect/Pause buttons are expected to work
+                // whenever a config exists — not only while connected/paused. The
+                // previous gate `connected || paused` made both buttons silently
+                // do nothing after the system had torn the TUN down (e.g. kill
+                // switch or failure with auto-reconnect off), which reads as
+                // "the notification is broken".
+                if (config != null) {
+                    val wasPaused = paused.getAndSet(false)
                     ConnectionLog.record(
-                        if (connected.get()) "Quick reconnect requested"
-                        else "Reconnect requested after pause"
+                        if (wasPaused) "Reconnect requested after pause"
+                        else if (connected.get()) "Quick reconnect requested"
+                        else "Reconnect requested"
                     )
                     if (connected.get()) {
                         requestQuickReconnect("user")
                     } else {
-                        // A paused session had already torn the tunnel down, so
-                        // there is nothing to wait for: start it again from the
-                        // last config the user connected with.
                         userInitiatedStop.set(false)
                         killSwitchSealed.set(false)
                         reconnectAttempts = 0
@@ -5880,7 +5892,6 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
 
         val disconnectIntent = Intent(this, MsnGuardVpnService::class.java).apply {
             action = ACTION_DISCONNECT
-            putExtra(EXTRA_CONFIG, storedConfig ?: "")
         }
         val disconnectPendingIntent = PendingIntent.getService(
             this, 1, disconnectIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
