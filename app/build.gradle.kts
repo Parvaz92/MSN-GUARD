@@ -8,17 +8,16 @@ plugins {
 val targetAbis = (project.findProperty("targetAbi") as String?)?.split(',')?.map(String::trim)?.filter(String::isNotEmpty) ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
 val releaseKeystore = (project.findProperty("aetheryKeystore") as String?)?.takeIf { rootProject.file(it).let { f -> f.isFile && f.length() > 0 } }
 
-// Deliberately use the legacy Kotlin target property. It avoids every Kotlin
-// toolchain lookup, including the JetBrains JDK 21 request seen in Actions.
-kotlinOptions {
-    jvmTarget = "17"
-}
-
 android {
     namespace = "com.msnguard.vpn"
     compileSdk = 36
     buildToolsVersion = "36.0.0"
     ndkVersion = "26.3.11579264"
+
+    // Keep Kotlin on the JDK already installed by GitHub Actions.
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 
     defaultConfig {
         applicationId = "com.parvaz.vpn"
