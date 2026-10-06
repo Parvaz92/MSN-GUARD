@@ -208,6 +208,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     private val connected = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
     private val vpnModeActive = AtomicBoolean(false)
+    /**
+     * The port aether's SOCKS listener is on for the current session, or null
+     * when no aether session is running. Set by [waitForSocksReady], read by
+     * the watchdog's [socksListenerAccepting] probe.
+     */
+    @Volatile
+    private var socksListenerPortForWatchdog: Int? = null
+
     private var tun: ParcelFileDescriptor? = null
     private var lastTrafficSampleMs = 0L
     private var currentTx = 0L
@@ -1014,6 +1022,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         private const val SOCKS_READY_TIMEOUT_MS = 180_000L
         private const val SOCKS_READY_PROBE_MS = 2_000
         private const val SOCKS_READY_POLL_MS = 500L
+        // The watchdog's liveness probe for the aether SOCKS listener. Short: it
+        // runs every 30 s on a live tunnel and only has to distinguish "the
+        // listener is still there" from "the job died and took it with it".
+        private const val WATCHDOG_SOCKS_PROBE_MS = 1_000
 
         /** Exit address measured by the core from inside the tunnel. */
         const val EXTRA_EXIT_IP = "exit_ip"
@@ -3399,55 +3411,17 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 currentProtocol.contains("GOOL"))
         ) {
             if (!NativeCore.isRunning()) return "the tunnel process stopped"
-            val tx = currentTx
-            val rx = currentRx
-            if (nativeLastTx < 0 || nativeLastRx < 0) {
-                // First tick of the session: baseline only, no verdict.
-                nativeLastTx = tx
-                nativeLastRx = rx
-                nativeIdleTicks = 0
-                return null
-            }
-            // Only DOWNSTREAM bytes prove the far end is alive — the exact
-            // lesson of the SHARD branch above. Apps keep retrying into a
-            // dead tunnel, so tx moves on its own while rx stays flat; gating
-            // on "tx or rx" would let a dead session vote healthy forever.
-            // The UI's own verification gates on rx alone for the same
-            // reason (awaitTunnelBytes / watchForTunnelBytes).
-            val downstreamMoved = rx != nativeLastRx
-            val upstreamMoved = tx != nativeLastTx
-            nativeLastTx = tx
-            nativeLastRx = rx
-            if (downstreamMoved) {
-                nativeIdleTicks = 0
-                return null
-            }
-            if (!isScreenInteractive()) {
-                // Dark screen: honest idle, not a strike. Judging it would
-                // tear down every overnight tunnel for the crime of not being
-                // used, and the radio wakeups would cost battery for nothing.
-                nativeIdleTicks = 0
-                return null
-            }
-            nativeIdleTicks++
-            if (nativeIdleTicks < NATIVE_STRIKES_BEFORE_RECONNECT) {
-                ConnectionLog.record(
-                    if (upstreamMoved) {
-                        "Watchdog: apps sending but nothing coming back " +
-                            "(strike $nativeIdleTicks/$NATIVE_STRIKES_BEFORE_RECONNECT)"
-                    } else {
-                        "Watchdog: native tunnel idle, no bytes " +
-                            "(strike $nativeIdleTicks/$NATIVE_STRIKES_BEFORE_RECONNECT)"
-                    }
-                )
-                return null
-            }
-            nativeIdleTicks = 0
-            return if (upstreamMoved) {
-                "the tunnel accepted traffic but answered nothing"
-            } else {
-                "the tunnel stopped passing traffic"
-            }
+            // aether 2.3.0 never emits "traffic" events to the host (the job
+            // model publishes nothing but the job registry), so the byte
+            // counters this branch used to read never move and the watchdog
+            // condemned a fully working tunnel after two 30 s ticks. The honest
+            // liveness test on this path is the engine's own SOCKS listener:
+            // it is bound only after the tunnel validates and it stops
+            // accepting the moment the job dies, so a successful connect means
+            // the data plane is live. Same probe waitForSocksReady uses, one
+            // loopback connect, no radio traffic.
+            if (!socksListenerAccepting()) return "the tunnel stopped carrying traffic"
+            return null
         }
 
         if (currentProtocol.contains("TOR")) {
@@ -4830,6 +4804,8 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         TorManager.stop()
         stopPsiphonTunnel()
         NativeCore.stop()
+        // The aether session is over: no listener to probe any more.
+        socksListenerPortForWatchdog = null
         // The WARP path also borrows WarpUdpgwFront for BadVPN's udpgw
         // rendezvous, so it has to come down here too — leaving it bound across
         // a reconnect would fail the next start() with "already running" and
@@ -5051,8 +5027,36 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * start already occupies, bounded by [SOCKS_READY_TIMEOUT_MS], and it
      * publishes CONNECTED the same way every other path does.
      */
+    /**
+     * Is the aether engine's SOCKS listener accepting connections?
+     *
+     * aether 2.3.0's job model emits nothing to the host — no "traffic" events,
+     * no ready callback — so the watchdog cannot ask "did bytes move?". It can
+     * ask this instead: the engine only binds the listener after the tunnel
+     * validates ("exposing socks5" in the engine's own log) and the listener
+     * goes away with the job. A loopback connect that succeeds therefore means
+     * the data plane is live; a refused connect means the tunnel is gone.
+     *
+     * One connect, no handshake, no radio traffic — the same probe
+     * [waitForSocksReady] uses to publish CONNECTED.
+     */
+    private fun socksListenerAccepting(): Boolean {
+        val port = socksListenerPortForWatchdog ?: return false
+        return try {
+            java.net.Socket().use { probe ->
+                probe.connect(java.net.InetSocketAddress("127.0.0.1", port), WATCHDOG_SOCKS_PROBE_MS)
+            }
+            true
+        } catch (_: java.io.IOException) {
+            false
+        }
+    }
+
     private fun waitForSocksReady(listenAddress: String) {
         val port = runCatching { listenAddress.substringAfter(':').toInt() }.getOrElse { return }
+        // Remember the port for the watchdog: it needs the same listener to test
+        // liveness once this wait is over.
+        socksListenerPortForWatchdog = port
         val deadline = SystemClock.elapsedRealtime() + SOCKS_READY_TIMEOUT_MS
         try {
             while (SystemClock.elapsedRealtime() < deadline) {
