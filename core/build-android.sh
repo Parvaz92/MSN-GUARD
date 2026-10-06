@@ -100,24 +100,17 @@ if [[ -z "${LIBCLANG_PATH:-}" ]]; then
   fi
 fi
 
-# boring-sys builds BoringSSL before its known second-configure failure.
-set +e
-(
-  cd "$CRATE"
-  cargo ndk -t "$ABI" --platform "$API" build --release --lib
-)
-BOOTSTRAP_EXIT=$?
-set -e
-
-BSSL_OUT="$(find "$TARGET/$TARGET_TRIPLE/release/build" -path '*/out/build/libssl.a' -print 2>/dev/null | sed 's#/build/libssl\.a$##' | tail -n 1)"
-if [[ -z "$BSSL_OUT" ]]; then
-  echo "BoringSSL bootstrap failed before static libraries were produced (cargo exit $BOOTSTRAP_EXIT)." >&2
-  exit 1
-fi
-
-export BORING_BSSL_PATH="$BSSL_OUT/build"
-export BORING_BSSL_INCLUDE_PATH="$BSSL_OUT/boringssl/src/include"
-export BORING_BSSL_ASSUME_PATCHED="1"
+# boring-sys builds BoringSSL itself. boring 5.2 reworked the build: the
+# second-target CMake re-configure that 4.22 hit no longer wipes the cache
+# (build_boringssl_or_get_prebuilt compiles `ssl` then `crypto` from one
+# config), so the manual bootstrap pass that used to exist here was finding
+# a libssl.a whose header layout the new version does not produce. Build
+# once and let boring-sys own the whole tree.
+#
+# BORING_BSSL_ASSUME_PATCHED is dropped too: in 5.2 it is only valid together
+# with BORING_BSSL_PATH/SOURCE_PATH (config.rs errors otherwise), and this
+# crate uses none of the rpk / relax-cert-validation / underscore-wildcards
+# features those patches carry.
 export CLANG_PATH="$BIN/clang"
 
 RUST_ENV_SUFFIX="${TARGET_TRIPLE^^}"
