@@ -336,6 +336,45 @@ object CoreConfig {
     }
 
     /**
+     * Like [env] but merges overrides from [overridesJson] (an [effectiveConfig]
+     * that already contains `forced_peer`/`socks_proxy`). The forged fields
+     * come from [overridesJson] while every other preference is still read
+     * from [context]. This is the glue that keeps the old `effectiveConfig`
+     * construction working with the new Aether 2.3.0 engine.
+     *
+     * Prefer [env] when there is no artificial forced_peer/socks_proxy in play.
+     */
+    fun envFromEffectiveConfig(
+        context: Context,
+        overridesJson: String,
+        listenOverride: Int? = null,
+    ): Map<String, String> {
+        val json = runCatching { org.json.JSONObject(overridesJson) }.getOrElse { org.json.JSONObject() }
+        val proto = json.optString("protocol").ifBlank { null }
+        val peer = json.optString("forced_peer").ifBlank { null }
+        val w = runCatching { json.optString("socks_proxy").ifBlank { null } }.getOrNull()
+        // socks_proxy was written as a plain `127.0.0.1:port` listener without a
+        // scheme by every caller since v1.3 — the engine now expects a socks5://
+        // URL in AETHER_UPSTREAM.
+        val upstream = when {
+            w == null -> null
+            w.startsWith("socks5://", ignoreCase = true) -> w
+            w.contains("://") -> w // http:// / https:// passthrough
+            else -> "socks5://$w"
+        }
+        val base = env(context, protocol = proto, listenOverride = listenOverride, socksProxyForCore = upstream ?: "")
+        if (peer != null) {
+            val ov = LinkedHashMap(base)
+            // Mirrors the old JSON -> engine mapping: a manual pin reached both
+            // AETHER_PEER and AETHER_WG_PEER.
+            ov["AETHER_PEER"] = peer
+            ov["AETHER_WG_PEER"] = peer
+            return ov
+        }
+        return base
+    }
+
+    /**
      * Installs [env] on this process so the Aether engine reads it.
      *
      * The engine is dlopen'd in-process and reads `std::env`. Java has no

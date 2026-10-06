@@ -4550,9 +4550,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // engine starts. The engine owns no TUN — it publishes the SOCKS listener
                 // AETHER_SOCKS names and the TunEngine below bridges the VPN interface to it.
                 CoreConfig.applyEnv(
-                    CoreConfig.env(
+                    CoreConfig.envFromEffectiveConfig(
                         this@MsnGuardVpnService,
-                        effectiveConfig.substringAfter("\"protocol\":\"").substringBefore('"').ifBlank { null },
+                        effectiveConfig,
                     ),
                 )
                 val addresses = NativeCore.prepare(effectiveConfig)
