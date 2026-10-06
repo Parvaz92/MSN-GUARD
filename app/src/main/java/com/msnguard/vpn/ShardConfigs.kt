@@ -245,46 +245,54 @@ object ShardConfigs {
         return nodes
     }
 
-    private fun parseOne(line: String): ShardNode? = try {
+    private fun parseOne(line: String): ShardNode? {
+    return try {
         val scheme = line.substringBefore("://", "").lowercase(Locale.US)
         if (scheme !in SUPPORTED) return null
+
         val rest = line.substringAfter("://")
         val label = rest.substringAfter('#', "").let { decode(it) }
         val withoutLabel = rest.substringBefore('#')
+
         val credential = decode(withoutLabel.substringBefore('@', ""))
         if (credential.isEmpty()) return null
+
         val hostPortAndQuery = withoutLabel.substringAfter('@')
         val hostPort = hostPortAndQuery.substringBefore('?')
         val query = hostPortAndQuery.substringAfter('?', "")
+
         val address = hostPort.substringBeforeLast(':', "")
-        val port = hostPort.substringAfterLast(':', "").toIntOrNull() ?: return null
+        val port = hostPort.substringAfterLast(':', "").toIntOrNull()
+            ?: return null
+
         if (address.isEmpty() || port !in 1..65535) return null
 
         val params = parseQuery(query)
         val host = params["host"].orEmpty()
         val sni = params["sni"].orEmpty()
-        val security = params["security"]?.lowercase(Locale.US).orEmpty().ifEmpty { "none" }
-        // ws and xhttp are implemented. `ws` rides a WebSocket upgrade;
-        // `xhttp` rides plain HTTP/1.1-or-h2 requests, which is the shape that
-        // still crosses a firewall that killed UDP and capped WebSocket — see
-        // the xhttp branch in [outbound]. A node announcing anything else is
-        // dropped rather than forced onto a transport it did not ask for, which
-        // would fail at the handshake with a useless error.
-        val network = params["type"]?.lowercase(Locale.US).orEmpty().ifEmpty { "tcp" }
-        if (network != "ws" && network != "xhttp" && scheme != "anytls") return null
+        val security = params["security"]
+            ?.lowercase(Locale.US)
+            .orEmpty()
+            .ifEmpty { "none" }
 
-        // anytls:// is its own URI shape (docs/uri_scheme.md): password in the
-        // userinfo, host[:port] with 443 as the default port, `sni` and
-        // `insecure` as the only parameters. No ws, no path, no CDN `host` —
-        // the fields below are filled so the node survives the xray-shaped
-        // [ShardNode] and the health/rank machinery unchanged, and the
-        // engine-specific values travel in the fields the sidecar reads:
-        // [ShardNode.serverName] is the SNI param, and [ShardNode.security]
-        // carries the insecure flag ("insecure" vs "tls") for the sidecar's
-        // TLS verification. Insecure stays opt-in per node from its own URL,
-        // never a default — see AnyTlsManager.
+        val network = params["type"]
+            ?.lowercase(Locale.US)
+            .orEmpty()
+            .ifEmpty { "tcp" }
+
+        if (
+            network != "ws" &&
+            network != "xhttp" &&
+            scheme != "anytls"
+        ) {
+            return null
+        }
+
         if (scheme == "anytls") {
-            val insecure = params["insecure"] == "1" || params["insecure"] == "true"
+            val insecure =
+                params["insecure"] == "1" ||
+                params["insecure"] == "true"
+
             return ShardNode(
                 protocol = scheme,
                 credential = credential,
@@ -313,9 +321,6 @@ object ShardConfigs {
             security = security,
             path = params["path"].orEmpty().ifEmpty { "/" },
             host = host,
-            // serverName falls back to host because that is what the CDN routes
-            // on; an empty SNI to Cloudflare gets the default certificate and the
-            // handshake fails.
             serverName = sni.ifEmpty { host },
             fingerprint = params["fp"].orEmpty(),
             cipherSuites = params["cs"].orEmpty(),
@@ -325,9 +330,9 @@ object ShardConfigs {
             label = label,
         )
     } catch (_: Exception) {
-        // One unparseable line, not a failed refresh.
         null
     }
+}
 
     /**
      * Split a query string without letting one bad pair kill the rest.
