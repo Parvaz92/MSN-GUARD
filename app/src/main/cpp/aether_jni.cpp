@@ -139,10 +139,14 @@ Java_com_msnguard_vpn_NativeCore_nativeStart(JNIEnv*, jobject, jstring, jint) {
     // same split FCAE has between the aether backend and its TUN bridges.
     // tun_fd and the old config JSON are therefore unused; the whole engine
     // configuration comes from the AETHER_* environment the service sets.
-    std::lock_guard<std::mutex> lock(g_job_mu);
-    if (g_job != 0) {
-        LOGE("aether already running as job %llu", (unsigned long long)g_job);
-        return -1;
+    static std::thread::id g_starter;
+    {
+        std::lock_guard<std::mutex> lock(g_job_mu);
+        if (g_job != 0) {
+            LOGE("aether already running as job %llu", (unsigned long long)g_job);
+            return -1;
+        }
+        g_starter = std::this_thread::get_id();
     }
 
     const char* reply = aether_core_start("[]");
@@ -169,23 +173,17 @@ Java_com_msnguard_vpn_NativeCore_nativeStart(JNIEnv*, jobject, jstring, jint) {
         LOGE("aether_core_start gave job id 0: %s", text.c_str());
         return -1;
     }
-    g_job = id;
-    LOGI("aether_core_start -> job %llu", id);
-
-    // Block until the tunnel exits — the old aether_start_json_with_tun did
-    // exactly this, and every Kotlin caller (the VpnService worker, the chain
-    // ladder) depends on it: the `finally` that tears down the TUN and runs
-    // the reconnect ladder only runs when this returns. Returning immediately
-    // after job creation left the host with a live engine it had already
-    // decided to stop.
-    while (!job_finished(id)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
     {
         std::lock_guard<std::mutex> lock(g_job_mu);
-        if (g_job == id) g_job = 0;
+        g_job = id;
     }
-    free_job(id);
+    LOGI("aether_core_start -> job %llu", id);
+
+    // Non-blocking: return immediately. The tunnel keeps running until
+    // nativeStop cancels the job. Polling is done by IsRunning / the
+    // watchdog; the worker thread that called start is freed for UI /
+    // notification / egress verification instead of being held for the
+    // whole session like the old aether_start_json_with_tun was.
     return 0;
 }
 
@@ -208,26 +206,30 @@ Java_com_msnguard_vpn_NativeCore_nativeStop(JNIEnv*, jobject) {
 
     const char* reply = aether_job_cancel(id);
     if (reply != nullptr) aether_string_free(reply);
-    // The blocked nativeStart/nativeStartProxy notices the finished state and
-    // frees the job itself; wait for it so the engine is fully stopped before
-    // the caller tears down its own listener.
-    for (int i = 0; i < 100 && g_job != 0; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_job_mu);
-        if (g_job == id) {
-            free_job(id);
-            g_job = 0;
-        }
-    }
+    // Don't block here either — IsRunning will notice the finished job and
+    // free it. A short grace sleep so the SOCKS listener has time to close
+    // before the caller immediately starts a new job on the same port.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     return 0;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_msnguard_vpn_NativeCore_nativeIsRunning(JNIEnv*, jobject) {
-    std::lock_guard<std::mutex> lock(g_job_mu);
-    return g_job != 0 ? JNI_TRUE : JNI_FALSE;
+    unsigned long long id;
+    {
+        std::lock_guard<std::mutex> lock(g_job_mu);
+        id = g_job;
+    }
+    if (id == 0) return JNI_FALSE;
+    if (job_finished(id)) {
+        std::lock_guard<std::mutex> lock(g_job_mu);
+        if (g_job == id) {
+            free_job(id);
+            g_job = 0;
+        }
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

@@ -128,10 +128,39 @@ object CoreConfig {
         listenOverride: Int?,
         socksProxyForCore: String = "",
     ): String {
-        // Kept for the callers that still hand a JSON blob to NativeCore. The
-        // Aether 2.3.0 engine reads nothing from it — [env] is the config now.
-        env(context, protocol, listenOverride, socksProxyForCore)
-        return "{}"
+        val prefs = context.profiled()
+        fun text(key: String, fallback: String = "") =
+            prefs.getString(key, fallback)?.trim().orEmpty()
+        val effectiveProtocol = when {
+            protocol == null -> text("default_protocol", "wireguard")
+            protocol == "masque" && mimArmed(context) -> MIM_PROTOCOL
+            else -> protocol
+        }
+        return org.json.JSONObject().apply {
+            // The old core read these; the 2.3.0 job reads env, but sending them
+            // here keeps currentProtocol/protocol parsing and lastResult fallbacks
+            // working and avoids {} in logs/notifications.
+            put("protocol", effectiveProtocol)
+            put("config_path", java.io.File(context.filesDir, "aether.toml").absolutePath)
+            put("listen", if (listenOverride != null) "127.0.0.1:$listenOverride" else "${proxyBindHost(context)}:${sharedSocksPort(context)}")
+            put("scan_mode", text("default_scan_mode", "balanced"))
+            put("ip_scan", text("default_scan", "v4"))
+            // forwarded verbatim when present — keeps pin/SHARD-identity logic from breaking
+            if (socksProxyForCore.isNotBlank()) put("socks_proxy", socksProxyForCore)
+            text("manual_endpoint").ifBlank { null }?.let { put("forced_peer", it) }
+            text("manual_inner_endpoint").ifBlank { null }?.let { put("forced_inner_peer", it) }
+            put("obfuscation_profile", text("obfuscation_profile", "balanced"))
+            put("tls_curve_preset", text("tls_curve_preset", "chrome"))
+            put("wireguard_data_check", prefs.getBoolean("wireguard_data_check", true))
+            put("log_level", text("log_level", "info"))
+            put("perf_profile", text("perf_profile", "auto"))
+            put("h2_fragmentation", text("h2_fragmentation", "on") == "on")
+            put("mixed_case_sni", prefs.getBoolean("mixed_case_sni", false))
+            text("dns_servers").ifBlank { null }?.let { put("dns_servers", it) }
+            text("route_block").ifBlank { null }?.let { put("route_block", it) }
+            text("route_direct").ifBlank { null }?.let { put("route_direct", it) }
+            // AETHER_* is the live path from the next block; this JSON is just compat.
+        }.toString()
     }
 
     /**
