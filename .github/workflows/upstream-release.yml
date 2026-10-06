@@ -22,25 +22,33 @@ jobs:
         id: sync
         run: |
           set -e
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          before=$(git rev-parse HEAD)
           git fetch https://github.com/mbm110/MSN-GUARD.git master
 
           if git merge-base --is-ancestor FETCH_HEAD HEAD; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream update found."
             exit 0
           fi
 
           git merge --no-edit FETCH_HEAD
-          git checkout HEAD -- NOTICE.md README.md README.en.md \
-            tools/rebrand.sh branding \
-            app/src/main/java/com/msnguard/vpn/ParvazSocialLinks.kt 2>/dev/null || true
+
+          git checkout HEAD -- \
+            NOTICE.md \
+            README.md \
+            README.en.md \
+            tools/rebrand.sh \
+            branding \
+            app/src/main/java/com/msnguard/vpn/ParvazSocialLinks.kt \
+            2>/dev/null || true
 
           git add -A
           git commit -m "Sync MSN-GUARD update into Yekta VPN" || true
           git push origin master
+
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Set up Java
@@ -62,14 +70,20 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
-          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            x86_64-linux-android
+
           cargo install cargo-ndk
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build APKs
         if: steps.sync.outputs.changed == 'true'
         run: |
-          chmod +x gradlew tools/rebrand.sh
+          chmod +x gradlew
+          chmod +x tools/rebrand.sh
           ./gradlew assembleRelease
 
       - name: Publish automatic Release
@@ -78,6 +92,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
+
           version=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts | head -1)
           tag="v${version}"
 
@@ -85,11 +100,16 @@ jobs:
             tag="${tag}-$(date -u +%Y%m%d%H%M)"
           fi
 
-          gh release create "$tag" app/build/outputs/apk/release/*.apk \
-            --title "Yekta VPN ${tag}" \
-            --notes "Automatic update from MSN-GUARD upstream.
+          cat > release-notes.md <<EOF
+          Automatic update from MSN-GUARD upstream.
 
-Yekta VPN modified source under AGPL-3.0.
-Version: ${version}
-Android architectures: arm64-v8a, armeabi-v7a, x86_64." \
+          Yekta VPN modified source under AGPL-3.0.
+          Version: ${version}
+          Android architectures: arm64-v8a, armeabi-v7a, x86_64.
+          EOF
+
+          gh release create "$tag" \
+            app/build/outputs/apk/release/*.apk \
+            --title "Yekta VPN ${tag}" \
+            --notes-file release-notes.md \
             --latest
