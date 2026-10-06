@@ -37,7 +37,7 @@ object ParvazSocialLinks {
             setPadding(0, dp(2), 0, dp(7))
         })
         addView(row(activity, "اینستاگرام  @Nabz.moamma", INSTAGRAM, dp(34)))
-        addView(row(activity, "تلگرام  NabzKhabarOfficial", TELEGRAM, dp(34)))
+        addView(row(activity, "تلگرام  @NabzKhabarOfficial", TELEGRAM, dp(34)))
     }.also { card ->
         card.isFocusable = true
         card.contentDescription = "لینک‌های شبکه‌های اجتماعی پرواز"
