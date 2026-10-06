@@ -28,7 +28,7 @@ SRC="$ROOT/app/src/main/java/com/msnguard/vpn"
 RES="$ROOT/app/src/main/res"
 ART="$ROOT/branding"
 
-echo "==> Rebranding Android config"
+ echo "==> Rebranding Android config"
 perl -pi -e 's{android:label="MSN-GUARD"}{android:label="\@string/app_name"}' "$ROOT/app/src/main/AndroidManifest.xml"
 for f in "$RES"/values*/strings.xml; do
   BRAND="$BRAND" perl -CSD -pi -e 's{MSN-GUARD}{$ENV{BRAND}}g' "$f"
@@ -45,6 +45,22 @@ for f in "$SRC"/*.kt; do
     s{mbm110/MSN-GUARD/releases}{$ENV{REPO}/releases}g;
   ' "$f"
 done
+
+# Add the two public channels to the home screen without hand-editing the very
+# large upstream MainActivity. The marker makes this safe to run repeatedly.
+python3 - "$ROOT/app/src/main/java/com/msnguard/vpn/MainActivity.kt" <<'PY'
+from pathlib import Path
+p = Path(__import__('sys').argv[1])
+s = p.read_text()
+marker = '        // PARVAZ_SOCIAL_LINKS\n'
+if marker not in s:
+    needle = '''        addView(transportRail, LinearLayout.LayoutParams(\n'''
+    insert = marker + '''        addView(ParvazSocialLinks.build(this@MainActivity), LinearLayout.LayoutParams(\n            ViewGroup.LayoutParams.MATCH_PARENT,\n            ViewGroup.LayoutParams.WRAP_CONTENT,\n        ).apply { topMargin = dp(10) })\n\n'''
+    if needle not in s:
+        raise SystemExit("home-screen insertion point not found")
+    s = s.replace(needle, insert + needle, 1)
+    p.write_text(s)
+PY
 
 echo "==> Rendering artwork"
 if ! command -v rsvg-convert >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
