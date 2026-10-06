@@ -212,6 +212,18 @@ object CoreConfig {
         // everything else -> masque.
         out["AETHER_PROTOCOL"] = effectiveProtocol
 
+        // FCAE sets this for gool (core/fcae-ffi/runtime/src/config.rs:
+        // `set("AETHER_GOOL_MODE", (cfg.protocol == FcaeProtocol::Gool).then_some("classic"))`),
+        // and the engine's own gool_classic() reads it: without it, "gool" is
+        // WARP-in-MASQUE (the `WarpInWarp if !gool_classic()` arm), which dials a
+        // MASQUE handshake this carrier kills. Classic gool — WireGuard carried
+        // inside WireGuard — is what the WoW label actually promises and what the
+        // scan + AETHER_WG_PEER path is built for, so name it explicitly the way
+        // FCAE does.
+        if (effectiveProtocol == "gool") {
+            out["AETHER_GOOL_MODE"] = "classic"
+        }
+
         // Where the core's own SOCKS listener goes.
         //
         // Three cases, and the first two are why this is not a constant any more:

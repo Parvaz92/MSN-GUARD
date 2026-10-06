@@ -1006,6 +1006,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         private const val RECONNECT_SETTLE_MS = 600L
         private const val RECONNECT_CORE_WAIT_MS = 6_000
         private const val RECONNECT_POLL_MS = 100L
+        // waitForSocksReady: aether 2.3.0 publishes CONNECTED nowhere, so the
+        // service probes the engine's SOCKS listener. The budget has to cover a
+        // cold registration (ECH lookup + register) and a full endpoint scan,
+        // which is what WireGuard was observed taking in the field; the probe is
+        // cheap and the loop exits the instant the listener answers.
+        private const val SOCKS_READY_TIMEOUT_MS = 180_000L
+        private const val SOCKS_READY_PROBE_MS = 2_000
+        private const val SOCKS_READY_POLL_MS = 500L
 
         /** Exit address measured by the core from inside the tunnel. */
         const val EXTRA_EXIT_IP = "exit_ip"
@@ -4495,6 +4503,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         if (!willAutoReconnect()) sendStatus(STATUS_FAILED, detail)
                     } else if (proxyResult == 0 && !stopRequested.get()) {
                         ConnectionLog.record("aether job running — identity/scan in progress")
+                        // See the TunEngine branch: aether 2.3.0 never reports
+                        // CONNECTED on its own. In proxy mode the listener IS the
+                        // deliverable, so the probe also marks TunnelStatus
+                        // isProxyMode — without it isActive() stays false over a
+                        // working proxy.
+                        waitForSocksReady(
+                            "${CoreConfig.proxyBindHost(this)}:${CoreConfig.proxyListenPort(this)}"
+                        )
                     } else if (stopRequested.get()) {
                         // Not under a quick reconnect: MainActivity's DISCONNECTED
                         // branch would paint "Not connected" and the tile would flip
@@ -4607,6 +4623,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         if (!willAutoReconnect()) sendStatus(STATUS_FAILED, d)
                     } else if (fbResult == 0 && !stopRequested.get()) {
                         ConnectionLog.record("aether job running — identity/scan in progress")
+                        // See the TunEngine branch: aether 2.3.0 never reports
+                        // CONNECTED, so the service learns the tunnel is up by
+                        // probing the SOCKS listener. In this native-TUN fallback
+                        // the engine still publishes one.
+                        waitForSocksReady("127.0.0.1:${CoreConfig.SOCKS_PORT}")
                     } else if (stopRequested.get()) {
                         if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting…")) else sendStatus(STATUS_DISCONNECTED)
                     } else { ConnectionLog.record("Native tunnel stopped unexpectedly"); if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly") }
@@ -4651,6 +4672,17 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // The job is up. Nothing exited — the engine owns the
                     // lifecycle from here and the watchdog watches it.
                     ConnectionLog.record("aether job running — identity/scan in progress")
+                    // aether 2.3.0 never emits a status event to the host (the
+                    // job model has no mark_ready() callback), so CONNECTED is
+                    // not going to arrive on its own. Wait for the engine's SOCKS
+                    // listener to accept a connection — that IS the tunnel being
+                    // up, exactly as FCAE's log announces itself with
+                    // "socks5 server listening on 127.0.0.1:1819". Until this
+                    // fires the UI sits on "Connecting" and the notification
+                    // never leaves its placeholder, which is the report: the
+                    // tunnel works, Telegram and filtered sites open, but the
+                    // dial never turns green.
+                    waitForSocksReady(warpListen)
                 } else if (stopRequested.get()) {
                     // Same as the SOCKS branch above: no DISCONNECTED under a pending
                     // reconnect, or the UI blinks "Not connected" mid-restart.
@@ -4999,6 +5031,61 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             getSystemService(NotificationManager::class.java)
                 .notify(NOTIFICATION_ID, notification())
         } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * The tunnel is up the moment aether's SOCKS listener accepts a connection.
+     *
+     * aether 2.3.0 does not tell the host when it is ready — the old core fired
+     * mark_ready() over onEvent, the 2.3.0 job model emits nothing — so the
+     * service learns it by probing. This is exactly what FCAE's own log line
+     * marks ("socks5 server listening on 127.0.0.1:1819"), and it is the only
+     * signal that turns the dial green and replaces the placeholder
+     * notification.
+     *
+     * The probe is a bare TCP connect, not a SOCKS handshake: the listener
+     * accepts before the engine has a verified data plane, but the engine only
+     * binds it after the tunnel validates ("exposing socks5" in the log), so an
+     * accepted connect is the right edge. It runs on the worker thread the
+     * start already occupies, bounded by [SOCKS_READY_TIMEOUT_MS], and it
+     * publishes CONNECTED the same way every other path does.
+     */
+    private fun waitForSocksReady(listenAddress: String) {
+        val port = runCatching { listenAddress.substringAfter(':').toInt() }.getOrElse { return }
+        val deadline = SystemClock.elapsedRealtime() + SOCKS_READY_TIMEOUT_MS
+        try {
+            while (SystemClock.elapsedRealtime() < deadline) {
+                if (stopRequested.get() || userInitiatedStop.get()) return
+                if (!NativeCore.isRunning()) return
+                try {
+                    java.net.Socket().use { probe ->
+                        probe.connect(java.net.InetSocketAddress("127.0.0.1", port), SOCKS_READY_PROBE_MS)
+                    }
+                    // The listener answered. The tunnel is carrying traffic.
+                    connected.set(true)
+                    // Which flag TunnelStatus carries depends on the session: a
+                    // whole-device VPN start leaves both clear (the TUN engine is
+                    // what makes isActive() true), a proxy-mode start is the only
+                    // path where isProxyMode is the flag that keeps isActive()
+                    // honest. Set them from what this session actually owns.
+                    TunnelStatus.isProxyMode = proxyMode
+                    TunnelStatus.isNativeTunMode = false
+                    repostNotification()
+                    sendStatus(STATUS_CONNECTED)
+                    ConnectionLog.record("aether SOCKS listener up at $listenAddress — connected")
+                    return
+                } catch (_: java.io.IOException) {
+                    // Still provisioning the identity or scanning. Try again.
+                }
+                Thread.sleep(SOCKS_READY_POLL_MS)
+            }
+            // The deadline passed with no listener. The job is still running, so
+          // this is a slow scan rather than a crash — leave it to the watchdog
+          // and keep the UI honest about the state it is actually in.
+            ConnectionLog.record("aether SOCKS listener not up after ${SOCKS_READY_TIMEOUT_MS / 1000}s; still working")
+        } catch (_: InterruptedException) {
+            // A disconnect during the wait; the caller has already torn down.
         }
     }
 
