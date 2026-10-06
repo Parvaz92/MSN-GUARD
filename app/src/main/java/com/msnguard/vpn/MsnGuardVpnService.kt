@@ -3306,6 +3306,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     private fun stopWatchdog() {
         watchdogTask?.cancel(false)
         watchdogTask = null
+        // A pending late-connect is session-scoped: the next session probes for
+        // its own listener and sets the flag itself, so leaving it set here
+        // would make a fresh session's watchdog announce a connect it never had.
+        socksConnectPending.set(false)
     }
 
     /**
