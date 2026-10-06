@@ -5,18 +5,13 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val targetAbis = (project.findProperty("targetAbi") as String?)
-    ?.split(',')?.map(String::trim)?.filter(String::isNotEmpty)
-    ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-val releaseKeystore = (project.findProperty("aetheryKeystore") as String?)
-    ?.takeIf { rootProject.file(it).let { f -> f.isFile && f.length() > 0 } }
+val targetAbis = (project.findProperty("targetAbi") as String?)?.split(',')?.map(String::trim)?.filter(String::isNotEmpty) ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+val releaseKeystore = (project.findProperty("aetheryKeystore") as String?)?.takeIf { rootProject.file(it).let { f -> f.isFile && f.length() > 0 } }
 
-kotlin {
-    // Do not call jvmToolchain here. GitHub Actions supplies the JDK and the
-    // Kotlin compiler runs in-process, so Gradle must not provision JetBrains JDKs.
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
-    }
+// Deliberately use the legacy Kotlin target property. It avoids every Kotlin
+// toolchain lookup, including the JetBrains JDK 21 request seen in Actions.
+kotlinOptions {
+    jvmTarget = "17"
 }
 
 android {
