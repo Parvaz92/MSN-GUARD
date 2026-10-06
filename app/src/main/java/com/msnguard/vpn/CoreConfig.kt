@@ -144,7 +144,7 @@ object CoreConfig {
             put("config_path", java.io.File(context.filesDir, "aether.toml").absolutePath)
             put("listen", if (listenOverride != null) "127.0.0.1:$listenOverride" else "${proxyBindHost(context)}:${sharedSocksPort(context)}")
             put("scan_mode", text("default_scan_mode", "balanced"))
-            put("ip_scan", text("default_scan", "v4"))
+            put("ip_scan", text("default_scan", "both"))
             // forwarded verbatim when present — keeps pin/SHARD-identity logic from breaking
             if (socksProxyForCore.isNotBlank()) put("socks_proxy", socksProxyForCore)
             text("manual_endpoint").ifBlank { null }?.let { put("forced_peer", it) }
@@ -259,7 +259,10 @@ object CoreConfig {
         // ironclad/real/verify/guaranteed, everything else -> balanced.
         // IpScan::parse takes v6/ipv6/6, both/all/dual, everything else -> v4.
         out["AETHER_SCAN"] = text("default_scan_mode", "balanced")
-        out["AETHER_IP"] = text("default_scan", "v4")
+        // Both means scan IPv4 and IPv6; the engine tries IPv6 first and
+        // falls back to IPv4 when v6 is unreachable, which is exactly the
+        // "v6 first, then v4" order requested.
+        out["AETHER_IP"] = text("default_scan", "both")
 
         // Obfuscation (aethernoize). off/light/balanced/aggressive/firewall/gfw;
         // the engine defaults wireguard to "firewall" and masque to "balanced".

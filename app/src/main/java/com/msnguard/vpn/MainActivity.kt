@@ -5858,11 +5858,15 @@ class MainActivity : Activity() {
         // Tor's outer transport follows its switch's VISIBLE state, exactly as
         // Psiphon's does: it only affects a chained Tor connect, so with the chain
         // off — or with obfs4/Snowflake pinned, which cannot be chained at all — it
-        // is greyed rather than hidden.
+        // is greyed rather than hidden. Mirrors torChainRowRef so the two rows
+        // never desync on BadVPN/Zeptun/Hev — all engines read the same rule.
         val torChained = chainArmed(Protocol.TOR) && torSelected && torChainable
         torChainOuterRow?.apply {
             setValue(torChainOuterMode().label)
-            setAvailable(torSelected && torChainable && modeControlsEnabled && torChained)
+            // Must read the same predicate as torChainRowRef; do not gate on
+            // the TUN engine — the outer transport is what carries Tor, not
+            // what Tor carries.
+            setAvailable(torChained && modeControlsEnabled)
         }
         // Tor's exit-country picker, greyed off the TOR transport for the same
         // reason Psiphon's is: it configures a transport that is not selected, and
@@ -7967,8 +7971,8 @@ class MainActivity : Activity() {
 
 
     private fun defaultScan(): ScanTarget {
-        val name = preferences().getString(DEFAULT_SCAN, ScanTarget.IPV4.coreName)
-        return ScanTarget.entries.firstOrNull { it.coreName == name } ?: ScanTarget.IPV4
+        val name = preferences().getString(DEFAULT_SCAN, ScanTarget.BOTH.coreName)
+        return ScanTarget.entries.firstOrNull { it.coreName == name } ?: ScanTarget.BOTH
     }
 
     private fun defaultScanMode(): ScanMode {

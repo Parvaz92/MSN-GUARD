@@ -3847,7 +3847,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             !auto -> 0
             chainMemory in ladder.indices -> chainMemory
             plainHint != null -> plainHint
-            else -> 0
+            else -> {
+                // No history at all — the user just asked WireGuard to go first on
+                // Auto. Without evidence there is no reason to prefer MASQUE over a
+                // plain WireGuard leg that has never been tried on this carrier.
+                val wireguardIndex = ladder.indexOf("wireguard")
+                if (wireguardIndex >= 0) wireguardIndex else 0
+            }
         }
 
         if (!auto) {

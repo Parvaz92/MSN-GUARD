@@ -360,6 +360,34 @@ fn build_wg_candidates(
     let mut anchors: Vec<IpAddr> = Vec::new();
     let mut pool: Vec<IpAddr> = Vec::new();
 
+    // Both: keep the same v6-first contract as Masque's prober — the handset
+    // that can do v6 probes the v6 ranges first and falls back to v4 only when
+    // they produce nothing, which matches the "both with v6 priority" UI label.
+    if ip.want_v6() {
+        for s in wireguard::WG_SEEDS_V6 {
+            if let Ok(a) = s.parse::<Ipv6Addr>() {
+                anchors.push(IpAddr::V6(a));
+            }
+        }
+        let per = if st.sample_per_cidr == 0 {
+            80
+        } else {
+            st.sample_per_cidr
+        };
+        let cidr6: Vec<Vec<Ipv6Addr>> = wireguard::wg_prefixes_v6()
+            .iter()
+            .map(|c| sample_cidr_v6(c, per, wireguard::WG_PREFIXES_V4))
+            .collect();
+        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
+        for i in 0..max6 {
+            for hosts in &cidr6 {
+                if let Some(a) = hosts.get(i) {
+                    pool.push(IpAddr::V6(*a));
+                }
+            }
+        }
+    }
+
     if ip.want_v4() {
         for s in wireguard::wg_seeds_v4() {
             if let Ok(a) = s.parse::<Ipv4Addr>() {
@@ -381,31 +409,6 @@ fn build_wg_candidates(
             for hosts in &cidr_hosts {
                 if let Some(a) = hosts.get(i) {
                     pool.push(IpAddr::V4(*a));
-                }
-            }
-        }
-    }
-
-    if ip.want_v6() {
-        for s in wireguard::WG_SEEDS_V6 {
-            if let Ok(a) = s.parse::<Ipv6Addr>() {
-                anchors.push(IpAddr::V6(a));
-            }
-        }
-        let per = if st.sample_per_cidr == 0 {
-            80
-        } else {
-            st.sample_per_cidr
-        };
-        let cidr6: Vec<Vec<Ipv6Addr>> = wireguard::wg_prefixes_v6()
-            .iter()
-            .map(|c| sample_cidr_v6(c, per, wireguard::WG_PREFIXES_V4))
-            .collect();
-        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max6 {
-            for hosts in &cidr6 {
-                if let Some(a) = hosts.get(i) {
-                    pool.push(IpAddr::V6(*a));
                 }
             }
         }

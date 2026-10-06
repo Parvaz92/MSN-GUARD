@@ -470,6 +470,36 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         .filter_map(|s| s.parse().ok())
         .collect();
 
+    // Both: v6 first then v4, so an IPv6-capable host reaches v6 gateways
+    // before burning budget on v4. A host with no v6 was already rewritten to
+    // V4 above, so Both arriving here always has two legs to try.
+    if ip.want_v6() {
+        for a in &seeds6 {
+            if seen.insert((IpAddr::V6(*a), primary)) {
+                out.push((IpAddr::V6(*a), primary));
+            }
+        }
+        let per = if st.sample_per_cidr == 0 {
+            96
+        } else {
+            st.sample_per_cidr
+        };
+        let cidr6: Vec<Vec<Ipv6Addr>> = masque_cidrs_v6()
+            .iter()
+            .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
+            .collect();
+        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
+        for i in 0..max6 {
+            for hosts in &cidr6 {
+                if let Some(a) = hosts.get(i) {
+                    if seen.insert((IpAddr::V6(*a), primary)) {
+                        out.push((IpAddr::V6(*a), primary));
+                    }
+                }
+            }
+        }
+    }
+
     if ip.want_v4() {
         for a in &seeds {
             if seen.insert((IpAddr::V4(*a), primary)) {
@@ -500,45 +530,18 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
 
     if ip.want_v6() {
         for a in &seeds6 {
-            if seen.insert((IpAddr::V6(*a), primary)) {
-                out.push((IpAddr::V6(*a), primary));
-            }
-        }
-        let per = if st.sample_per_cidr == 0 {
-            96
-        } else {
-            st.sample_per_cidr
-        };
-        let cidr6: Vec<Vec<Ipv6Addr>> = masque_cidrs_v6()
-            .iter()
-            .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
-            .collect();
-        let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
-        for i in 0..max6 {
-            for hosts in &cidr6 {
-                if let Some(a) = hosts.get(i) {
-                    if seen.insert((IpAddr::V6(*a), primary)) {
-                        out.push((IpAddr::V6(*a), primary));
-                    }
+            for &port in ports {
+                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
+                    out.push((IpAddr::V6(*a), port));
                 }
             }
         }
     }
-
     if ip.want_v4() {
         for a in &seeds {
             for &port in ports {
                 if port != primary && seen.insert((IpAddr::V4(*a), port)) {
                     out.push((IpAddr::V4(*a), port));
-                }
-            }
-        }
-    }
-    if ip.want_v6() {
-        for a in &seeds6 {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
-                    out.push((IpAddr::V6(*a), port));
                 }
             }
         }
