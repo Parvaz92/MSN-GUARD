@@ -28,6 +28,18 @@ object HevEngine : TunEngine {
 
     @Volatile private var lastConfigPath: String? = null
 
+    // Raw fd detached from the dup and handed to libhev (see start()).
+    // detachFd() strips ownership from ParcelFileDescriptor, so we must close
+    // it ourselves — same fix as ZeptunEngine.ownedFd (37e2ae8).
+    @Volatile private var ownedFd: Int = -1
+
+    private fun closeOwnedFd() {
+        val fd = ownedFd
+        ownedFd = -1
+        if (fd < 0) return
+        try { ParcelFileDescriptor.adoptFd(fd).close() } catch (_: Throwable) {}
+    }
+
     override val isRunning: Boolean get() = try { hev.htproxy.TProxyService.TProxyIsRunning() } catch (_: Throwable) { false }
 
     override fun start(fd: ParcelFileDescriptor, socksPort: Int, mtu: Int, dnsOnly: Boolean): Boolean {
@@ -48,6 +60,7 @@ object HevEngine : TunEngine {
             try { dup.close() } catch (_: Exception) {}
             return false
         }
+        ownedFd = rawFd
         val dir = File(ctx.filesDir, "hev").apply { mkdirs() }
         val cfgFile = File(dir, "hev-$socksPort.yml")
         // Minimal YAML that matches hev's sample conf/main.yml:
@@ -101,10 +114,15 @@ object HevEngine : TunEngine {
                 ConnectionLog.record("Hev started → SOCKS 127.0.0.1:$socksPort mtu=$mtu")
             } else {
                 ConnectionLog.record("Hev start returned false (check logcat hev)")
+                // libhev may still hold the fd on a failed start — but ours is
+                // unconditionally ours (detachFd), and a leak here leaves the
+                // TUN interface and the VPN key up with no engine behind it.
+                closeOwnedFd()
             }
             ok
         } catch (e: Throwable) {
             ConnectionLog.record("Hev start exception: ${e.message}")
+            closeOwnedFd()
             false
         }
     }
@@ -121,6 +139,11 @@ object HevEngine : TunEngine {
             // Best-effort remove the ephemeral config so filesDir does not pile up.
             try { lastConfigPath?.let { File(it).delete() } } catch (_: Exception) {}
             lastConfigPath = null
+            // TProxyStopService has unwound its side by now (stop() is called
+            // off the main thread and it does pthread_join), and this detached
+            // fd is the last reference to the TUN — closing it is what takes
+            // the interface, and the status-bar key, down.
+            closeOwnedFd()
         }
     }
 }

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
-use boring::ssl::{SslConnector, SslMethod, SslVersion};
+use boring::ssl::{SslConnector, SslMethod};
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
@@ -20,10 +20,11 @@ use crate::quic::{AssignedAddr, Control, Internals};
 use crate::tls;
 
 /// ALPN: HTTP/2, then HTTP/1.1, as Chrome offers them; the edge picks HTTP/2, which the
-/// tunnel speaks. Listing h2 alone left no fallback, so a peer that negotiates by
-/// ALPN answered nothing and the handshake hung instead of being retried.
+/// ALPN: HTTP/2, then HTTP/1.1, as Chrome offers them; the edge picks HTTP/2,
+/// which the tunnel speaks. Listing h2 alone left no fallback, so a peer that
+/// negotiates by ALPN answered nothing and the handshake hung instead of being
+/// retried.
 const H2_ALPN: &[u8] = b"\x02h2\x08http/1.1";
-const CHROME_GROUPS: &str = "P-256:X25519:P-384";
 static H2_FALLBACK: AtomicBool = AtomicBool::new(false);
 static H2_PREFERRED: AtomicBool = AtomicBool::new(false);
 
@@ -181,28 +182,7 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    builder
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-    builder
-        .set_max_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-
-    builder.set_grease_enabled(true);
-
-    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
-    let groups = groups
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(CHROME_GROUPS);
-    builder
-        .set_curves_list(groups)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-
-    builder
-        .set_alpn_protos(H2_ALPN)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    crate::tls::Fingerprint::configured().apply(&mut builder, H2_ALPN)?;
 
     let cert = X509::from_pem(&cfg.cert_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
     let key =

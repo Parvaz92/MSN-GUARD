@@ -14,10 +14,10 @@ path = "src/bin/aether.rs"
 
 [dependencies]
 quiche = { path = "../quiche/quiche", default-features = false, features = ["boringssl-boring-crate", "qlog"] }
-boring = "4.22"
+boring = "5.2"
 foreign-types-shared = "0.3"
 libc = "0.2"
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "signal"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "io-std", "signal", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies", "socks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,7 +46,7 @@ socket2 = "0.6.4"
 h2 = "0.4.15"
 http = "1"
 bytes = "1"
-tokio-boring = "4.22"
+tokio-boring = "5.2"
 
 [profile.release]
 opt-level = 3

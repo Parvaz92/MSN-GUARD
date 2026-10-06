@@ -25,8 +25,168 @@ extern "C" {
     );
 }
 
+/// The groups of the fingerprint, in order, unless --tls-groups names others.
 const CHROME_GROUPS: &str = "P-256:X25519:P-384";
 const COMPATIBILITY_GROUPS: &str = "X25519:P-256:P-384";
+
+/// The TLS 1.2 cipher suites of the fingerprint unless --tls-ciphers names others: Chrome's
+/// own rule, which BoringSSL orders as it does for Chrome, AES-GCM before ChaCha20 on
+/// hardware with AES instructions and after it elsewhere.
+pub const CHROME_CIPHERS: &str = "ALL:!aPSK:!ECDSA+SHA1:!3DES";
+
+/// An option that sets TLS 1.2 cipher suites: a BoringSSL cipher string, names separated
+/// by ':'. A ClientHello lists them after BoringSSL's own TLS 1.3 suites, which no cipher
+/// string changes, and only where it offers TLS 1.2 as well.
+#[derive(Debug)]
+pub struct CipherOption {
+    pub flag: &'static str,
+    pub variable: &'static str,
+}
+
+/// --tls-ciphers: the TLS 1.2 cipher suites of the handshakes `Fingerprint` makes, in place
+/// of Chrome's (`CHROME_CIPHERS`). HTTP/3 lists none: QUIC offers TLS 1.3 alone.
+pub const TLS_CIPHERS: CipherOption = CipherOption {
+    flag: "--tls-ciphers",
+    variable: "AETHER_TLS_CIPHERS",
+};
+
+impl CipherOption {
+    /// The cipher string given to the option; None when it is not given.
+    pub fn configured(&self) -> Option<String> {
+        std::env::var(self.variable)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+/// Sets `list`, a BoringSSL cipher string, as the TLS 1.2 cipher suites of `builder`.
+/// Strictly, through boring's set_strict_cipher_list (SSL_CTX_set_strict_cipher_list): a name
+/// BoringSSL does not know is an error, which set_cipher_list would leave out without a word.
+/// boring takes the error off the thread's error queue, where it would show in a later error.
+pub fn set_tls12_ciphers(builder: &mut SslContextBuilder, list: &str) -> Result<()> {
+    builder.set_strict_cipher_list(list).map_err(|_| {
+        AetherError::Tls(format!(
+            "{list:?} is no cipher list BoringSSL takes (cipher names separated by ':')"
+        ))
+    })
+}
+
+/// The TLS 1.2 cipher suites `list` names, in its order, as BoringSSL reads it: the number
+/// and the name of each.
+pub fn tls12_ciphers(list: &str) -> Result<Vec<(u16, &'static str)>> {
+    let mut builder =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
+    set_tls12_ciphers(&mut builder, list)?;
+    Ok(builder
+        .ciphers()
+        .map(|ciphers| {
+            ciphers
+                .iter()
+                .map(|cipher| {
+                    let name = cipher.standard_name().unwrap_or_else(|| cipher.name());
+                    (cipher.protocol_id(), name)
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Sets `groups`, a BoringSSL group list, names separated by ':', as the groups of `builder`,
+/// in order.
+fn set_groups(builder: &mut SslContextBuilder, groups: &str) -> Result<()> {
+    builder.set_curves_list(groups).map_err(|_| {
+        AetherError::Tls(format!(
+            "{groups:?} is no group list BoringSSL takes (group names separated by ':')"
+        ))
+    })
+}
+
+/// The TLS fingerprint of the handshakes of the tunnel and its setup: MASQUE over HTTP/2 and
+/// over HTTP/3, the calls to the WARP API and the DoH lookup of the ECH key, each with its
+/// own ALPN.
+/// It is Chrome's, as BoringSSL writes it, with what --tls-ciphers, --tls-groups and
+/// --disable-grease change of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// --tls-ciphers: the TLS 1.2 cipher suites in place of Chrome's, when given.
+    pub ciphers: Option<String>,
+    /// --tls-groups: the groups, in order; the first gets a key share.
+    pub groups: String,
+    /// GREASE values (RFC 8701) among the cipher suites, the extensions, the groups, the key
+    /// shares and the versions, as Chrome sends them; --disable-grease leaves them out.
+    pub grease: bool,
+}
+
+impl Default for Fingerprint {
+    /// Chrome's, with none of the options given.
+    fn default() -> Self {
+        Fingerprint {
+            ciphers: None,
+            groups: CHROME_GROUPS.to_string(),
+            grease: true,
+        }
+    }
+}
+
+impl Fingerprint {
+    /// The fingerprint the options give: --tls-ciphers (AETHER_TLS_CIPHERS), --tls-groups
+    /// (AETHER_TLS_GROUPS) and --disable-grease (AETHER_DISABLE_GREASE).
+    pub fn configured() -> Self {
+        let groups = std::env::var("AETHER_TLS_GROUPS")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Fingerprint {
+            ciphers: TLS_CIPHERS.configured(),
+            groups: groups.unwrap_or_else(|| CHROME_GROUPS.to_string()),
+            grease: !std::env::var("AETHER_DISABLE_GREASE")
+                .is_ok_and(|value| crate::fragment::is_truthy(&value)),
+        }
+    }
+
+    /// Gives `builder` the fingerprint, offering `alpn`, in wire format: TLS 1.2 and 1.3, the
+    /// groups, the extensions in a new order on each handshake, signed certificate timestamps
+    /// and OCSP asked for, GREASE unless it is off, and the TLS 1.2 suites, Chrome's unless the
+    /// cipher list names others. TLS server-certificate verification disabled (unconditional).
+    pub fn apply(&self, builder: &mut SslContextBuilder, alpn: &[u8]) -> Result<()> {
+        let tls = |error: boring::error::ErrorStack| AetherError::Tls(error.to_string());
+        builder.set_verify(SslVerifyMode::NONE);
+        builder
+            .set_min_proto_version(Some(SslVersion::TLS1_2))
+            .map_err(tls)?;
+        builder
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .map_err(tls)?;
+        builder.set_grease_enabled(self.grease);
+        builder.set_permute_extensions(true);
+        set_groups(builder, &self.groups)?;
+        builder.set_alpn_protos(alpn).map_err(tls)?;
+        builder.enable_signed_cert_timestamps();
+        builder.enable_ocsp_stapling();
+        set_tls12_ciphers(builder, self.ciphers.as_deref().unwrap_or(CHROME_CIPHERS))?;
+        Ok(())
+    }
+}
+
+/// Checks --tls-ciphers and --tls-groups as the core starts: a cipher string or a group list
+/// BoringSSL does not take stops it, with the option named.
+pub fn check_tls_options() -> Result<()> {
+    let named = |flag: &str, e: AetherError| {
+        let reason = match e {
+            AetherError::Tls(reason) => reason,
+            other => other.to_string(),
+        };
+        AetherError::Tls(format!("{flag}: {reason}"))
+    };
+    let fingerprint = Fingerprint::configured();
+    if let Some(list) = &fingerprint.ciphers {
+        tls12_ciphers(list).map_err(|e| named(TLS_CIPHERS.flag, e))?;
+    }
+    let mut builder =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
+    set_groups(&mut builder, &fingerprint.groups).map_err(|e| named("--tls-groups", e))
+}
 
 pub struct TlsParams<'a> {
     pub cert_pem: &'a [u8],
