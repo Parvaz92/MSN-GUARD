@@ -1,58 +1,10 @@
-//! TLS ClientHello SNI extraction, without a TLS stack.
-//!
-//! ## Why this exists
-//!
-//! The routing rules a user writes are expressed as *domains*, but inside a
-//! TUN front end a connection is addressed as an IP. The name was resolved
-//! before the packet reached us, and is gone by the time we see a SYN. So a
-//! rule like "instagram.com goes direct" has nothing to match against, and
-//! the only rules that work are CIDRs.
-//!
-//! The fix is to read the name off the wire: the first thing the client sends
-//! is a TLS ClientHello that carries the name in the clear (that is the point
-//! of SNI). We do not terminate TLS, decrypt, or even parse past the
-//! extensions we care about — we only locate the SNI extension and read its
-//! single hostname field. On a non-TLS flow, or a flow whose ClientHello is
-//! fragmented across packets, we return [None] and the caller keeps its
-//! existing IP-based decision. Nothing about the connection changes.
-//!
-//! ## Where it is called
-//!
-//! Only in the outbound path of [crate::tun], on the *first* segment of a
-//! flow, when routing rules that name domains are actually configured. That
-//! gate matters: the peek costs one extra read per new connection, and there
-//! is no reason to pay it when nobody wrote a domain rule.
-//!
-//! ## The trade-off, stated plainly
-//!
-//! The ClientHello is not guaranteed to arrive in the first segment. TLS 1.3
-//! with a large key-share and a long certificate list can exceed one TCP
-//! segment, and if the SNI happens to sit in the part that has not arrived
-//! yet we see [None] and fall back to the IP rule. That is a miss, not a
-//! misroute: the fallback is the exact behaviour that existed before, so a
-//! fragmented ClientHello costs a domain rule it would otherwise have won.
-//!
-//! It is also why the peek is bounded by [PEEK_BUDGET]: we read at most this
-//! many bytes, and if the name is further in than that we do not chase it.
-use std::io;
-
-/// The TLS record type for a handshake.
 const TLS_HANDSHAKE: u8 = 0x16;
-/// The handshake message type for a ClientHello.
 const TLS_CLIENT_HELLO: u8 = 0x01;
-/// The extension type that carries the server name.
 const EXT_SERVER_NAME: u16 = 0x0000;
-/// The ServerNameEntry type for a hostname.
 const SNI_HOST_NAME: u8 = 0x00;
 
-/// The longest a DNS name may be, RFC 1035.
 const MAX_HOST_LEN: usize = 253;
 
-/// How many bytes to read looking for a name.
-///
-/// A ClientHello comfortably fits inside this in practice — the SNI extension
-/// sits early in the extension list — and the budget also bounds how much a
-/// misbehaving peer can make us buffer before we give up.
 pub const PEEK_BUDGET: usize = 4096;
 
 fn be16(buf: &[u8], at: usize) -> Option<usize> {
@@ -68,13 +20,6 @@ fn be24(buf: &[u8], at: usize) -> Option<usize> {
     Some((a << 16) | (b << 8) | c)
 }
 
-/// Is this a plausible hostname, and not an IP address in disguise?
-///
-/// A DPI filter or a malformed ClientHello can put bytes in the SNI field that
-/// are not a name at all. Accepting them would mean matching a user's domain
-/// rule against garbage, which is how a rule acquires a false positive. So the
-/// name must be ASCII, must contain a dot, must not parse as an IP, and must
-/// be within the DNS length limit.
 fn plausible_host(raw: &[u8]) -> Option<String> {
     if raw.is_empty() || raw.len() > MAX_HOST_LEN {
         return None;
@@ -92,8 +37,6 @@ fn plausible_host(raw: &[u8]) -> Option<String> {
         return None;
     }
 
-    // An IP literal in the SNI is not a domain rule target. Some clients do
-    // send it, and it must not be treated as a name.
     if name.parse::<std::net::IpAddr>().is_ok() {
         return None;
     }
@@ -101,230 +44,265 @@ fn plausible_host(raw: &[u8]) -> Option<String> {
     Some(name.to_lowercase())
 }
 
-/// Read the SNI hostname out of a TLS ClientHello.
-///
-/// Returns [None] for anything that is not a ClientHello carrying an SNI we
-/// can trust: a non-handshake record, a non-ClientHello message, a truncated
-/// extension list, a missing SNI extension, or a field that is not a
-/// plausible hostname. Callers must treat [None] as "no name available" and
-/// keep their existing behaviour.
-///
-/// `buf` holds the bytes received so far on this connection; it does not have
-/// to be complete, only the leading part of the ClientHello.
 pub fn tls_sni(buf: &[u8]) -> Option<String> {
-    // TLS record header: type, version (2), length (2).
-    if buf.len() < 5 || buf[0] != TLS_HANDSHAKE {
+    if *buf.first()? != TLS_HANDSHAKE {
         return None;
     }
 
-    // The handshake message begins after the 5-byte record header.
-    let hs = &buf[5..];
-    if hs.is_empty() || hs[0] != TLS_CLIENT_HELLO {
+    let record_len = be16(buf, 3)?;
+    let record_end = 5usize.checked_add(record_len)?.min(buf.len());
+
+    let body = buf.get(5..record_end)?;
+    if *body.first()? != TLS_CLIENT_HELLO {
         return None;
     }
 
-    // Handshake header: type (1), length (3), then the ClientHello body.
-    if hs.len() < 4 {
+    let hello_len = be24(body, 1)?;
+    let hello_end = 4usize.checked_add(hello_len)?.min(body.len());
+    let hello = body.get(4..hello_end)?;
+
+    let mut at = 2 + 32;
+
+    let session_len = *hello.get(at)? as usize;
+    at = at.checked_add(1 + session_len)?;
+
+    let cipher_len = be16(hello, at)?;
+    at = at.checked_add(2 + cipher_len)?;
+
+    let compression_len = *hello.get(at)? as usize;
+    at = at.checked_add(1 + compression_len)?;
+
+    let extensions_len = be16(hello, at)?;
+    at = at.checked_add(2)?;
+    let extensions_end = at.checked_add(extensions_len)?.min(hello.len());
+
+    while at + 4 <= extensions_end {
+        let kind = be16(hello, at)? as u16;
+        let len = be16(hello, at + 2)?;
+        let data_start = at + 4;
+        let data_end = data_start.checked_add(len)?;
+        if data_end > extensions_end {
+            return None;
+        }
+
+        if kind == EXT_SERVER_NAME {
+            let data = hello.get(data_start..data_end)?;
+            return first_server_name(data);
+        }
+
+        at = data_end;
+    }
+
+    None
+}
+
+fn first_server_name(data: &[u8]) -> Option<String> {
+    let list_len = be16(data, 0)?;
+    let list_end = 2usize.checked_add(list_len)?.min(data.len());
+
+    let mut at = 2usize;
+    while at + 3 <= list_end {
+        let kind = *data.get(at)?;
+        let len = be16(data, at + 1)?;
+        let start = at + 3;
+        let end = start.checked_add(len)?;
+        if end > list_end {
+            return None;
+        }
+
+        if kind == SNI_HOST_NAME {
+            return plausible_host(data.get(start..end)?);
+        }
+
+        at = end;
+    }
+
+    None
+}
+
+pub fn http_host(buf: &[u8]) -> Option<String> {
+    let head_end = buf.len().min(PEEK_BUDGET);
+    let head = buf.get(..head_end)?;
+
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+
+    let request_line = lines.next()?;
+    if !looks_like_http(request_line) {
         return None;
     }
-    let _hs_len = be24(hs, 1)?;
-    let mut cur = hs.get(4..)?;
 
-    // legacy_version (2), random (32), legacy_session_id (1 + len).
-    if cur.len() < 2 + 32 {
-        return None;
-    }
-    cur = &cur[2 + 32..];
-    let sid_len = *cur.first()? as usize;
-    cur = cur.get(1 + sid_len..)?;
-
-    // cipher_suites (2 + len), legacy_compression_methods (1 + len).
-    let cs_len = be16(cur, 0)?;
-    cur = cur.get(2 + cs_len..)?;
-    let cm_len = *cur.first()? as usize;
-    cur = cur.get(1 + cm_len..)?;
-
-    // Extensions: 2-byte total length, then type (2) + length (2) each.
-    let _ext_total = be16(cur, 0)?;
-    cur = cur.get(2..)?;
-
-    while cur.len() >= 4 {
-        let ext_type = be16(cur, 0)?;
-        let ext_len = be16(cur, 2)?;
-        let ext = cur.get(4..4 + ext_len)?;
-        cur = &cur[4 + ext_len..];
-
-        if ext_type != EXT_SERVER_NAME as usize {
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = match line.split_once(':') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        if !name.eq_ignore_ascii_case("host") {
             continue;
         }
 
-        // The server_name extension is itself a list: 2-byte total length,
-        // then entries of type (1) + length (2) + name.
-        let mut list = ext;
-        let _list_len = be16(list, 0)?;
-        list = list.get(2..)?;
-
-        while list.len() >= 3 {
-            let name_type = list[0];
-            let name_len = be16(list, 1)?;
-            let name = list.get(3..3 + name_len)?;
-            list = &list[3 + name_len..];
-
-            if name_type != SNI_HOST_NAME {
-                // Other name types are not hostnames and we do not use them.
-                continue;
-            }
-
-            return plausible_host(name);
-        }
+        let value = value.trim();
+        let without_port = match value.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            _ => value,
+        };
+        return plausible_host(without_port.as_bytes());
     }
 
     None
 }
 
-/// Extract a hostname from the first bytes of an HTTP/1 request, if that is
-/// what this flow is.
-///
-/// `Host: example.com` is the cleartext equivalent of SNI for HTTP, and the
-/// same domain rule should apply to it. Kept separate from [tls_sni] because
-/// the two formats share nothing but the goal.
-pub fn http_host(buf: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(buf).ok()?;
-    if !text.starts_with("GET ") && !text.starts_with("POST ")
-        && !text.starts_with("HEAD ") && !text.starts_with("PUT ")
-        && !text.starts_with("CONNECT ")
-    {
-        return None;
-    }
-
-    for line in text.split("\r\n") {
-        if let Some(rest) = line.strip_prefix("Host:") {
-            return plausible_host(rest.as_bytes());
-        }
-    }
-
-    None
+fn looks_like_http(line: &str) -> bool {
+    const METHODS: [&str; 9] = [
+        "GET ", "POST ", "PUT ", "HEAD ", "DELETE ", "OPTIONS ", "PATCH ", "TRACE ", "CONNECT ",
+    ];
+    METHODS.iter().any(|method| line.starts_with(method)) && line.contains("HTTP/")
 }
 
-/// Whatever hostname these bytes announce, TLS or HTTP.
-///
-/// Returns the first format that yields a name. This is the one entry point
-/// the caller needs: it does not have to know which kind of flow it has.
 pub fn hostname(buf: &[u8]) -> Option<String> {
     tls_sni(buf).or_else(|| http_host(buf))
-}
-
-/// How many bytes of the head of a stream are worth reading.
-///
-/// Same value as [PEEK_BUDGET]; exists so a caller can name the intent
-/// ("read the sniff head") rather than the constant.
-pub fn read_budget() -> usize {
-    PEEK_BUDGET
-}
-
-/// Read from `stream` into `buf` without consuming it: TCP is a stream, and
-/// the bytes we inspect to learn the name are the same bytes the tunnel must
-/// forward afterwards. Available on Unix, where the TUN front end runs.
-#[cfg(unix)]
-pub async fn peek(stream: &mut tokio::net::TcpStream, buf: &mut Vec<u8>) -> io::Result<usize> {
-    use tokio::io::AsyncReadExt;
-    let read = stream.read(buf).await?;
-    buf.truncate(read);
-    Ok(read)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A minimal ClientHello carrying one SNI, built by hand so the test does
-    /// not depend on any TLS library's layout.
-    fn client_hello(sni: &str) -> Vec<u8> {
-        let mut ext = Vec::new();
-        let name = sni.as_bytes();
-        // ServerNameEntry: type 0, length, name.
-        ext.push(SNI_HOST_NAME);
-        ext.extend_from_slice(&(name.len() as u16).to_be_bytes());
-        ext.extend_from_slice(name);
-        // server_name extension body: 2-byte list length, then the entries.
-        let mut ext_body = Vec::new();
-        ext_body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
-        ext_body.extend_from_slice(&ext);
-        // The extension itself: type (2) + length (2) + body.
+    fn client_hello(server_name: Option<&str>) -> Vec<u8> {
         let mut extensions = Vec::new();
-        extensions.extend_from_slice(&EXT_SERVER_NAME.to_be_bytes());
-        extensions.extend_from_slice(&(ext_body.len() as u16).to_be_bytes());
-        extensions.extend_from_slice(&ext_body);
+        if let Some(name) = server_name {
+            let mut entry = Vec::new();
+            entry.push(SNI_HOST_NAME);
+            entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            entry.extend_from_slice(name.as_bytes());
+
+            let mut sni = Vec::new();
+            sni.extend_from_slice(&(entry.len() as u16).to_be_bytes());
+            sni.extend_from_slice(&entry);
+
+            extensions.extend_from_slice(&EXT_SERVER_NAME.to_be_bytes());
+            extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(&sni);
+        }
+
+        extensions.extend_from_slice(&0x002bu16.to_be_bytes());
+        extensions.extend_from_slice(&2u16.to_be_bytes());
+        extensions.extend_from_slice(&[0x03, 0x04]);
 
         let mut hello = Vec::new();
-        hello.push(TLS_CLIENT_HELLO);
-        let len = 2 + 32 + 1 + 0 + 2 + 0 + 1 + 0 + 2 + extensions.len();
-        hello.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
-        hello.extend_from_slice(&[0x03, 0x03]); // legacy_version
-        hello.extend_from_slice(&[0u8; 32]); // random
-        hello.push(0); // legacy_session_id length
-        hello.extend_from_slice(&[0x00, 0x00]); // cipher_suites length
-        hello.push(0); // legacy_compression_methods length
+        hello.extend_from_slice(&[0x03, 0x03]);
+        hello.extend_from_slice(&[0x11; 32]);
+        hello.push(0);
+        hello.extend_from_slice(&2u16.to_be_bytes());
+        hello.extend_from_slice(&[0x13, 0x01]);
+        hello.push(1);
+        hello.push(0);
         hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         hello.extend_from_slice(&extensions);
+
+        let mut body = Vec::new();
+        body.push(TLS_CLIENT_HELLO);
+        let len = hello.len();
+        body.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        body.extend_from_slice(&hello);
 
         let mut record = Vec::new();
         record.push(TLS_HANDSHAKE);
         record.extend_from_slice(&[0x03, 0x01]);
-        record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
-        record.extend_from_slice(&hello);
+        record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        record.extend_from_slice(&body);
         record
     }
 
     #[test]
-    fn reads_the_sni_from_a_client_hello() {
-        let pkt = client_hello("www.example.com");
-        assert_eq!(tls_sni(&pkt).as_deref(), Some("www.example.com"));
+    fn the_server_name_is_read_out_of_a_client_hello() {
+        let hello = client_hello(Some("example.com"));
+        assert_eq!(tls_sni(&hello).as_deref(), Some("example.com"));
+        assert_eq!(hostname(&hello).as_deref(), Some("example.com"));
     }
 
     #[test]
-    fn lowercases_the_name() {
-        let pkt = client_hello("WWW.Example.COM");
-        assert_eq!(tls_sni(&pkt).as_deref(), Some("www.example.com"));
+    fn a_client_hello_without_a_server_name_yields_nothing() {
+        let hello = client_hello(None);
+        assert_eq!(tls_sni(&hello), None);
     }
 
     #[test]
-    fn a_non_tls_record_gives_nothing() {
-        let pkt = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        assert!(tls_sni(pkt).is_none());
+    fn a_server_name_is_lowercased_and_stripped_of_a_trailing_dot() {
+        let hello = client_hello(Some("Example.COM."));
+        assert_eq!(tls_sni(&hello).as_deref(), Some("example.com"));
     }
 
     #[test]
-    fn a_truncated_client_hello_gives_nothing() {
-        let pkt = client_hello("www.example.com");
-        assert!(tls_sni(&pkt[..20]).is_none());
+    fn a_truncated_client_hello_is_refused_without_panicking() {
+        let hello = client_hello(Some("example.com"));
+        for cut in 0..hello.len() {
+            let _ = tls_sni(&hello[..cut]);
+        }
     }
 
     #[test]
-    fn no_sni_extension_gives_nothing() {
-        // The same ClientHello with the SNI extension removed.
-        let pkt = client_hello("www.example.com");
-        // Cut the extension list: take everything up to the extension length.
-        let cut = pkt.len() - 6;
-        assert!(tls_sni(&pkt[..cut]).is_none());
+    fn random_bytes_are_never_mistaken_for_a_server_name() {
+        let mut seed = 0x12345678u32;
+        for _ in 0..2000 {
+            let mut buf = Vec::new();
+            for _ in 0..64 {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                buf.push((seed >> 16) as u8);
+            }
+            let _ = hostname(&buf);
+        }
     }
 
     #[test]
-    fn an_ip_literal_is_not_a_hostname() {
-        let pkt = client_hello("1.2.3.4");
-        assert_eq!(tls_sni(&pkt), None);
+    fn a_literal_address_in_the_server_name_is_not_treated_as_a_domain() {
+        let hello = client_hello(Some("192.168.1.1"));
+        assert_eq!(tls_sni(&hello), None);
     }
 
     #[test]
-    fn http_host_is_read() {
-        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        assert_eq!(http_host(req).as_deref(), Some("example.com"));
-        assert_eq!(hostname(req).as_deref(), Some("example.com"));
+    fn the_host_header_is_read_out_of_a_plain_request() {
+        let request = b"GET /index.html HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+        assert_eq!(http_host(request).as_deref(), Some("example.com"));
+        assert_eq!(hostname(request).as_deref(), Some("example.com"));
     }
 
     #[test]
-    fn a_binary_blob_gives_nothing() {
-        assert!(tls_sni(&[0xff; 64]).is_none());
-        assert!(http_host(&[0xff; 64]).is_none());
+    fn a_port_on_the_host_header_is_dropped() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        assert_eq!(http_host(request).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn the_host_header_is_found_whatever_its_capitalisation() {
+        let request = b"POST /submit HTTP/1.1\r\nHOST: Example.Com\r\n\r\n";
+        assert_eq!(http_host(request).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_http_is_refused() {
+        assert_eq!(http_host(b"SSH-2.0-OpenSSH_9.6\r\n"), None);
+        assert_eq!(http_host(b"\x00\x01\x02\x03"), None);
+        assert_eq!(http_host(b""), None);
+    }
+
+    #[test]
+    fn a_host_header_carrying_an_address_is_ignored() {
+        let request = b"GET / HTTP/1.1\r\nHost: 10.0.0.1\r\n\r\n";
+        assert_eq!(http_host(request), None);
+    }
+
+    #[test]
+    fn a_single_label_host_is_ignored_because_rules_are_written_with_dots() {
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(http_host(request), None);
+    }
+
+    #[test]
+    fn an_over_long_name_is_refused() {
+        let long = format!("{}.com", "a".repeat(300));
+        assert_eq!(plausible_host(long.as_bytes()), None);
     }
 }

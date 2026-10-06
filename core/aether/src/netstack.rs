@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
-use std::future::Future;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -13,7 +10,6 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address,
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{AetherError, Result};
-use crate::ffi;
 
 fn tcp_rx_buf() -> usize {
     crate::sysprofile::netstack_tcp_rx_buf_bytes()
@@ -44,6 +40,53 @@ const MAX_RECV_CHUNKS: usize = 128;
 const BACKPRESSURE_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
 const DROP_REPORT_STEP: usize = 512;
 const MAX_IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+const ORPHAN_LINGER: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn max_tcp_pending() -> usize {
+    tcp_rx_buf().saturating_mul(2).max(64 * 1024)
+}
+
+pub(crate) fn tcp_keepalive() -> std::time::Duration {
+    let secs = std::env::var("AETHER_TCP_KEEPALIVE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+fn tcp_connect_timeout() -> std::time::Duration {
+    let secs = std::env::var("AETHER_TCP_CONNECT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
+fn smol_duration(duration: std::time::Duration) -> smoltcp::time::Duration {
+    smoltcp::time::Duration::from_millis(duration.as_millis().min(u64::MAX as u128) as u64)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TcpLimits {
+    connect: std::time::Duration,
+    keepalive: std::time::Duration,
+    orphan_linger: std::time::Duration,
+}
+
+impl TcpLimits {
+    fn from_env() -> Self {
+        Self {
+            connect: tcp_connect_timeout(),
+            keepalive: tcp_keepalive(),
+            orphan_linger: ORPHAN_LINGER,
+        }
+    }
+}
 
 type OpenTcpResp = oneshot::Sender<std::result::Result<TcpConn, String>>;
 type OpenUdpResp = oneshot::Sender<std::result::Result<UdpConn, String>>;
@@ -118,22 +161,6 @@ pub enum Cmd {
         v4: Option<(Ipv4Addr, u8)>,
         v6: Option<(Ipv6Addr, u8)>,
     },
-    /// Enable transparent TCP accept mode.
-    /// When set, any incoming SYN to any destination is accepted,
-    /// and the accepted connection is sent via the channel.
-    EnableAccept {
-        accept_tx: mpsc::Sender<AcceptedTcp>,
-    },
-}
-
-/// An accepted TCP connection in transparent mode.
-pub struct AcceptedTcp {
-    /// The remote address that connected (the app's source).
-    pub remote: SocketAddr,
-    /// The local address (the destination the app was trying to reach).
-    pub local: SocketAddr,
-    /// The netstack TCP connection — use into_split() to get sender/receiver.
-    pub conn: TcpConn,
 }
 
 pub enum DataIn {
@@ -147,6 +174,7 @@ pub struct TcpConn {
     pub id: usize,
     pub from_stack: mpsc::Receiver<Vec<u8>>,
     data_in: mpsc::Sender<DataIn>,
+    split: bool,
 }
 
 impl TcpConn {
@@ -161,64 +189,26 @@ impl TcpConn {
         let _ = self.data_in.send(DataIn::TcpClose(self.id)).await;
     }
 
-    /// Send a chunk without awaiting — for the AsyncWrite adapter, which must
-    /// drive the channel from a poll context.
-    pub fn poll_send(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        id: usize,
-        data: Vec<u8>,
-    ) -> std::task::Poll<Result<()>> {
-        // `Sender::send` registers the channel's waker while it waits for
-        // capacity, so polling it here turns Pending into a real wait instead
-        // of a busy loop.
-        let mut fut = Box::pin(self.data_in.send(DataIn::Tcp(id, data)));
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(
-                AetherError::Other("netstack closed".into()),
-            )),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-
-    pub fn poll_close(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        let mut fut = Box::pin(self.data_in.send(DataIn::TcpClose(self.id)));
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(_)) => {
-                std::task::Poll::Ready(Err(io::Error::other("netstack closed")))
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-
-    pub fn id(&self) -> usize {
-        self.id
-    }
-
-    pub fn take_inbound(&mut self) -> mpsc::Receiver<Vec<u8>> {
-        std::mem::replace(&mut self.from_stack, mpsc::channel(1).1)
-    }
-
-    /// Non-blocking close, for use in Drop. Returns Full when the channel is
-    /// saturated (the stack will still tear the connection down) and Closed
-    /// when the stack is already gone.
-    pub fn try_send_close(&self) -> std::result::Result<(), tokio::sync::mpsc::error::TrySendError<DataIn>> {
-        self.data_in.try_send(DataIn::TcpClose(self.id))
-    }
-
-    pub fn into_split(self) -> (TcpSender, mpsc::Receiver<Vec<u8>>) {
+    pub fn into_split(mut self) -> (TcpSender, mpsc::Receiver<Vec<u8>>) {
+        self.split = true;
         (
             TcpSender {
                 id: self.id,
-                data_in: self.data_in,
+                data_in: self.data_in.clone(),
             },
-            self.from_stack,
+            std::mem::replace(&mut self.from_stack, {
+                let (_tx, rx) = mpsc::channel(1);
+                rx
+            }),
         )
+    }
+}
+
+impl Drop for TcpConn {
+    fn drop(&mut self) {
+        if !self.split {
+            let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
+        }
     }
 }
 
@@ -228,10 +218,6 @@ pub struct TcpSender {
 }
 
 impl TcpSender {
-    pub fn id(&self) -> usize {
-        self.id
-    }
-
     pub async fn send(&self, data: Vec<u8>) -> Result<()> {
         self.data_in
             .send(DataIn::Tcp(self.id, data))
@@ -242,45 +228,11 @@ impl TcpSender {
     pub async fn close(&self) {
         let _ = self.data_in.send(DataIn::TcpClose(self.id)).await;
     }
+}
 
-    /// Send a chunk without awaiting — for the AsyncWrite adapter, which must
-    /// drive the channel from a poll context.
-    pub fn poll_send(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        data: Vec<u8>,
-    ) -> std::task::Poll<Result<()>> {
-        let mut fut = Box::pin(self.data_in.send(DataIn::Tcp(self.id, data)));
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(
-                AetherError::Other("netstack closed".into()),
-            )),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-
-    pub fn poll_close(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        let mut fut = Box::pin(self.data_in.send(DataIn::TcpClose(self.id)));
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(_)) => {
-                std::task::Poll::Ready(Err(io::Error::other("netstack closed")))
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-
-    /// Non-blocking close, for use in Drop. Returns Full when the channel is
-    /// saturated (the stack will still tear the connection down) and Closed
-    /// when the stack is already gone.
-    pub fn try_send_close(
-        &self,
-    ) -> std::result::Result<(), tokio::sync::mpsc::error::TrySendError<DataIn>> {
-        self.data_in.try_send(DataIn::TcpClose(self.id))
+impl Drop for TcpSender {
+    fn drop(&mut self) {
+        let _ = self.data_in.try_send(DataIn::TcpClose(self.id));
     }
 }
 
@@ -288,6 +240,7 @@ pub struct UdpConn {
     pub id: usize,
     pub from_stack: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     data_in: mpsc::Sender<DataIn>,
+    split: bool,
 }
 
 impl UdpConn {
@@ -302,14 +255,26 @@ impl UdpConn {
         let _ = self.data_in.send(DataIn::UdpClose(self.id)).await;
     }
 
-    pub fn into_split(self) -> (UdpSender, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
+    pub fn into_split(mut self) -> (UdpSender, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
+        self.split = true;
         (
             UdpSender {
                 id: self.id,
-                data_in: self.data_in,
+                data_in: self.data_in.clone(),
             },
-            self.from_stack,
+            std::mem::replace(&mut self.from_stack, {
+                let (_tx, rx) = mpsc::channel(1);
+                rx
+            }),
         )
+    }
+}
+
+impl Drop for UdpConn {
+    fn drop(&mut self) {
+        if !self.split {
+            let _ = self.data_in.try_send(DataIn::UdpClose(self.id));
+        }
     }
 }
 
@@ -328,6 +293,12 @@ impl UdpSender {
 
     pub async fn close(&self) {
         let _ = self.data_in.send(DataIn::UdpClose(self.id)).await;
+    }
+}
+
+impl Drop for UdpSender {
+    fn drop(&mut self) {
+        let _ = self.data_in.try_send(DataIn::UdpClose(self.id));
     }
 }
 
@@ -371,17 +342,6 @@ impl StackHandle {
             .await
             .map_err(|_| AetherError::Other("netstack closed".into()))
     }
-
-    /// Enable transparent TCP accept mode.
-    /// Returns a receiver that yields accepted TCP connections.
-    pub async fn enable_accept(&self) -> Result<mpsc::Receiver<AcceptedTcp>> {
-        let (accept_tx, accept_rx) = mpsc::channel(app_queue());
-        self.cmd_tx
-            .send(Cmd::EnableAccept { accept_tx })
-            .await
-            .map_err(|_| AetherError::Other("netstack closed".into()))?;
-        Ok(accept_rx)
-    }
 }
 
 struct TcpState {
@@ -389,9 +349,12 @@ struct TcpState {
     to_app: mpsc::Sender<Vec<u8>>,
     from_stack_rx: Option<mpsc::Receiver<Vec<u8>>>,
     connect_resp: Option<OpenTcpResp>,
+    connect_deadline: std::time::Instant,
     pending: Vec<u8>,
     established: bool,
     half_closed: bool,
+    orphaned_at: Option<std::time::Instant>,
+    aborted: bool,
 }
 
 struct UdpState {
@@ -408,8 +371,7 @@ pub struct NetStack {
     next_id: usize,
     next_port: u16,
     data_in_tx: mpsc::Sender<DataIn>,
-    /// When set, incoming TCP SYNs are auto-accepted and yielded here.
-    accept_tx: Option<mpsc::Sender<AcceptedTcp>>,
+    tcp_limits: TcpLimits,
 }
 
 fn strip_cidr(s: &str) -> &str {
@@ -502,6 +464,20 @@ fn apply_addrs(iface: &mut Interface, v4: Option<(Ipv4Addr, u8)>, v6: Option<(Ip
     }
 }
 
+type AddrPair = (Option<(Ipv4Addr, u8)>, Option<(Ipv6Addr, u8)>);
+
+fn current_addrs(iface: &Interface) -> AddrPair {
+    let mut v4 = None;
+    let mut v6 = None;
+    for cidr in iface.ip_addrs() {
+        match cidr {
+            IpCidr::Ipv4(c) => v4 = Some((c.address(), c.prefix_len())),
+            IpCidr::Ipv6(c) => v6 = Some((c.address(), c.prefix_len())),
+        }
+    }
+    (v4, v6)
+}
+
 fn endpoint_to_socketaddr(ep: IpEndpoint) -> SocketAddr {
     let ip = match ep.addr {
         IpAddress::Ipv4(v4) => IpAddr::V4(v4.into()),
@@ -516,6 +492,24 @@ pub fn spawn(
     mtu: usize,
     inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<StackHandle> {
+    spawn_with_limits(
+        ipv4,
+        ipv6,
+        mtu,
+        inbound_rx,
+        outbound_tx,
+        TcpLimits::from_env(),
+    )
+}
+
+fn spawn_with_limits(
+    ipv4: &str,
+    ipv6: &str,
+    mtu: usize,
+    inbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_tx: mpsc::Sender<Vec<u8>>,
+    tcp_limits: TcpLimits,
 ) -> Result<StackHandle> {
     let mut device = StackDevice::new(mtu);
 
@@ -538,7 +532,7 @@ pub fn spawn(
         next_id: 1,
         next_port: 49152,
         data_in_tx: data_in_tx.clone(),
-        accept_tx: None,
+        tcp_limits,
     };
 
     tokio::spawn(run(stack, cmd_rx, data_in_rx, inbound_rx, outbound_tx));
@@ -559,9 +553,7 @@ async fn run(
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    let mut rx_total = 0u64;
-    let mut tx_total = 0u64;
-    let mut last_report = std::time::Instant::now();
+    let mut deferred: VecDeque<DataIn> = VecDeque::new();
     let mut tx_dropped: usize = 0;
     let mut next_drop_report: usize = DROP_REPORT_STEP;
 
@@ -576,18 +568,7 @@ async fn run(
         }
         let tcp_busy = service_tcp(&mut s);
         let udp_busy = service_udp(&mut s);
-        let (sent, dropped) = flush_tx(&mut s, &outbound_tx);
-        tx_total = tx_total.saturating_add(sent);
-
-        if last_report.elapsed() >= std::time::Duration::from_millis(1000) {
-            ffi::emit_traffic(tx_total, rx_total);
-            if rx_total == 0 && tx_total == 0 {
-                // Diagnostic: log when no traffic flows (helps debug "Degraded" status)
-                let conns = s.tcp_conns.len() + s.udp_conns.len();
-                log::debug!("[netstack] no traffic: tcp+udp conns={conns}");
-            }
-            last_report = std::time::Instant::now();
-        }
+        let dropped = flush_tx(&mut s, &outbound_tx);
 
         if dropped > 0 {
             tx_dropped = tx_dropped.saturating_add(dropped);
@@ -597,7 +578,14 @@ async fn run(
             }
         }
 
-        let delay = if tcp_busy || udp_busy {
+        while let Some(d) = deferred.pop_front() {
+            if let Some(back) = try_handle_data(&mut s, d) {
+                deferred.push_front(back);
+                break;
+            }
+        }
+
+        let delay = if tcp_busy || udp_busy || !deferred.is_empty() {
             Some(BACKPRESSURE_RETRY)
         } else {
             let polled = s
@@ -618,77 +606,11 @@ async fn run(
             maybe = inbound_rx.recv() => {
                 match maybe {
                     Some(pkt) => {
-                        rx_total += pkt.len() as u64;
-
-                        // Diagnostic: prove the TUN bridge is delivering packets.
-                        //
-                        // Goes to log::debug!, not ffi::record_log. record_log crosses
-                        // the JNI boundary, appends to a file and pushes onto the
-                        // in-app ring buffer, and this arm fires on *every* inbound
-                        // packet until 5KB has flowed — in the field log that was
-                        // ~25 lines in a single second at connect time, each one
-                        // waking the app process to write to storage while the
-                        // handshake is the only thing that should be running. The
-                        // information is worth keeping for a logcat session; it is
-                        // not worth a file write per packet on a phone battery.
-                        if rx_total < 5000 {
-                            let pkt_len = pkt.len();
-                            let proto_str = if pkt_len > 9 {
-                                match pkt[9] { 6 => "TCP", 17 => "UDP", _ => "other" }
-                            } else { "?" };
-                            log::debug!("[netstack] RX {pkt_len}B {proto_str} (total={rx_total})");
-                        }
-
-                        // Transparent accept: intercept TCP SYN before feeding to netstack.
-                        // When accept mode is on, create a listening socket for the SYN's
-                        // destination, then feed the packet so smoltcp can accept it.
-                        if s.accept_tx.is_some() && is_tcp_syn(&pkt) {
-                            if let Some((dst_ip, dst_port, src_ip, src_port)) = parse_tcp_syn(&pkt) {
-                                // Create a listening socket for this destination
-                                let rx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_rx_buf()]);
-                                let tx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_tx_buf()]);
-                                let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-                                socket.set_nagle_enabled(false);
-
-                                let local_ep = IpEndpoint::new(to_ip_address(dst_ip), dst_port);
-                                if socket.listen(local_ep).is_ok() {
-                                    let handle = s.sockets.add(socket);
-                                    let id = s.next_id;
-                                    s.next_id += 1;
-                                    let (to_app_tx, to_app_rx) = mpsc::channel(app_queue());
-                                    s.tcp_conns.insert(
-                                        id,
-                                        TcpState {
-                                            handle,
-                                            to_app: to_app_tx,
-                                            from_stack_rx: Some(to_app_rx),
-                                            connect_resp: None, // not from open_tcp
-                                            pending: Vec::new(),
-                                            established: false,
-                                            half_closed: false,
-                                        },
-                                    );
-                                    log::debug!(
-                                        "[netstack] listening for SYN to {dst_ip}:{dst_port} (id={id})"
-                                    );
-                                }
-                                // Feed the packet so smoltcp can accept it
-                                s.device.rx.push_back(pkt);
-                            } else {
-                                s.device.rx.push_back(pkt);
-                            }
-                        } else {
-                            s.device.rx.push_back(pkt);
-                        }
-
+                        s.device.rx.push_back(pkt);
                         let mut n = 0;
                         while n < MAX_INGEST_PER_TICK {
                             match inbound_rx.try_recv() {
-                                Ok(p) => {
-                                    rx_total += p.len() as u64;
-                                    s.device.rx.push_back(p);
-                                    n += 1;
-                                }
+                                Ok(p) => { s.device.rx.push_back(p); n += 1; }
                                 Err(_) => break,
                             }
                         }
@@ -704,11 +626,21 @@ async fn run(
                 }
             }
 
-            maybe = data_in_rx.recv() => {
+            maybe = data_in_rx.recv(), if deferred.is_empty() => {
                 if let Some(d) = maybe {
-                    handle_data(&mut s, d);
-                    while let Ok(d2) = data_in_rx.try_recv() {
-                        handle_data(&mut s, d2);
+                    if let Some(back) = try_handle_data(&mut s, d) {
+                        deferred.push_back(back);
+                    } else {
+                        while deferred.is_empty() {
+                            match data_in_rx.try_recv() {
+                                Ok(d2) => {
+                                    if let Some(back) = try_handle_data(&mut s, d2) {
+                                        deferred.push_back(back);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                 }
             }
@@ -732,6 +664,9 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; tcp_tx_buf()]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             socket.set_nagle_enabled(false);
+            let keepalive = s.tcp_limits.keepalive;
+            socket.set_keep_alive(Some(smol_duration(keepalive)));
+            socket.set_timeout(Some(smol_duration(keepalive.saturating_mul(3))));
 
             let local_port = alloc_port(&mut s.next_port);
             let remote = to_ip_endpoint(dst);
@@ -754,9 +689,12 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                     to_app: to_app_tx,
                     from_stack_rx: Some(to_app_rx),
                     connect_resp: Some(resp),
+                    connect_deadline: std::time::Instant::now() + s.tcp_limits.connect,
                     pending: Vec::new(),
                     established: false,
                     half_closed: false,
+                    orphaned_at: None,
+                    aborted: false,
                 },
             );
         }
@@ -790,42 +728,55 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                 id,
                 from_stack: to_app_rx,
                 data_in: s.data_in_tx.clone(),
+                split: false,
             };
             let _ = resp.send(Ok(conn));
         }
         Cmd::SetAddrs { v4, v6 } => {
-            apply_addrs(&mut s.iface, v4, v6);
+            let (current_v4, current_v6) = current_addrs(&s.iface);
+            apply_addrs(&mut s.iface, v4.or(current_v4), v6.or(current_v6));
             log::info!("netstack addresses synchronized from edge capsule");
-        }
-        Cmd::EnableAccept { accept_tx } => {
-            s.accept_tx = Some(accept_tx);
-            log::info!("netstack transparent TCP accept mode enabled");
         }
     }
 }
 
-fn handle_data(s: &mut NetStack, d: DataIn) {
+/// Returns `Some(d)` when the datagram must be deferred (TCP pending full).
+fn try_handle_data(s: &mut NetStack, d: DataIn) -> Option<DataIn> {
     match d {
         DataIn::Tcp(id, data) => {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
-                st.pending.extend_from_slice(&data);
+                let max = max_tcp_pending();
+                if st.pending.len() >= max {
+                    return Some(DataIn::Tcp(id, data));
+                }
+                let space = max - st.pending.len();
+                if data.len() <= space {
+                    st.pending.extend_from_slice(&data);
+                } else {
+                    st.pending.extend_from_slice(&data[..space]);
+                    return Some(DataIn::Tcp(id, data[space..].to_vec()));
+                }
             }
+            None
         }
         DataIn::TcpClose(id) => {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
                 st.half_closed = true;
             }
+            None
         }
         DataIn::Udp(id, dst, data) => {
             if let Some(st) = s.udp_conns.get(&id) {
                 let sock = s.sockets.get_mut::<udp::Socket>(st.handle);
                 let _ = sock.send_slice(&data, to_ip_endpoint(dst));
             }
+            None
         }
         DataIn::UdpClose(id) => {
             if let Some(st) = s.udp_conns.remove(&id) {
                 s.sockets.remove(st.handle);
             }
+            None
         }
     }
 }
@@ -833,6 +784,7 @@ fn handle_data(s: &mut NetStack, d: DataIn) {
 fn service_tcp(s: &mut NetStack) -> bool {
     let mut backpressured = false;
     let ids: Vec<usize> = s.tcp_conns.keys().copied().collect();
+    let now = std::time::Instant::now();
 
     for id in ids {
         let handle = match s.tcp_conns.get(&id) {
@@ -840,54 +792,32 @@ fn service_tcp(s: &mut NetStack) -> bool {
             None => continue,
         };
 
+        if s.tcp_conns[&id].aborted {
+            s.sockets.remove(handle);
+            s.tcp_conns.remove(&id);
+            continue;
+        }
+
         let state = s.sockets.get_mut::<tcp::Socket>(handle).state();
         let data_in_tx = s.data_in_tx.clone();
 
-        // `get` rather than index: an entry can be removed by the dead-socket
-        // branch below on a previous iteration, and indexing a HashMap entry that
-        // is gone panics the poll loop, which ends the tunnel.
-        if s.tcp_conns.get(&id).is_none_or(|st| !st.established) && state == tcp::State::Established {
+        let connected = matches!(state, tcp::State::Established | tcp::State::CloseWait);
+        if !s.tcp_conns[&id].established && connected {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
                 st.established = true;
                 if let (Some(resp), Some(rx)) = (st.connect_resp.take(), st.from_stack_rx.take()) {
-                    // This is from open_tcp() — send via oneshot
                     let conn = TcpConn {
                         id,
                         from_stack: rx,
                         data_in: data_in_tx.clone(),
+                        split: false,
                     };
                     let _ = resp.send(Ok(conn));
-                } else if let Some(rx) = st.from_stack_rx.take() {
-                    // This is from transparent accept — send via accept channel
-                    let conn = TcpConn {
-                        id,
-                        from_stack: rx,
-                        data_in: data_in_tx.clone(),
-                    };
-
-                    // Get the remote/local endpoint from the socket
-                    let socket = s.sockets.get_mut::<tcp::Socket>(handle);
-                    let remote = socket.remote_endpoint()
-                        .map(endpoint_to_socketaddr)
-                        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                    let local = socket.local_endpoint()
-                        .map(endpoint_to_socketaddr)
-                        .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-
-                    if let Some(accept_tx) = &s.accept_tx {
-                        let accepted = AcceptedTcp {
-                            remote,
-                            local,
-                            conn,
-                        };
-                        // Use try_send to avoid blocking the poll loop
-                        let _ = accept_tx.try_send(accepted);
-                    }
                 }
             }
         }
 
-        if s.tcp_conns.get(&id).is_none_or(|st| !st.established)
+        if !s.tcp_conns[&id].established
             && matches!(state, tcp::State::Closed | tcp::State::TimeWait)
         {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
@@ -900,34 +830,45 @@ fn service_tcp(s: &mut NetStack) -> bool {
             continue;
         }
 
+        if !s.tcp_conns[&id].established {
+            let st = s.tcp_conns.get_mut(&id).unwrap();
+            let abandoned = st.connect_resp.as_ref().is_none_or(|resp| resp.is_closed());
+            if abandoned || now >= st.connect_deadline {
+                if let Some(resp) = st.connect_resp.take() {
+                    let _ = resp.send(Err("connection timed out".into()));
+                }
+                s.sockets.remove(handle);
+                s.tcp_conns.remove(&id);
+            }
+            continue;
+        }
+
         {
-            // The entry can be gone by this point — a TimeWait/Closed socket whose
-            // connection was established is removed at the end of the previous
-            // iteration, and the same id is not revisited. Guard instead of
-            // unwrapping: this unwrap is what kills the tunnel when the edge
-            // re-announces an address mid-session.
             let socket = s.sockets.get_mut::<tcp::Socket>(handle);
             if socket.can_send() {
-                let Some(st) = s.tcp_conns.get_mut(&id) else { continue };
+                let st = s.tcp_conns.get_mut(&id).unwrap();
                 if !st.pending.is_empty() {
                     let sent = socket.send_slice(&st.pending).unwrap_or(0);
                     if sent > 0 {
                         st.pending.drain(0..sent);
+                        if st.pending.len() * 4 < st.pending.capacity() {
+                            st.pending
+                                .shrink_to(max_tcp_pending().min(st.pending.capacity()));
+                        }
                     }
                 }
             }
         }
 
         {
-            let Some(st) = s.tcp_conns.get(&id) else { continue };
-            let pending_empty = st.pending.is_empty();
-            let half = st.half_closed;
+            let pending_empty = s.tcp_conns[&id].pending.is_empty();
+            let half = s.tcp_conns[&id].half_closed;
             if half && pending_empty {
                 s.sockets.get_mut::<tcp::Socket>(handle).close();
             }
         }
 
-        let Some(to_app) = s.tcp_conns.get(&id).map(|st| st.to_app.clone()) else { continue };
+        let to_app = s.tcp_conns[&id].to_app.clone();
         let mut app_gone = false;
         let mut delivered = 0;
 
@@ -960,15 +901,31 @@ fn service_tcp(s: &mut NetStack) -> bool {
         }
 
         if app_gone {
-            s.sockets.get_mut::<tcp::Socket>(handle).close();
+            let st = s.tcp_conns.get_mut(&id).unwrap();
+            let socket = s.sockets.get_mut::<tcp::Socket>(handle);
+            let orphaned_at = *st.orphaned_at.get_or_insert(now);
+            if socket.can_recv() || now.duration_since(orphaned_at) >= s.tcp_limits.orphan_linger {
+                if socket.state() != tcp::State::Closed {
+                    socket.abort();
+                }
+                st.aborted = true;
+                continue;
+            }
+            socket.close();
         }
 
         let st_state = s.sockets.get_mut::<tcp::Socket>(handle).state();
         if matches!(st_state, tcp::State::CloseWait) {
             s.sockets.get_mut::<tcp::Socket>(handle).close();
         }
-        if matches!(st_state, tcp::State::Closed)
-            && s.tcp_conns.get(&id).is_some_and(|st| st.established)
+        if matches!(st_state, tcp::State::TimeWait) {
+            if let Some(st) = s.tcp_conns.get_mut(&id) {
+                st.pending.clear();
+                st.pending.shrink_to_fit();
+            }
+        }
+        if matches!(st_state, tcp::State::Closed | tcp::State::TimeWait)
+            && s.tcp_conns[&id].established
         {
             s.sockets.remove(handle);
             s.tcp_conns.remove(&id);
@@ -976,38 +933,6 @@ fn service_tcp(s: &mut NetStack) -> bool {
     }
 
     backpressured
-}
-
-// ─── Helpers for transparent TCP accept ──────────────────────────
-
-/// Check if a raw IP packet is a TCP SYN (not ACK).
-fn is_tcp_syn(pkt: &[u8]) -> bool {
-    if pkt.len() < 40 { return false; }
-    let version = pkt[0] >> 4;
-    if version != 4 { return false; }
-    let proto = pkt[9];
-    if proto != 6 { return false; }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    if pkt.len() < ihl + 20 { return false; }
-    let tcp = &pkt[ihl..];
-    let flags = tcp[13];
-    // SYN only (bit 1 set, bit 4 not set)
-    (flags & 0x02) != 0 && (flags & 0x10) == 0
-}
-
-/// Parse a TCP SYN packet and return (dst_ip, dst_port, src_ip, src_port).
-fn parse_tcp_syn(pkt: &[u8]) -> Option<(IpAddr, u16, IpAddr, u16)> {
-    if pkt.len() < 40 { return None; }
-    let version = pkt[0] >> 4;
-    if version != 4 { return None; }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    if pkt.len() < ihl + 20 { return None; }
-    let src_ip = IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]));
-    let dst_ip = IpAddr::V4(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]));
-    let tcp = &pkt[ihl..];
-    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
-    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
-    Some((dst_ip, dst_port, src_ip, src_port))
 }
 
 fn service_udp(s: &mut NetStack) -> bool {
@@ -1020,11 +945,9 @@ fn service_udp(s: &mut NetStack) -> bool {
             None => continue,
         };
 
-        // `get` rather than index: UdpClose removes an entry while the
-        // snapshot the loop walks still holds its id, and indexing a HashMap
-        // entry that is gone panics the poll loop, which ends the tunnel.
-        let Some(to_app) = s.udp_conns.get(&id).map(|st| st.to_app.clone()) else { continue };
+        let to_app = s.udp_conns[&id].to_app.clone();
         let mut delivered = 0;
+        let mut app_gone = false;
 
         while delivered < MAX_RECV_CHUNKS {
             let permit = match to_app.try_reserve() {
@@ -1033,7 +956,10 @@ fn service_udp(s: &mut NetStack) -> bool {
                     backpressured = true;
                     break;
                 }
-                Err(mpsc::error::TrySendError::Closed(())) => break,
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    app_gone = true;
+                    break;
+                }
             };
 
             let socket = s.sockets.get_mut::<udp::Socket>(handle);
@@ -1048,47 +974,33 @@ fn service_udp(s: &mut NetStack) -> bool {
                 Err(_) => break,
             }
         }
+
+        if app_gone {
+            if let Some(st) = s.udp_conns.remove(&id) {
+                s.sockets.remove(st.handle);
+            }
+        }
     }
 
     backpressured
 }
 
-fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) -> (u64, usize) {
-    let mut sent = 0u64;
+fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) -> usize {
     let mut dropped = 0;
     while let Some(pkt) = s.device.tx.pop_front() {
-        let len = pkt.len() as u64;
         match outbound_tx.try_send(pkt) {
-            Ok(()) => sent = sent.saturating_add(len),
+            Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => dropped += 1,
             Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
-    (sent, dropped)
+    dropped
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::socket::tcp;
     use std::time::Duration as StdDuration;
-
-    fn bare_stack() -> NetStack {
-        let mut device = StackDevice::new(1400);
-        let config = Config::new(HardwareAddress::Ip);
-        NetStack {
-            iface: Interface::new(config, &mut device, Instant::now()),
-            device,
-            sockets: SocketSet::new(Vec::new()),
-            tcp_conns: HashMap::new(),
-            udp_conns: HashMap::new(),
-            next_id: 0,
-            next_port: 40000,
-            data_in_tx: mpsc::channel(1).0,
-            accept_tx: None,
-        }
-    }
-
 
     fn udp_ip_packet(payload_len: usize) -> Vec<u8> {
         let total = 20 + 8 + payload_len;
@@ -1286,81 +1198,176 @@ mod tests {
         );
     }
 
-    /// A stack with one connected TCP entry whose socket is gone, the exact state
-    /// the dead-socket branch of [service_tcp] leaves behind on the iteration
-    /// after it removes the entry: [service_tcp] iterates a snapshot of ids, so
-    /// the id is still in the list while `tcp_conns` no longer holds it.
-    fn stack_with_evicted_entry() -> (NetStack, usize) {
-        let mut stack = bare_stack();
-        let mut tcp = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; 4096]),
-            tcp::SocketBuffer::new(vec![0; 4096]),
-        );
-        tcp.listen(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 9)), 80))
-            .unwrap();
-        let handle = stack.sockets.add(tcp);
-        let (to_app_tx, _to_app_rx) = mpsc::channel(8);
-        stack.tcp_conns.insert(
-            7,
-            TcpState {
-                handle,
-                to_app: to_app_tx,
-                from_stack_rx: None,
-                connect_resp: None,
-                pending: vec![1, 2, 3],
-                established: true,
-                half_closed: false,
-            },
-        );
-        // The entry the snapshot still references, but the map has already
-        // dropped: this is the state that used to index and unwrap.
-        stack.tcp_conns.remove(&7);
-        (stack, 7)
+    fn quick_limits() -> TcpLimits {
+        TcpLimits {
+            connect: StdDuration::from_millis(300),
+            keepalive: StdDuration::from_secs(60),
+            orphan_linger: StdDuration::from_millis(300),
+        }
     }
 
-    #[test]
-    fn service_tcp_survives_a_connection_the_map_evicted_mid_iteration() {
-        let (mut stack, evicted) = stack_with_evicted_entry();
-        // The snapshot is what makes this a fair reproduction: the id is still
-        // in the list the loop walks, but the map dropped it.
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = service_tcp(&mut stack);
-        }))
-        .is_ok(), "service_tcp must not panic on an evicted entry: it killed tunnels in the field");
-        assert!(stack.tcp_conns.is_empty());
-        let _ = evicted;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_nobody_answers_fails_instead_of_hanging() {
+        let (_inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (outbound_tx, _outbound_rx) = mpsc::channel::<Vec<u8>>(256);
+        let stack = spawn_with_limits(
+            "198.18.0.1",
+            "fc00::1",
+            1400,
+            inbound_rx,
+            outbound_tx,
+            quick_limits(),
+        )
+        .expect("netstack should start");
+
+        let dst: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let outcome = tokio::time::timeout(StdDuration::from_secs(5), stack.open_tcp(dst))
+            .await
+            .expect("a connect that is never answered must fail, not hang");
+
+        match outcome {
+            Ok(_) => panic!("nothing answered, so the connect cannot succeed"),
+            Err(error) => assert!(error.to_string().contains("timed out"), "{error}"),
+        }
     }
 
-    #[test]
-    fn an_address_change_does_not_kill_established_connections_in_service_tcp() {
-        // A re-announced edge address clears the interface addresses; the
-        // connections that survive it must still be serviceable.
-        let mut stack = bare_stack();
-        let mut tcp = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; 4096]),
-            tcp::SocketBuffer::new(vec![0; 4096]),
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_orphan_whose_far_end_never_closes_is_reset() {
+        let local = Ipv4Addr::new(198, 18, 0, 1);
+        let remote = Ipv4Addr::new(93, 184, 216, 34);
+        let remote_port = 80u16;
+
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(256);
+        let stack = spawn_with_limits(
+            "198.18.0.1",
+            "fc00::1",
+            1400,
+            inbound_rx,
+            outbound_tx,
+            quick_limits(),
+        )
+        .expect("netstack should start");
+
+        let dst = SocketAddr::new(IpAddr::V4(remote), remote_port);
+        let connect = {
+            let stack = stack.clone();
+            tokio::spawn(async move { stack.open_tcp(dst).await })
+        };
+
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(5);
+        let (client_port, client_seq) = loop {
+            let pkt = tokio::time::timeout_at(deadline, outbound_rx.recv())
+                .await
+                .expect("the netstack should emit a syn")
+                .expect("outbound channel stays open");
+            if let Some(seg) = parse_tcp(&pkt) {
+                if seg.dst_port == remote_port && seg.flags & 0x02 != 0 && seg.flags & 0x10 == 0 {
+                    break (seg.src_port, seg.seq);
+                }
+            }
+        };
+
+        let syn_ack = build_tcp(
+            (remote, remote_port),
+            (local, client_port),
+            5000,
+            client_seq.wrapping_add(1),
+            0x12,
         );
-        tcp.listen(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 9)), 81))
-            .unwrap();
-        let handle = stack.sockets.add(tcp);
-        let (to_app_tx, _to_app_rx) = mpsc::channel(8);
-        stack.tcp_conns.insert(
-            9,
-            TcpState {
-                handle,
-                to_app: to_app_tx,
-                from_stack_rx: None,
-                connect_resp: None,
-                pending: vec![4, 5],
-                established: true,
-                half_closed: false,
+        inbound_tx
+            .send(syn_ack)
+            .await
+            .expect("inbound accepts the syn-ack");
+
+        let conn = tokio::time::timeout(StdDuration::from_secs(5), connect)
+            .await
+            .expect("the connect call should finish")
+            .expect("the connect task should not panic")
+            .expect("the connection should be established");
+        drop(conn);
+
+        let fin_seq = loop {
+            let pkt = tokio::time::timeout_at(deadline, outbound_rx.recv())
+                .await
+                .expect("the netstack should send a fin")
+                .expect("outbound channel stays open");
+            if let Some(seg) = parse_tcp(&pkt) {
+                if seg.flags & 0x01 != 0 {
+                    break seg.seq;
+                }
+            }
+        };
+        let ack = build_tcp(
+            (remote, remote_port),
+            (local, client_port),
+            5001,
+            fin_seq.wrapping_add(1),
+            0x10,
+        );
+        inbound_tx.send(ack).await.expect("inbound accepts the ack");
+
+        let mut saw_reset = false;
+        while let Ok(Some(pkt)) = tokio::time::timeout_at(deadline, outbound_rx.recv()).await {
+            if let Some(seg) = parse_tcp(&pkt) {
+                if seg.flags & 0x04 != 0 {
+                    saw_reset = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_reset,
+            "an orphaned connection whose far end never closes must be reset, not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_assigned_for_one_family_keeps_the_other() {
+        let mut device = StackDevice::new(1400);
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            Instant::now(),
+        );
+        apply_addrs(
+            &mut iface,
+            Some(("172.16.0.2".parse().unwrap(), 32)),
+            Some(("2606:4700:110:8a36::1".parse().unwrap(), 128)),
+        );
+        let mut stack = NetStack {
+            iface,
+            device,
+            sockets: SocketSet::new(Vec::new()),
+            tcp_conns: HashMap::new(),
+            udp_conns: HashMap::new(),
+            next_id: 0,
+            next_port: 40000,
+            data_in_tx: mpsc::channel(1).0,
+            tcp_limits: TcpLimits::from_env(),
+        };
+
+        handle_cmd(
+            &mut stack,
+            Cmd::SetAddrs {
+                v4: Some(("172.16.0.9".parse().unwrap(), 32)),
+                v6: None,
             },
         );
-        // The real trigger: addresses cleared and re-set, as set_addrs does.
-        apply_addrs(&mut stack.iface, Some((Ipv4Addr::new(10, 0, 0, 9), 24)), None);
-        let _ = service_tcp(&mut stack);
-        // The connection must still be tracked and not have panicked the loop.
-        assert!(stack.tcp_conns.contains_key(&9));
+        handle_cmd(
+            &mut stack,
+            Cmd::SetAddrs {
+                v4: None,
+                v6: Some(("2606:4700:110:8a36::9".parse().unwrap(), 128)),
+            },
+        );
+
+        let (v4, v6) = current_addrs(&stack.iface);
+        assert_eq!(v4.map(|(ip, _)| ip), Some("172.16.0.9".parse().unwrap()));
+        assert_eq!(
+            v6.map(|(ip, _)| ip),
+            Some("2606:4700:110:8a36::9".parse().unwrap())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1379,20 +1386,16 @@ mod tests {
             next_id: 0,
             next_port: 40000,
             data_in_tx: mpsc::channel(1).0,
-            // Accept mode is off in this test; the field was added to the struct
-            // later and the initializer was never updated, which broke `cargo
-            // test` compilation for the whole crate.
-            accept_tx: None,
+            tcp_limits: TcpLimits::from_env(),
         };
 
         for _ in 0..10 {
             stack.device.tx.push_back(vec![1, 2, 3]);
         }
 
-        let (sent, dropped) = flush_tx(&mut stack, &outbound_tx);
+        let dropped = flush_tx(&mut stack, &outbound_tx);
 
         assert!(stack.device.tx.is_empty(), "the tx queue must be drained");
-        assert_eq!(sent, 6, "sent bytes are counted");
         assert_eq!(
             dropped, 8,
             "everything past the channel capacity is dropped"

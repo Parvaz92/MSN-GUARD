@@ -97,6 +97,8 @@ pub struct MasquePingParams {
     pub path: String,
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+    /// The ECHConfigList the handshake offers, that of the scan the check is part of.
+    pub ech_config_list: Option<Vec<u8>>,
     pub noize: NoizeConfig,
     pub local_ipv4: Ipv4Addr,
     pub local_ipv4_str: String,
@@ -132,12 +134,12 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 key_pem: p.key_pem.clone(),
                 local_ipv4: p.local_ipv4,
                 quiet: true,
-                announce: true,
                 pin_endpoint: true,
                 expected_pins: crate::consts::MASQUE_PINS
                     .iter()
                     .map(|p| p.to_vec())
                     .collect(),
+                ech_config_list: p.ech_config_list.clone(),
             };
             AbortGuard(tokio::spawn(masque_h2::run(
                 h2cfg,
@@ -153,15 +155,10 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 path: p.path.clone(),
                 cert_pem: p.cert_pem.clone(),
                 key_pem: p.key_pem.clone(),
-                ech_config_list: None,
+                ech_config_list: p.ech_config_list.clone(),
                 noize: p.noize.clone(),
-                tls_curve_preset: crate::TlsCurvePreset::Chrome,
                 local_ipv4: p.local_ipv4,
                 quiet: true,
-                // Same defaults as the real tunnel: full datagram, bait on —
-                // a ping is only evidence if it takes the same path. The ping
-                // IS its own session, so it announces like a real one.
-                announce: true,
                 max_datagram: quic::MAX_DATAGRAM_SIZE,
                 version_bait: true,
             };

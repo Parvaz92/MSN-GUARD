@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use quiche::h3;
 use quiche::h3::NameValue;
-use rand::{RngExt, Rng};
+use rand::Rng;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
@@ -16,112 +16,6 @@ use crate::{consts, error::AetherError, error::Result};
 
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const MIN_DATAGRAM_SIZE: usize = 1200;
-
-/// QUIC v2, the RFC 9369 version number. Some carrier middleboxes let the
-/// v1 flow through untouched once a v2-looking flow has been seen on the same
-/// 5-tuple — the version-negotiation trick from upstream Aether v2.0.0.
-const QUIC_V2_VERSION: u32 = 0x6b33_43cf;
-const QUIC_V2_BAIT_WAIT: Duration = Duration::from_millis(600);
-const QUIC_V2_BAIT_LEN: usize = 1200;
-
-/// Upstream: the bait is on unless explicitly turned off. AETHER_QUIC_V2 is
-/// the escape hatch for a network where the extra packet hurts.
-pub(crate) fn quic_v2_bait_enabled() -> bool {
-    !matches!(
-        std::env::var("AETHER_QUIC_V2").as_deref(),
-        Ok("0") | Ok("off") | Ok("false") | Ok("no")
-    )
-}
-
-/// Two-byte QUIC varint, the 0x4000-prefixed short form.
-fn quic_varint2(value: u64) -> [u8; 2] {
-    (((value & 0x3fff) as u16) | 0x4000).to_be_bytes()
-}
-
-/// A single throwaway QUIC v2 long-header packet of the minimum legal size.
-///
-/// It is never handshake material: the DCID/SCID are random, so the edge cannot
-/// associate it with our real v1 connection. What it does is make a
-/// version-negotiation (or version-mismatch drop) happen on the 5-tuple before
-/// the v1 Client Initial follows, which is enough for filters that key on
-/// "first QUIC version seen" to treat the rest of the flow as v2 and pass it
-/// where they would otherwise drop v1. Mirrors upstream Aether v2.0.0
-/// (`build_version_bait`) byte for byte.
-fn build_version_bait() -> Vec<u8> {
-    let mut rng = rand::rng();
-    let mut dcid = [0u8; 8];
-    let mut scid = [0u8; 8];
-    rng.fill_bytes(&mut dcid);
-    rng.fill_bytes(&mut scid);
-
-    let mut pkt = Vec::with_capacity(QUIC_V2_BAIT_LEN);
-    // 0xc3: long header + fixed bit, type 3 (the type value QUIC v2 uses for
-    // Initial). v1 Initial is 0xc0; using v1's type byte would be another way
-    // to do this, but upstream ships 0xc3 and field-testing was on that byte.
-    pkt.push(0xc3);
-    pkt.extend_from_slice(&QUIC_V2_VERSION.to_be_bytes());
-    pkt.push(dcid.len() as u8);
-    pkt.extend_from_slice(&dcid);
-    pkt.push(scid.len() as u8);
-    pkt.extend_from_slice(&scid);
-    // Zero-length token.
-    pkt.push(0x00);
-
-    // The length field must cover the rest of the packet so the total is
-    // exactly the QUIC minimum datagram size — an undersized Initial is
-    // malformed and would be dropped before any version negotiation happened.
-    let remaining = QUIC_V2_BAIT_LEN - pkt.len() - 2;
-    pkt.extend_from_slice(&quic_varint2(remaining as u64));
-    let mut pn = [0u8; 4];
-    rng.fill_bytes(&mut pn);
-    pkt.extend_from_slice(&pn);
-    pkt.resize(QUIC_V2_BAIT_LEN, 0);
-    pkt
-}
-
-/// Fire the bait and briefly listen for the version-negotiation reply.
-///
-/// The reply, if any, is discarded: it goes to a random DCID the real
-/// connection will never use, and the purpose is the side effect on the
-/// filter, not the payload. Up to `tries` attempts with `wait` between them;
-/// both stops at the first answer, because a server that answered is a server
-/// that saw the packet, which is all the bait is for.
-async fn send_version_bait(sock: &UdpSocket, target: SocketAddr, wait: Duration, tries: usize) {
-    let bait = build_version_bait();
-    let connected = sock.peer_addr().is_ok();
-    let mut buf = [0u8; 2048];
-
-    for _attempt in 0..tries.max(1) {
-        let sent = if connected {
-            sock.send(&bait).await
-        } else {
-            sock.send_to(&bait, target).await
-        };
-        if sent.is_err() {
-            return;
-        }
-
-        let answered = tokio::time::timeout(wait, async {
-            if connected {
-                sock.recv(&mut buf).await
-            } else {
-                sock.recv_from(&mut buf).await.map(|(n, _)| n)
-            }
-        })
-        .await;
-
-        match answered {
-            Ok(Ok(_n)) => {
-                log::debug!(
-                    "[quic] version-negotiation bait answered; the path is open for v1"
-                );
-                return;
-            }
-            Ok(Err(_)) => return,
-            Err(_) => continue,
-        }
-    }
-}
 
 fn net_queue() -> usize {
     crate::sysprofile::channel_capacity()
@@ -140,11 +34,9 @@ async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
     let buf_size = crate::sysprofile::udp_socket_buf_bytes();
     let _ = sock.set_recv_buffer_size(buf_size);
     let _ = sock.set_send_buffer_size(buf_size);
+    crate::egress::apply(socket2::SockRef::from(&sock)).map_err(AetherError::Io)?;
 
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
-    // VPN/TUN mode routes 0.0.0.0/0 into the tunnel. Protect this socket so
-    // MASQUE/QUIC handshakes leave on the real network instead of looping.
-    crate::platform::protect_socket(&sock).map_err(AetherError::Io)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
 }
 
@@ -170,29 +62,16 @@ pub struct TunnelConfig {
     pub key_pem: Vec<u8>,
     pub ech_config_list: Option<Vec<u8>>,
     pub noize: NoizeConfig,
-    pub tls_curve_preset: crate::TlsCurvePreset,
     pub local_ipv4: Ipv4Addr,
     pub quiet: bool,
-    /// Whether this tunnel may call [crate::ffi::mark_ready] on its own
-    /// validation. The single-hop MASQUE tunnel owns the whole session, so it
-    /// announces itself. In masque-in-masque neither hop does: the outer hop's
-    /// validation says nothing about the inner hop that actually owns the TUN,
-    /// and a premature announce is what made v1.8.8 show "connected" while no
-    /// data plane existed. The MIM orchestrator announces once BOTH hops are
-    /// up — see [run_masque_in_masque].
-    pub announce: bool,
-    /// Cap on the QUIC datagram size this tunnel may emit. The plain MASQUE
-    /// tunnel leaves this at [MAX_DATAGRAM_SIZE]; the MIM inner hop shrinks it
-    /// so the inner datagram fits inside the outer tunnel's QUIC payload.
     pub max_datagram: usize,
-    /// Fire the QUIC v2 version-negotiation bait before the v1 Client Initial.
     pub version_bait: bool,
 }
 
 impl TunnelConfig {
-    /// The effective datagram cap, clamped to the QUIC-legal range.
     pub fn datagram_budget(&self) -> usize {
-        self.max_datagram.clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE)
+        self.max_datagram
+            .clamp(MIN_DATAGRAM_SIZE, MAX_DATAGRAM_SIZE)
     }
 }
 
@@ -201,32 +80,16 @@ fn validation_timeout() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
         .unwrap_or(10);
     Duration::from_secs(secs)
 }
 
-fn data_check_enabled_for(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("true") | Some("yes") | Some("on"))
-}
-
 fn data_check_enabled() -> bool {
-    data_check_enabled_for(std::env::var("AETHER_MASQUE_DATA_CHECK").ok().as_deref())
+    std::env::var("AETHER_MASQUE_NO_DATA_CHECK").is_err()
 }
 
 const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
-
-/// How many packets one `select!` wake-up may move in a single direction.
-///
-/// The loop used to move exactly one packet per wake-up, then run the whole
-/// tail — `poll_h3`, `drain_datagrams`, `flush` — for that one packet. At
-/// 100 Mbps a 1350-byte path carries roughly 9 000 packets/second, so the tail
-/// ran 9 000 times a second and `flush` allocated a fresh 1350-byte buffer each
-/// time. Draining what is already queued before running the tail amortises it.
-///
-/// Bounded, not unbounded: an unbounded drain would let a fast download hold the
-/// loop indefinitely and starve the timeout branch, which is how the connection
-/// loses its loss-detection timers.
-const PACKET_BATCH: usize = 32;
 
 pub struct Channels {
     pub outbound_tx: mpsc::Sender<Vec<u8>>,
@@ -287,9 +150,90 @@ fn random_scid() -> [u8; 16] {
     scid
 }
 
+const QUIC_V2_VERSION: u32 = 0x6b33_43cf;
+const QUIC_V2_BAIT_WAIT: Duration = Duration::from_millis(600);
+const QUIC_V2_BAIT_LEN: usize = 1200;
+
+pub(crate) fn quic_v2_bait_enabled() -> bool {
+    !matches!(
+        std::env::var("AETHER_QUIC_V2").as_deref(),
+        Ok("0") | Ok("off") | Ok("false") | Ok("no")
+    )
+}
+
+fn quic_varint2(value: u64) -> [u8; 2] {
+    (((value & 0x3fff) as u16) | 0x4000).to_be_bytes()
+}
+
+fn build_version_bait() -> Vec<u8> {
+    let mut rng = rand::rng();
+    let mut dcid = [0u8; 8];
+    let mut scid = [0u8; 8];
+    rng.fill_bytes(&mut dcid);
+    rng.fill_bytes(&mut scid);
+
+    let mut pkt = Vec::with_capacity(QUIC_V2_BAIT_LEN);
+    pkt.push(0xc3);
+    pkt.extend_from_slice(&QUIC_V2_VERSION.to_be_bytes());
+    pkt.push(dcid.len() as u8);
+    pkt.extend_from_slice(&dcid);
+    pkt.push(scid.len() as u8);
+    pkt.extend_from_slice(&scid);
+    pkt.push(0x00);
+
+    let remaining = QUIC_V2_BAIT_LEN - pkt.len() - 2;
+    pkt.extend_from_slice(&quic_varint2(remaining as u64));
+    let mut pn = [0u8; 4];
+    rng.fill_bytes(&mut pn);
+    pkt.extend_from_slice(&pn);
+    pkt.resize(QUIC_V2_BAIT_LEN, 0);
+    pkt
+}
+
+async fn send_version_bait(sock: &UdpSocket, target: SocketAddr, wait: Duration, tries: usize) {
+    let bait = build_version_bait();
+    let connected = sock.peer_addr().is_ok();
+    let mut buf = [0u8; 2048];
+
+    for attempt in 0..tries.max(1) {
+        let sent = if connected {
+            sock.send(&bait).await
+        } else {
+            sock.send_to(&bait, target).await
+        };
+        if sent.is_err() {
+            return;
+        }
+
+        let answered = tokio::time::timeout(wait, async {
+            if connected {
+                sock.recv(&mut buf).await
+            } else {
+                sock.recv_from(&mut buf).await.map(|(n, _)| n)
+            }
+        })
+        .await;
+
+        match answered {
+            Ok(Ok(n)) => {
+                log::debug!(
+                    "[quic] version-negotiation bait answered with {n} bytes; the path is open for v1"
+                );
+                return;
+            }
+            Ok(Err(_)) => return,
+            Err(_) => log::trace!(
+                "[quic] version-negotiation bait attempt {} went unanswered",
+                attempt + 1
+            ),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ReaderGuard {
     handles: Vec<tokio::task::JoinHandle<()>>,
+    detours: Vec<crate::upstream::DetourGuard>,
 }
 
 impl ReaderGuard {
@@ -315,7 +259,8 @@ fn spawn_reader(
         let mut buf = vec![0u8; 65535];
         loop {
             match sock.recv_from(&mut buf).await {
-                Ok((n, from)) => {
+                Ok((n, observed)) => {
+                    let from = crate::upstream::real_source(local, observed);
                     log::trace!("recv {n} bytes from {from}");
                     if tx.send((local, from, buf[..n].to_vec())).await.is_err() {
                         break;
@@ -344,21 +289,15 @@ pub async fn run(
     let mut ready_fired = false;
     let mut validate_deadline: Option<Instant> = None;
     let mut validate_successes: u32 = 0;
-    // Device packets discarded while the tunnel was still being accepted.
-    let mut predelivery_drops: u64 = 0;
 
     let init_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
+    let _init_detour = crate::upstream::attach_detour(&init_sock, peer).await?;
     let local = init_sock.local_addr()?;
     let init_sock = Arc::new(init_sock);
 
-    // Upstream Aether v2.0.0: before the v1 Client Initial, send one throwaway
-    // QUIC v2 long-header packet on the same socket. Filters that classify the
-    // flow by the first QUIC version they see then treat the v1 handshake that
-    // follows as v2 traffic and pass it — which revives MASQUE on networks
-    // where the v1 fingerprint alone was being dropped. Two tries with a
-    // short listen, then the real handshake proceeds either way.
     if cfg.version_bait && quic_v2_bait_enabled() {
-        send_version_bait(&init_sock, peer, QUIC_V2_BAIT_WAIT, 2).await;
+        let target = crate::upstream::relay_target(local, peer);
+        send_version_bait(&init_sock, target, QUIC_V2_BAIT_WAIT, 2).await;
     }
 
     let (net_tx, mut net_rx) = mpsc::channel::<NetPacket>(net_queue());
@@ -371,14 +310,10 @@ pub async fn run(
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &cfg.cert_pem,
         key_pem: &cfg.key_pem,
-        curve_preset: cfg.tls_curve_preset,
-        pin_endpoint: false,
-        expected_pins: &[],
+        pin_endpoint: true,
+        expected_pins: consts::MASQUE_PINS,
     })?;
 
-    // The MIM inner hop shrinks this below MAX_DATAGRAM_SIZE so an inner QUIC
-    // datagram fits inside the outer tunnel's payload; the plain tunnel leaves
-    // it at the default and this is a no-op. quiche clamps at 1200 minimum.
     let datagram = cfg.datagram_budget();
     config.set_max_send_udp_payload_size(datagram);
     config.set_max_recv_udp_payload_size(datagram);
@@ -406,8 +341,7 @@ pub async fn run(
         noize::pre_handshake(sock.as_ref(), peer, &cfg.noize).await;
     }
 
-    let mut send_buf = vec![0u8; MAX_DATAGRAM_SIZE];
-    flush(&mut conn, &sockets, &mut send_buf).await?;
+    flush(&mut conn, &sockets, datagram).await?;
 
     let mut out_buf = vec![0u8; 65535];
     let mut keepalive_interval = tokio::time::interval(Duration::from_secs(20));
@@ -436,20 +370,9 @@ pub async fn run(
 
         let timeout = conn.timeout();
 
-        // NOT `biased`. With biased polling tokio takes the first ready arm in
-        // declaration order, and `net_rx` is never empty during a download — so
-        // the arms below it (device traffic out, and `conn.on_timeout()`) were
-        // never polled at all. Two things broke as a result:
-        //
-        //   * the device's own TCP ACKs could not leave the phone, so every
-        //     download collapsed to a stall-and-recover crawl;
-        //   * QUIC loss detection never ran, so a lost packet was only noticed
-        //     when the peer happened to retransmit.
-        //
-        // Unbiased polling starts at a random arm each time, so every arm makes
-        // progress. `PACKET_BATCH` is what keeps that efficient: each arm drains
-        // a bounded burst per wake-up instead of one packet.
         tokio::select! {
+            biased;
+
             _ = keepalive_interval.tick() => {
                 if conn.is_established() {
                     if let Err(e) = conn.send_ack_eliciting() {
@@ -480,22 +403,6 @@ pub async fn run(
                 if let Err(e) = conn.recv(&mut data, info) {
                     log::trace!("recv error: {e}");
                 }
-
-                // Drain whatever else the socket reader already has queued before
-                // falling through to poll_h3/drain_datagrams/flush. Under load the
-                // channel is never empty, so without this the expensive tail runs
-                // once per received packet.
-                for _ in 1..PACKET_BATCH {
-                    match net_rx.try_recv() {
-                        Ok((to_local, from, mut data)) => {
-                            let info = quiche::RecvInfo { from, to: to_local };
-                            if let Err(e) = conn.recv(&mut data, info) {
-                                log::trace!("recv error: {e}");
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
             }
 
             ctrl = internals.ctrl_rx.recv(), if ctrl_open => {
@@ -519,53 +426,14 @@ pub async fn run(
             pkt = internals.outbound_rx.recv(), if outbound_open => {
                 match pkt {
                     Some(ip_packet) => {
-                        // Only carry device traffic once the edge has accepted the
-                        // CONNECT-IP request. Before that the packets are
-                        // undeliverable *and* actively harmful:
-                        //
-                        // Android brings the TUN up before the tunnel exists, so by
-                        // the time this connection is dialled the kernel already
-                        // holds seconds of the whole device's traffic. The instant
-                        // `req_stream` became Some, that entire backlog used to be
-                        // encoded into QUIC DATAGRAMs on a brand-new connection
-                        // whose congestion window is still at its initial value —
-                        // starving the very CONNECT-IP request whose response we
-                        // are waiting for. Field log: the same gateway answered a
-                        // 2-second pre-flight verify, then the real tunnel sat for
-                        // the full 30s startup timeout and only connected on the
-                        // retry, when the backlog had already been drained.
-                        //
-                        // Keep draining the channel so the TUN reader never blocks;
-                        // just do not hand the packets to QUIC yet.
-                        match (req_stream, ready_fired) {
-                            (Some(sid), true) => match masque::encode_ip_datagram(sid, &ip_packet) {
+                        if let Some(sid) = req_stream {
+                            match masque::encode_ip_datagram(sid, &ip_packet) {
                                 Ok(framed) => {
                                     if let Err(e) = conn.dgram_send(&framed) {
                                         log::trace!("dgram_send: {e}");
                                     }
                                 }
                                 Err(e) => log::trace!("encap: {e}"),
-                            },
-                            _ => predelivery_drops += 1,
-                        }
-
-                        // Same batching as the inbound arm: during an upload the
-                        // TUN reader keeps this channel full, and one packet per
-                        // wake-up is what made the upload direction slow.
-                        if let (Some(sid), true) = (req_stream, ready_fired) {
-                            for _ in 1..PACKET_BATCH {
-                                match internals.outbound_rx.try_recv() {
-                                    Ok(next) => match masque::encode_ip_datagram(sid, &next) {
-                                        Ok(framed) => {
-                                            if let Err(e) = conn.dgram_send(&framed) {
-                                                log::trace!("dgram_send: {e}");
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => log::trace!("encap: {e}"),
-                                    },
-                                    Err(_) => break,
-                                }
                             }
                         }
                     }
@@ -582,6 +450,10 @@ pub async fn run(
         }
 
         if conn.is_established() && h3_conn.is_none() {
+            // Nothing goes over a handshake that went without the key it was given.
+            if current_ech.is_some() && !tls::ech_accepted(&mut conn) {
+                return Err(AetherError::Ech("the handshake went without ECH".into()));
+            }
             established_ever = true;
             log_or_debug(
                 quiet,
@@ -603,29 +475,16 @@ pub async fn run(
                     quiet,
                     "[*] validating masque data-plane before exposing socks5".to_string(),
                 );
+            } else if !ready_fired {
+                ready_fired = true;
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(());
+                }
             }
         }
 
-        let mut connect_ip_ok = false;
         if let (Some(h3c), Some(sid)) = (h3_conn.as_mut(), req_stream) {
-            connect_ip_ok = poll_h3(&mut conn, h3c, sid, &mut capsules, &addr_tx, quiet)?;
-        }
-        if connect_ip_ok && !data_check && !ready_fired {
-            ready_fired = true;
-            if cfg.announce {
-                crate::ffi::mark_ready();
-            }
-            if predelivery_drops > 0 {
-                log_or_debug(
-                    quiet,
-                    format!(
-                        "[*] dropped {predelivery_drops} device packet(s) queued before the edge accepted CONNECT-IP"
-                    ),
-                );
-            }
-            if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(());
-            }
+            poll_h3(&mut conn, h3c, sid, &mut capsules, &addr_tx, quiet)?;
         }
 
         let got_data = drain_datagrams(&mut conn, req_stream, &internals.inbound_tx, &mut out_buf);
@@ -640,17 +499,6 @@ pub async fn run(
             if validate_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
                 ready_fired = true;
                 validate_deadline = None;
-                if cfg.announce {
-                    crate::ffi::mark_ready();
-                }
-                if predelivery_drops > 0 {
-                    log_or_debug(
-                        quiet,
-                        format!(
-                            "[*] dropped {predelivery_drops} device packet(s) queued before data-plane validation"
-                        ),
-                    );
-                }
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(());
                 }
@@ -662,33 +510,42 @@ pub async fn run(
             }
         }
 
-        flush(&mut conn, &sockets, &mut send_buf).await?;
+        flush(&mut conn, &sockets, datagram).await?;
+
+        // A handshake turned down for its ECH key is made again at once: the alert that
+        // says so is final as soon as it is sent, and the connection need not drain first.
+        if (conn.is_draining() || conn.is_closed())
+            && !established_ever
+            && !ech_retried
+            && current_ech.is_some()
+            && tls::ech_rejected(&conn)
+        {
+            if let Some(retry) = tls::extract_ech_retry_configs(&mut conn) {
+                log::warn!(
+                    "ech_required: retrying handshake with server retry_configs ({} bytes)",
+                    retry.len()
+                );
+                // Later handshakes of the session offer it as well, on either carrier.
+                tls::adopt_ech_retry(&retry);
+                ech_retried = true;
+                current_ech = Some(retry);
+
+                let scid_bytes = random_scid();
+                let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+                conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
+                if let Some(ref ech) = current_ech {
+                    tls::inject_ech(&mut conn, ech)?;
+                }
+
+                h3_conn = None;
+                req_stream = None;
+                capsules = CapsuleParser::new();
+                flush(&mut conn, &sockets, datagram).await?;
+                continue;
+            }
+        }
 
         if conn.is_closed() {
-            if !established_ever && !ech_retried && current_ech.is_some() {
-                if let Some(retry) = tls::extract_ech_retry_configs(&mut conn) {
-                    log::warn!(
-                        "ech_required: retrying handshake with server retry_configs ({} bytes)",
-                        retry.len()
-                    );
-                    ech_retried = true;
-                    current_ech = Some(retry);
-
-                    let scid_bytes = random_scid();
-                    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
-                    conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
-                    if let Some(ref ech) = current_ech {
-                        tls::inject_ech(&mut conn, ech)?;
-                    }
-
-                    h3_conn = None;
-                    req_stream = None;
-                    capsules = CapsuleParser::new();
-                    flush(&mut conn, &sockets, &mut send_buf).await?;
-                    continue;
-                }
-            }
-
             log_or_debug(quiet, format!("connection closed: {:?}", conn.stats()));
             if let Some(e) = conn.peer_error() {
                 log_or_debug(
@@ -739,28 +596,19 @@ fn poll_h3(
     capsules: &mut CapsuleParser,
     addr_tx: &Option<mpsc::Sender<AssignedAddr>>,
     quiet: bool,
-) -> Result<bool> {
+) -> Result<()> {
     let mut body = vec![0u8; 65535];
-    let mut connect_ip_ok = false;
 
     loop {
         match h3c.poll(conn) {
             Ok((stream_id, h3::Event::Headers { list, .. })) => {
-                if stream_id != req_stream {
-                    continue;
-                }
                 for h in &list {
                     if h.name() == b":status" {
-                        log_or_debug(
-                            quiet,
-                            format!("connect-ip status: {}", String::from_utf8_lossy(h.value())),
-                        );
-                        if h.value() == b"200" {
-                            connect_ip_ok = true;
-                        } else {
-                            return Err(AetherError::Other(format!(
-                                "connect-ip status {}",
-                                String::from_utf8_lossy(h.value())
+                        let status = String::from_utf8_lossy(h.value()).to_string();
+                        log_or_debug(quiet, format!("connect-ip status: {status}"));
+                        if stream_id == req_stream && !status.starts_with('2') {
+                            return Err(AetherError::Masque(format!(
+                                "the edge refused connect-ip with status {status}"
                             )));
                         }
                     }
@@ -780,8 +628,16 @@ fn poll_h3(
                 drain_capsules(capsules, addr_tx);
             }
 
-            Ok((_stream_id, h3::Event::Finished)) => {}
-            Ok((_stream_id, h3::Event::Reset(_))) => {}
+            Ok((stream_id, h3::Event::Finished)) if stream_id == req_stream => {
+                return Err(AetherError::Masque(
+                    "the edge closed the connect-ip stream".into(),
+                ));
+            }
+            Ok((stream_id, h3::Event::Reset(code))) if stream_id == req_stream => {
+                return Err(AetherError::Masque(format!(
+                    "the edge reset the connect-ip stream (code 0x{code:x})"
+                )));
+            }
             Ok(_) => {}
 
             Err(h3::Error::Done) => break,
@@ -789,7 +645,7 @@ fn poll_h3(
         }
     }
 
-    Ok(connect_ip_ok)
+    Ok(())
 }
 
 fn drain_capsules(capsules: &mut CapsuleParser, addr_tx: &Option<mpsc::Sender<AssignedAddr>>) {
@@ -871,24 +727,22 @@ fn drain_datagrams(
     delivered
 }
 
-/// Drain quiche's send queue onto the wire.
-///
-/// The scratch buffer is caller-owned on purpose. This runs once per loop
-/// iteration — thousands of times a second on a fast tunnel — and allocating a
-/// fresh 1350-byte `Vec` each call put a hot allocation directly in the data
-/// path.
 async fn flush(
     conn: &mut quiche::Connection,
     sockets: &HashMap<SocketAddr, Arc<UdpSocket>>,
-    out: &mut [u8],
+    datagram: usize,
 ) -> Result<()> {
+    let mut out = vec![0u8; datagram];
+
     loop {
-        match conn.send(out) {
+        match conn.send(&mut out) {
             Ok((write, send_info)) => {
                 if let Some(sock) = sockets.get(&send_info.from) {
-                    sock.send_to(&out[..write], send_info.to).await?;
-                } else if let Some((_, sock)) = sockets.iter().next() {
-                    sock.send_to(&out[..write], send_info.to).await?;
+                    let to = crate::upstream::relay_target(send_info.from, send_info.to);
+                    sock.send_to(&out[..write], to).await?;
+                } else if let Some((local, sock)) = sockets.iter().next() {
+                    let to = crate::upstream::relay_target(*local, send_info.to);
+                    sock.send_to(&out[..write], to).await?;
                 }
             }
             Err(quiche::Error::Done) => break,
@@ -911,6 +765,9 @@ async fn do_migrate(
     }
 
     let new_sock = bind_udp_fast(bind_addr_for(&peer)).await?;
+    readers
+        .detours
+        .push(crate::upstream::attach_detour(&new_sock, peer).await?);
     let new_local = new_sock.local_addr()?;
     let new_sock = Arc::new(new_sock);
 
@@ -946,7 +803,6 @@ pub struct VerifyParams {
     pub key_pem: Vec<u8>,
     pub ech_config_list: Option<Vec<u8>>,
     pub noize: NoizeConfig,
-    pub tls_curve_preset: crate::TlsCurvePreset,
     pub timeout: Duration,
     pub local_ipv4: Ipv4Addr,
 }
@@ -958,31 +814,27 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         "[::]:0".parse().unwrap()
     };
     let sock = bind_udp_fast(bind).await?;
-    sock.connect(p.peer).await?;
+    let _detour = crate::upstream::attach_detour(&sock, p.peer).await?;
     let local = sock.local_addr()?;
-
-    // Same bait as the tunnel path (upstream fires it here too): a gateway
-    // verify that never gets through the filter would rule out a peer the
-    // real connection might have reached.
-    if quic_v2_bait_enabled() {
-        send_version_bait(&sock, p.peer, Duration::from_millis(500), 1).await;
-    }
+    sock.connect(crate::upstream::relay_target(local, p.peer))
+        .await?;
 
     let mut config = tls::build_config(&TlsParams {
         cert_pem: &p.cert_pem,
         key_pem: &p.key_pem,
-        curve_preset: p.tls_curve_preset,
-        pin_endpoint: false,
-        expected_pins: &[],
+        pin_endpoint: true,
+        expected_pins: consts::MASQUE_PINS,
     })?;
 
     let scid_bytes = random_scid();
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
     let mut conn = quiche::connect(Some(&p.sni), &scid, local, p.peer, &mut config)?;
 
+    // A key that cannot be set fails the check: left aside, the name would go in the clear.
     if let Some(ref ech) = p.ech_config_list {
-        let _ = tls::inject_ech(&mut conn, ech);
+        tls::inject_ech(&mut conn, ech)?;
     }
+    let mut ech_retried = false;
 
     let h3_config = h3::Config::new()?;
     let mut h3_conn: Option<h3::Connection> = None;
@@ -998,6 +850,10 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let start = Instant::now();
     let deadline = start + p.timeout;
 
+    if quic_v2_bait_enabled() {
+        send_version_bait(&sock, p.peer, Duration::from_millis(500), 1).await;
+    }
+
     noize::pre_handshake(&sock, p.peer, &p.noize).await;
 
     flush_connected(&mut conn, &sock).await?;
@@ -1006,15 +862,7 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
 
     loop {
         if Instant::now() >= deadline {
-            // Say where the timeout happened. A timeout during the handshake
-            // means UDP/443 to this address is being dropped; a timeout after the
-            // connect-ip request means the gateway completed TLS, read our
-            // certificate and then never answered the CONNECT. The old flat
-            // "verify timeout" could not tell those apart.
-            return Err(AetherError::Other(format!(
-                "verify timeout {}",
-                verify_stage(&conn, req_stream.is_some())
-            )));
+            return Err(AetherError::Other("verify timeout".into()));
         }
 
         let wait = match conn.timeout() {
@@ -1049,6 +897,10 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         }
 
         if conn.is_established() && h3_conn.is_none() {
+            // As in the tunnel: nothing goes over a handshake that went without its key.
+            if p.ech_config_list.is_some() && !tls::ech_accepted(&mut conn) {
+                return Err(AetherError::Ech("the handshake went without ECH".into()));
+            }
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&p.authority, &p.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
@@ -1064,9 +916,6 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                             if h.name() == b":status" {
                                 if h.value() == b"200" {
                                     if !data_check {
-                                        // Hand the session back before leaving.
-                                        // See `close_verify` for why this matters.
-                                        close_verify(&mut conn, &sock).await;
                                         return Ok(start.elapsed());
                                     }
                                     connect_ip_ok = true;
@@ -1111,7 +960,6 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
                             if let Ok(Some(_)) = masque::decode_ip_datagram(&dgram_buf[..n], sid) {
                                 probe_successes += 1;
                                 if probe_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
-                                    close_verify(&mut conn, &sock).await;
                                     return Ok(start.elapsed());
                                 }
                                 if let Ok(framed) = masque::encode_ip_datagram(sid, &probe_packet) {
@@ -1129,147 +977,38 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
 
         flush_connected(&mut conn, &sock).await?;
 
+        // As the tunnel does: once more, at once, with the ECHConfigList the server handed
+        // back as it turned the session's down, which later handshakes offer as well.
+        if (conn.is_draining() || conn.is_closed()) && !ech_retried && tls::ech_rejected(&conn) {
+            if let Some(retry) = tls::extract_ech_retry_configs(&mut conn) {
+                log::debug!(
+                    "ech_required: verifying {} again with the server's retry_configs ({} bytes)",
+                    p.peer,
+                    retry.len()
+                );
+                tls::adopt_ech_retry(&retry);
+                ech_retried = true;
+                let scid_bytes = random_scid();
+                let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+                conn = quiche::connect(Some(&p.sni), &scid, local, p.peer, &mut config)?;
+                tls::inject_ech(&mut conn, &retry)?;
+                h3_conn = None;
+                req_stream = None;
+                flush_connected(&mut conn, &sock).await?;
+                continue;
+            }
+        }
+
         if conn.is_closed() {
-            return Err(AetherError::Other(verify_close_reason(
-                &conn,
-                req_stream.is_some(),
-            )));
+            return Err(AetherError::Other(
+                "closed before data-plane confirmation".into(),
+            ));
         }
     }
 }
 
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
-}
-
-/// Names the TLS alert carried inside a QUIC CRYPTO_ERROR code.
-///
-/// RFC 9001 §4.8 maps a TLS alert onto transport error code `0x100 + alert`, so
-/// the alert number is the only part of a certificate rejection that reaches us.
-/// Naming them is what makes the log actionable, because they diagnose
-/// completely different problems: `certificate_expired` means the WARP device
-/// registration needs refreshing, `unknown_ca` means the peer is not the gateway
-/// we think it is, and `handshake_failure` usually means the ClientHello never
-/// arrived intact.
-fn tls_alert_name(alert: u64) -> Option<&'static str> {
-    Some(match alert {
-        40 => "handshake_failure",
-        42 => "bad_certificate",
-        43 => "unsupported_certificate",
-        44 => "certificate_revoked",
-        45 => "certificate_expired",
-        46 => "certificate_unknown",
-        47 => "illegal_parameter",
-        48 => "unknown_ca",
-        49 => "access_denied",
-        50 => "decode_error",
-        51 => "decrypt_error",
-        70 => "protocol_version",
-        71 => "insufficient_security",
-        80 => "internal_error",
-        86 => "inappropriate_fallback",
-        112 => "unrecognized_name",
-        116 => "certificate_required",
-        120 => "no_application_protocol",
-        _ => return None,
-    })
-}
-
-/// Render a `CONNECTION_CLOSE` in terms of what it says about the failure.
-fn describe_connection_error(err: &quiche::ConnectionError) -> String {
-    let mut text = if err.is_app {
-        format!("application error 0x{:x}", err.error_code)
-    } else if (0x100..=0x1ff).contains(&err.error_code) {
-        let alert = err.error_code - 0x100;
-        match tls_alert_name(alert) {
-            Some(name) => format!("TLS alert {alert} ({name})"),
-            None => format!("TLS alert {alert}"),
-        }
-    } else {
-        format!("transport error 0x{:x}", err.error_code)
-    };
-
-    let reason = String::from_utf8_lossy(&err.reason);
-    let reason = reason.trim();
-    if !reason.is_empty() {
-        text.push_str(": ");
-        text.push_str(reason);
-    }
-    text
-}
-
-/// The `verify_stage` marker meaning "QUIC and TLS both completed and the
-/// connect-ip request was sent".
-///
-/// Public because `is_identity_rejection` in the dialler keys off it: on the QUIC
-/// path an authorization refusal arrives as a `CONNECTION_CLOSE` carrying TLS
-/// alert 49, with no `:status` to parse, and the *stage* is what separates that
-/// from a certificate rejected during the handshake. Sharing the constant keeps
-/// the two in step — a reworded message here would otherwise silently stop the
-/// classifier from recognising a refused identity.
-pub const CONNECT_STAGE_AFTER_REQUEST: &str = "after the connect-ip request, before any :status";
-
-/// How far the verify attempt got before it stopped.
-///
-/// The stage is the diagnostically valuable half. "Never established" means the
-/// QUIC handshake itself did not complete — UDP/443 to this address is being
-/// dropped or mangled. "After the connect-ip request" means QUIC and TLS both
-/// succeeded, the gateway read our client certificate, and it then refused or
-/// abandoned the CONNECT — a completely different problem with a completely
-/// different fix.
-fn verify_stage(conn: &quiche::Connection, connect_sent: bool) -> &'static str {
-    if !conn.is_established() {
-        "during the QUIC handshake"
-    } else if connect_sent {
-        CONNECT_STAGE_AFTER_REQUEST
-    } else {
-        "after the handshake, before the connect-ip request"
-    }
-}
-
-/// Why a verify connection closed, in a form worth putting in a field log.
-///
-/// Replaces the flat `closed before data-plane confirmation`, which collapsed
-/// every one of these causes into one sentence and so could not distinguish a
-/// rejected certificate from a blocked UDP path. Both appeared identically in the
-/// Iranian logs across a hundred consecutive gateways, which made the logs
-/// unusable for deciding what to fix.
-fn verify_close_reason(conn: &quiche::Connection, connect_sent: bool) -> String {
-    let stage = verify_stage(conn, connect_sent);
-
-    let cause = if let Some(err) = conn.peer_error() {
-        format!(
-            "gateway sent CONNECTION_CLOSE ({})",
-            describe_connection_error(err)
-        )
-    } else if let Some(err) = conn.local_error() {
-        format!("closed locally ({})", describe_connection_error(err))
-    } else if conn.is_timed_out() {
-        "idle timeout, no CONNECTION_CLOSE".to_string()
-    } else {
-        "no CONNECTION_CLOSE frame".to_string()
-    };
-
-    format!("closed {stage}: {cause}")
-}
-
-/// End a verify connection politely instead of just dropping the socket.
-///
-/// `verify_masque` proves a gateway will serve CONNECT-IP, then the caller dials
-/// the *same* gateway again for the real tunnel. Both connections present the
-/// same client certificate, and CONNECT-IP assigns the client an IP address per
-/// session — so an abandoned verify session is not free. Without a
-/// CONNECTION_CLOSE the edge cannot know we are gone and keeps that session (and
-/// its address assignment) alive until its own idle timeout, which is the same
-/// order of magnitude as the dead air seen in the field log between a successful
-/// verify and a tunnel that never received its `:status 200`.
-///
-/// Sending CONNECTION_CLOSE costs one datagram and removes that whole class of
-/// failure. Errors are ignored on purpose: we are leaving either way, and the
-/// verdict for the caller has already been decided.
-async fn close_verify(conn: &mut quiche::Connection, sock: &UdpSocket) {
-    let _ = conn.close(true, 0x00, b"verify-done");
-    let _ = flush_connected(conn, sock).await;
 }
 
 async fn flush_connected(conn: &mut quiche::Connection, sock: &UdpSocket) -> Result<()> {
@@ -1284,6 +1023,23 @@ async fn flush_connected(conn: &mut quiche::Connection, sock: &UdpSocket) -> Res
         }
     }
     Ok(())
+}
+
+/// Whether a QUIC v1 Initial, the packet that carries a ClientHello, reaches `peer` within
+/// `wait`. The version bait (QUIC v2) and the junk of the obfuscation are no Initial.
+#[cfg(test)]
+pub(crate) async fn hears_a_client_hello(peer: &UdpSocket, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut packet = [0u8; 2048];
+    while let Ok(Ok((read, _))) =
+        tokio::time::timeout_at(deadline, peer.recv_from(&mut packet)).await
+    {
+        // A long header of the Initial type, and version 1.
+        if read > 5 && packet[0] & 0xf0 == 0xc0 && packet[1..5] == [0, 0, 0, 1] {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1314,9 +1070,15 @@ mod v2_bait_tests {
 
     #[test]
     fn the_bait_is_on_unless_it_is_turned_off() {
-        // SAFETY: single-threaded test, and env mutation is the thing under test.
         std::env::remove_var("AETHER_QUIC_V2");
         assert!(quic_v2_bait_enabled());
+        std::env::set_var("AETHER_QUIC_V2", "0");
+        assert!(!quic_v2_bait_enabled());
+        std::env::set_var("AETHER_QUIC_V2", "off");
+        assert!(!quic_v2_bait_enabled());
+        std::env::set_var("AETHER_QUIC_V2", "1");
+        assert!(quic_v2_bait_enabled());
+        std::env::remove_var("AETHER_QUIC_V2");
     }
 
     #[tokio::test]
@@ -1343,125 +1105,5 @@ mod v2_bait_tests {
         client.connect(server_addr).await.unwrap();
         send_version_bait(&client, server_addr, Duration::from_secs(2), 1).await;
         responder.await.unwrap();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{data_check_enabled_for, describe_connection_error, tls_alert_name};
-
-    #[test]
-    fn h3_data_validation_is_opt_in() {
-        assert!(!data_check_enabled_for(None));
-        assert!(data_check_enabled_for(Some("true")));
-    }
-
-    /// A CRYPTO_ERROR is decoded into the TLS alert it carries.
-    ///
-    /// This is the case the flat log message hid. `0x100 + 45` is
-    /// `certificate_expired` — the gateway telling us the WARP registration is
-    /// stale, which is a fix on our side and nothing to do with the network.
-    #[test]
-    fn a_crypto_error_names_the_tls_alert() {
-        let err = quiche::ConnectionError {
-            is_app: false,
-            error_code: 0x100 + 45,
-            reason: Vec::new(),
-        };
-
-        assert_eq!(
-            describe_connection_error(&err),
-            "TLS alert 45 (certificate_expired)"
-        );
-    }
-
-    /// An unnamed alert still reports its number rather than being swallowed.
-    #[test]
-    fn an_unknown_tls_alert_still_reports_its_number() {
-        let err = quiche::ConnectionError {
-            is_app: false,
-            error_code: 0x100 + 99,
-            reason: Vec::new(),
-        };
-
-        assert_eq!(describe_connection_error(&err), "TLS alert 99");
-    }
-
-    /// A non-crypto transport error is reported as a transport code, not
-    /// misdecoded as an alert.
-    ///
-    /// Guards the `0x100..=0x1ff` range check: `0x2` is PROTOCOL_VIOLATION and
-    /// must not be rendered as "TLS alert".
-    #[test]
-    fn a_transport_error_is_not_mistaken_for_a_tls_alert() {
-        let err = quiche::ConnectionError {
-            is_app: false,
-            error_code: 0x2,
-            reason: Vec::new(),
-        };
-
-        assert_eq!(describe_connection_error(&err), "transport error 0x2");
-    }
-
-    /// An application close is labelled as such.
-    ///
-    /// HTTP/3 error codes live in this space, so mislabelling them as transport
-    /// errors would point debugging at the wrong layer.
-    #[test]
-    fn an_application_error_is_labelled_as_application() {
-        let err = quiche::ConnectionError {
-            is_app: true,
-            error_code: 0x101,
-            reason: Vec::new(),
-        };
-
-        assert_eq!(describe_connection_error(&err), "application error 0x101");
-    }
-
-    /// The reason phrase from the CONNECTION_CLOSE is appended when present.
-    ///
-    /// Cloudflare puts human-readable text here; it is the most direct statement
-    /// of why a gateway refused us and was previously discarded entirely.
-    #[test]
-    fn the_reason_phrase_is_included_when_the_gateway_sends_one() {
-        let err = quiche::ConnectionError {
-            is_app: false,
-            error_code: 0x100 + 48,
-            reason: b"bad client cert".to_vec(),
-        };
-
-        assert_eq!(
-            describe_connection_error(&err),
-            "TLS alert 48 (unknown_ca): bad client cert"
-        );
-    }
-
-    /// An empty or whitespace-only reason must not leave a dangling separator.
-    #[test]
-    fn an_empty_reason_phrase_adds_nothing() {
-        let err = quiche::ConnectionError {
-            is_app: false,
-            error_code: 0x100 + 40,
-            reason: b"   ".to_vec(),
-        };
-
-        assert_eq!(
-            describe_connection_error(&err),
-            "TLS alert 40 (handshake_failure)"
-        );
-    }
-
-    /// The alerts that change what we would do about a failure are all named.
-    ///
-    /// Each of these implies a different action: refresh the registration, stop
-    /// trusting the peer, or look at whether the ClientHello survived the path.
-    #[test]
-    fn the_diagnostically_important_alerts_are_named() {
-        assert_eq!(tls_alert_name(45), Some("certificate_expired"));
-        assert_eq!(tls_alert_name(48), Some("unknown_ca"));
-        assert_eq!(tls_alert_name(40), Some("handshake_failure"));
-        assert_eq!(tls_alert_name(116), Some("certificate_required"));
-        assert_eq!(tls_alert_name(49), Some("access_denied"));
-        assert_eq!(tls_alert_name(200), None);
     }
 }

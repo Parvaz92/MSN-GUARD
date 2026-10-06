@@ -9,7 +9,6 @@ use boring::x509::{X509Builder, X509NameBuilder};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::apifront;
 use crate::consts;
 use crate::error::{AetherError, Result};
 
@@ -149,12 +148,6 @@ pub struct Identity {
     pub organization: String,
     pub gateway_proxy: String,
     pub assigned_endpoint: String,
-    /// True when Cloudflare told us this identity no longer exists.
-    ///
-    /// Never persisted — [`crate::config`] always loads it as false. It is a fact
-    /// about the answer we just got from the API, not a property of the saved
-    /// profile, and a stale "refused" on disk would force a pointless
-    /// re-registration on the next start.
     pub refused: bool,
 }
 
@@ -228,45 +221,31 @@ pub fn generate_masque_keypair() -> Result<MasqueKeyPair> {
     })
 }
 
-fn http_client() -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .user_agent(consts::UA_REGISTER)
-        .timeout(std::time::Duration::from_secs(20));
-    if let Some(proxy) = socks_proxy_from_env() {
-        log::info!("[*] account API going through the SHARD SOCKS proxy at {proxy}");
-        builder = builder
-            .proxy(reqwest::Proxy::all(format!("socks5h://{proxy}")).map_err(|e| {
-                AetherError::Api(format!("socks proxy: {e}"))
-            })?);
+/// An identity with a MASQUE key pair of its own and nothing registered: enough to start a
+/// MASQUE handshake with in a test, never to get through to WARP.
+#[cfg(test)]
+pub(crate) fn handshake_identity() -> Identity {
+    let pair = generate_masque_keypair().expect("a MASQUE key pair");
+    Identity {
+        device_id: "device".to_string(),
+        access_token: "token".to_string(),
+        cert_pem: pair.cert_pem,
+        key_pem: pair.key_pem,
+        cert_issued_at: now_unix(),
+        ipv4: "172.16.0.2".to_string(),
+        ipv6: String::new(),
+        wg_private_key: [0u8; 32],
+        wg_peer_public_key: [0u8; 32],
+        client_id: [0u8; 3],
+        organization: String::new(),
+        gateway_proxy: String::new(),
+        assigned_endpoint: String::new(),
+        refused: false,
     }
-    builder
-        .build()
-        .map_err(|e| AetherError::Api(e.to_string()))
 }
 
-/// The SOCKS5 listener a transport publishes for the core to reach the open
-/// internet through, when the device's own link cannot reach the account API.
-///
-/// This is the SHARD path: xray's SOCKS inbound on port 1824. Registration is
-/// the one call a fresh install must make and cannot make on a filtered carrier,
-/// so when this is set the registration rides the working tunnel instead of the
-/// poisoned link. `socks5h` so the hostname is resolved at the proxy — the
-/// device's own resolver is the thing that is broken, and resolving locally
-/// would hand the proxy an address that is not the real one.
-fn socks_proxy_from_env() -> Option<String> {
-    let raw = std::env::var("AETHER_SOCKS_PROXY").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.to_string())
-}
-
-/// The parsed listener, for the camouflaged route in [crate::apifront], which
-/// builds its own TCP connection and cannot use reqwest's proxy support.
-pub fn socks_proxy_addr() -> Option<String> {
-    socks_proxy_from_env()
-}
+/// How long one attempt at a call to the WARP API may take.
+const API_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 const API_ATTEMPTS: u32 = 5;
 const API_BACKOFF_BASE_MS: u64 = 900;
@@ -288,19 +267,6 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Durati
     ))
 }
 
-fn worth_retrying(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-        || status.is_server_error()
-}
-
-/// Whether a status means the identity itself is gone, not the request.
-///
-/// Only 401, 404 and 410 — the codes that answer "this device does not exist".
-/// Deliberately NOT 403: that is Cloudflare refusing the *address* (a flagged
-/// network), and the identity may be perfectly good from another link. Nothing
-/// [`worth_retrying`] belongs here either, which the tests pin across the whole
-/// 4xx/5xx range.
 fn refuses_identity(status: reqwest::StatusCode) -> bool {
     matches!(
         status,
@@ -308,6 +274,12 @@ fn refuses_identity(status: reqwest::StatusCode) -> bool {
             | reqwest::StatusCode::NOT_FOUND
             | reqwest::StatusCode::GONE
     )
+}
+
+fn worth_retrying(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
 }
 
 fn api_host() -> &'static str {
@@ -341,60 +313,55 @@ fn front_headers(bearer: Option<&str>, jwt: Option<&str>) -> Vec<(String, String
     headers
 }
 
-async fn fallback_call(
-    label: &str,
-    method: &str,
-    path: &str,
-    body: Option<Vec<u8>>,
-    bearer: Option<&str>,
-    jwt: Option<&str>,
-) -> Result<AccountData> {
-    log::info!(
-        "[*] {label} retrying over a camouflaged route: random cloudflare edge address, \
-         no dns lookup, split client hello, alternate tls fingerprints"
-    );
+/// The ECH key the calls to the WARP API offer for the rest of the run, by --ech, once
+/// looked up; a key a server hands back takes its place.
+static API_ECH: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 
-    let request = apifront::ApiRequest {
-        method: method.to_string(),
-        host: api_host().to_string(),
-        path: path.to_string(),
-        headers: front_headers(bearer, jwt),
-        body,
-    };
-
-    let response = apifront::fetch(&request).await?;
-
-    if (200..300).contains(&response.status) {
-        log::info!(
-            "[+] {label} went through the camouflaged route ({})",
-            response.route
-        );
-        return serde_json::from_str::<AccountData>(&response.body).map_err(|e| {
-            AetherError::Api(format!(
-                "{label} decode over {}: {e}; body={}",
-                response.route, response.body
-            ))
-        });
-    }
-
-    let described = format!(
-        "{label} over {}: {}",
-        response.route,
-        describe_status(response.status, &response.body)
-    );
-    // The camouflaged route reports a bare u16, so match the codes directly here
-    // rather than going through refuses_identity.
-    if matches!(response.status, 401 | 404 | 410) {
-        return Err(AetherError::IdentityRefused(described));
-    }
-    Err(AetherError::Api(described))
+fn remember_api_ech(ech: Vec<u8>) {
+    *API_ECH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ech);
 }
 
-fn describe_status(status: u16, body: &str) -> String {
-    match reqwest::StatusCode::from_u16(status) {
-        Ok(code) => describe_rejection(code, body),
-        Err(_) => format!("status {status}: {body}"),
+/// Forgets the key the calls to the WARP API offered, as a run of the core starts: a run of
+/// the library after another looks up its own, by its own --ech, --ech-dns and --ech-domain.
+pub fn forget_api_ech() {
+    *API_ECH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// The key the calls to the WARP API offered last in this run, if any: the MASQUE session
+/// starts with it rather than look one up again.
+pub fn api_ech_in_use() -> Option<Vec<u8>> {
+    API_ECH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The ECH key of the calls to the WARP API, by --ech, as the MASQUE handshakes take it: none
+/// without the option; otherwise the key it gives, or with auto the one the lookup of
+/// --ech-dns and --ech-domain finds, once for the run. With the option and no key BoringSSL
+/// can offer, an error that says so: the API is not asked with its name in the clear.
+async fn api_ech() -> Result<Option<Vec<u8>>> {
+    let option = &crate::tls::API_ECH_OPTION;
+    let setting = std::env::var(option.variable).ok();
+    if setting.as_deref().is_none_or(str::is_empty) {
+        return Ok(None);
     }
+    let remembered = api_ech_in_use();
+    if remembered.is_some() {
+        return Ok(remembered);
+    }
+    let key = crate::tls::ech_key(option, setting.as_deref(), || {
+        crate::dns::fetch_ech_config(&crate::dns::SESSION_ECH)
+    })
+    .await?;
+    if let Some(key) = &key {
+        remember_api_ech(key.clone());
+    }
+    Ok(key)
 }
 
 fn describe_rejection(status: reqwest::StatusCode, body: &str) -> String {
@@ -402,8 +369,8 @@ fn describe_rejection(status: reqwest::StatusCode, body: &str) -> String {
         let trimmed = body.trim();
         if trimmed.is_empty() {
             "no details returned".to_string()
-        } else if trimmed.len() > 220 {
-            format!("{}…", &trimmed[..220])
+        } else if trimmed.chars().count() > 220 {
+            format!("{}…", trimmed.chars().take(220).collect::<String>())
         } else {
             trimmed.to_string()
         }
@@ -429,16 +396,16 @@ fn extract_api_error(body: &str) -> Option<String> {
     let errors = value.get("errors")?.as_array()?;
     let parts: Vec<String> = errors
         .iter()
-        .filter_map(|entry| {
+        .map(|entry| {
             let message = entry
                 .get("message")
                 .and_then(|value| value.as_str())
                 .unwrap_or("unknown");
             let code = entry.get("code").and_then(|value| value.as_i64());
-            Some(match code {
+            match code {
                 Some(code) => format!("{message} (code {code})"),
                 None => message.to_string(),
-            })
+            }
         })
         .collect();
 
@@ -449,10 +416,70 @@ fn extract_api_error(body: &str) -> Option<String> {
     }
 }
 
-async fn send_with_retry<F>(label: &str, build: F) -> Result<AccountData>
-where
-    F: Fn() -> Result<reqwest::RequestBuilder>,
-{
+/// --enroll-address (AETHER_ENROLL_ADDRESS): where the calls to the WARP API go, an IP address
+/// or a domain name and its port: 443 unless `:port` follows the address, an IPv6 one then in
+/// brackets; the API's name on 443 when it is not given. Only the connection goes there: the
+/// API's name stays the server name of the ClientHello and the HTTP host.
+fn enroll_address() -> Result<(String, u16)> {
+    let value = std::env::var("AETHER_ENROLL_ADDRESS").unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok((api_host().to_string(), 443));
+    }
+    crate::dns::host_and_port(value, 443).ok_or_else(|| {
+        AetherError::Api(format!(
+            "--enroll-address: {value} is no IP address or domain name, with or without a port"
+        ))
+    })
+}
+
+/// Checks --enroll-address as the core starts: an address it cannot use stops it, with the
+/// option named.
+pub fn check_enroll_address() -> Result<()> {
+    enroll_address().map(drop)
+}
+
+/// A call to the WARP API: to --enroll-address, the API's name on port 443 unless it names
+/// another address or port, with the API's name for the server name and the HTTP host, over
+/// BoringSSL with the
+/// core's TLS fingerprint (see `https`), offering the ECH key of --ech when it is given, through
+/// the upstream proxy when there is one. Retried on a transient answer, after as long as the API
+/// asks to wait when it does.
+async fn api_call(
+    label: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    bearer: Option<&str>,
+    jwt: Option<&str>,
+) -> Result<AccountData> {
+    let (address, port) = enroll_address()?;
+    // The system resolver looks a name up outside the socket mark; through the upstream proxy,
+    // the proxy looks it up and only the marked connection to the proxy leaves.
+    if crate::egress::mark() != 0
+        && crate::upstream::configured().is_none()
+        && address.parse::<std::net::IpAddr>().is_err()
+    {
+        return Err(AetherError::Api(format!(
+            "{label}: {address} would be looked up outside the socket mark, so the call would loop back into the tunnel; give --enroll-address an IP address"
+        )));
+    }
+
+    let mut ech = api_ech().await?;
+    let fingerprint = crate::tls::Fingerprint::configured();
+    let headers = front_headers(bearer, jwt);
+    let request = crate::https::Request {
+        method,
+        // The API's name on 443, which Host and :authority leave out, whatever port the
+        // connection goes to.
+        host: api_host(),
+        port: 443,
+        address: Some((address.as_str(), port)),
+        sni: None,
+        path,
+        headers: &headers,
+        body,
+    };
     let mut last_error = AetherError::Api(format!("{label}: no attempt was made"));
 
     for attempt in 0..API_ATTEMPTS {
@@ -467,7 +494,12 @@ where
             tokio::time::sleep(wait).await;
         }
 
-        let response = match build()?.send().await {
+        let sent = crate::https::send(&request, &fingerprint, ech.as_mut(), API_TIMEOUT).await;
+        if let Some(key) = &ech {
+            // A key a server handed back is the one the later calls offer.
+            remember_api_ech(key.clone());
+        }
+        let response = match sent {
             Ok(response) => response,
             Err(error) => {
                 last_error = AetherError::Api(format!("{label}: {error}"));
@@ -475,27 +507,26 @@ where
             }
         };
 
-        let status = response.status();
-        let cooldown = retry_after(response.headers());
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AetherError::Api(format!("{label}: {e}")))?;
+        let status = reqwest::StatusCode::from_u16(response.status)
+            .map_err(|_| AetherError::Api(format!("{label}: status {}", response.status)))?;
+        let cooldown = retry_after(&response.headers);
+        let body = String::from_utf8_lossy(&response.body);
 
         if status.is_success() {
-            return serde_json::from_str::<AccountData>(&body)
-                .map_err(|e| AetherError::Api(format!("{label} decode: {e}; body={body}")));
+            if ech.is_some() {
+                log::info!("[+] {label} went over ECH");
+            }
+            return serde_json::from_str::<AccountData>(&body).map_err(|e| {
+                AetherError::Api(format!("{label} decode: {e} ({} byte answer)", body.len()))
+            });
         }
 
-        last_error = AetherError::Api(format!("{label}: {}", describe_rejection(status, &body)));
-
-        if refuses_identity(status) {
-            // Not retried and not softened: the answer will be the same next time.
-            return Err(AetherError::IdentityRefused(format!(
-                "{label}: {}",
-                describe_rejection(status, &body)
-            )));
-        }
+        let described = format!("{label}: {}", describe_rejection(status, &body));
+        last_error = if refuses_identity(status) {
+            AetherError::IdentityRefused(described)
+        } else {
+            AetherError::Api(described)
+        };
 
         if !worth_retrying(status) {
             return Err(last_error);
@@ -511,21 +542,6 @@ where
     }
 
     Err(last_error)
-}
-
-fn base_headers() -> reqwest::header::HeaderMap {
-    use reqwest::header::{HeaderMap, HeaderValue, CONNECTION, CONTENT_TYPE};
-    let mut h = HeaderMap::new();
-    h.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=UTF-8"),
-    );
-    h.insert(CONNECTION, HeaderValue::from_static("Keep-Alive"));
-    h.insert(
-        "CF-Client-Version",
-        HeaderValue::from_static(consts::CF_CLIENT_VERSION),
-    );
-    h
 }
 
 fn generate_x25519_keypair() -> ([u8; 32], String) {
@@ -575,38 +591,19 @@ pub async fn register(
     };
 
     let path = format!("/{}/reg", consts::API_VERSION);
-    let url = format!("{}{}", consts::API_URL, path);
     let encoded =
         serde_json::to_vec(&body).map_err(|e| AetherError::Api(format!("encode: {e}")))?;
 
-    let direct = send_with_retry("registration", || {
-        let mut req = http_client()?
-            .post(&url)
-            .headers(base_headers())
-            .json(&body);
-        if let Some(jwt) = jwt {
-            req = req.header("CF-Access-Jwt-Assertion", jwt);
-        }
-        Ok(req)
-    })
-    .await;
-
-    let account = match direct {
-        Ok(account) => account,
-        Err(primary) => {
-            log::warn!("[!] registration failed over the direct route: {primary}");
-            match fallback_call("registration", "POST", &path, Some(encoded), None, jwt).await {
-                Ok(account) => account,
-                Err(secondary) => {
-                    return Err(AetherError::Api(format!(
-                        "registration: direct route -> {primary}; camouflaged route -> {secondary}"
-                    )));
-                }
-            }
-        }
-    };
-
+    let account = api_call("registration", "POST", &path, Some(&encoded), None, jwt).await?;
     Ok((account, wg_private))
+}
+
+pub async fn enable_warp(device_id: &str, token: &str) -> Result<()> {
+    let path = format!("/{}/reg/{}", consts::API_VERSION, device_id);
+    let body = serde_json::to_vec(&serde_json::json!({ "warp_enabled": true }))
+        .map_err(|e| AetherError::Api(format!("encode: {e}")))?;
+    api_call("enabling warp", "PATCH", &path, Some(&body), Some(token), None).await?;
+    Ok(())
 }
 
 pub async fn enroll_key(
@@ -623,54 +620,18 @@ pub async fn enroll_key(
     };
 
     let path = format!("/{}/reg/{}", consts::API_VERSION, device_id);
-    let url = format!("{}{}", consts::API_URL, path);
     let encoded =
         serde_json::to_vec(&body).map_err(|e| AetherError::Api(format!("encode: {e}")))?;
 
-    let direct = send_with_retry("key enrollment", || {
-        Ok(http_client()?
-            .patch(&url)
-            .headers(base_headers())
-            .bearer_auth(token)
-            .json(&body))
-    })
-    .await;
-
-    match direct {
-        Ok(account) => Ok(account),
-        Err(primary) => {
-            log::warn!("[!] key enrollment failed over the direct route: {primary}");
-            match fallback_call(
-                "key enrollment",
-                "PATCH",
-                &path,
-                Some(encoded),
-                Some(token),
-                None,
-            )
-            .await
-            {
-                Ok(account) => Ok(account),
-                // Combining the two routes into one Api error used to erase the
-                // refusal. If either route got a definitive "this device is gone",
-                // that is the finding — the other route's transport failure is
-                // noise beside it, and flattening both into `Api` would send the
-                // caller back to retrying a dead identity.
-                Err(secondary) => {
-                    let combined = format!(
-                        "key enrollment: direct route -> {primary}; camouflaged route -> {secondary}"
-                    );
-                    if matches!(primary, AetherError::IdentityRefused(_))
-                        || matches!(secondary, AetherError::IdentityRefused(_))
-                    {
-                        Err(AetherError::IdentityRefused(combined))
-                    } else {
-                        Err(AetherError::Api(combined))
-                    }
-                }
-            }
-        }
-    }
+    api_call(
+        "key enrollment",
+        "PATCH",
+        &path,
+        Some(&encoded),
+        Some(token),
+        None,
+    )
+    .await
 }
 
 fn extract_wg_peer(reg: &AccountData) -> Result<[u8; 32]> {
@@ -697,44 +658,18 @@ pub async fn register_with_team(
     let body = team_registration_body(wg_public, model, locale);
 
     let path = format!("/{}/reg", consts::API_VERSION);
-    let url = format!("{}{}", consts::API_URL, path);
     let encoded =
         serde_json::to_vec(&body).map_err(|e| AetherError::Api(format!("encode: {e}")))?;
 
-    let direct = send_with_retry("team registration", || {
-        Ok(http_client()?
-            .post(&url)
-            .headers(base_headers())
-            .header("CF-Access-Jwt-Assertion", token)
-            .json(&body))
-    })
-    .await;
-
-    let account = match direct {
-        Ok(account) => account,
-        Err(primary) => {
-            log::warn!("[!] team registration failed over the direct route: {primary}");
-            match fallback_call(
-                "team registration",
-                "POST",
-                &path,
-                Some(encoded),
-                None,
-                Some(token),
-            )
-            .await
-            {
-                Ok(account) => account,
-                Err(secondary) => {
-                    return Err(AetherError::Api(format!(
-                        "team registration: direct route -> {primary}; \
-                         camouflaged route -> {secondary}"
-                    )));
-                }
-            }
-        }
-    };
-
+    let account = api_call(
+        "team registration",
+        "POST",
+        &path,
+        Some(&encoded),
+        None,
+        Some(token),
+    )
+    .await?;
     Ok((account, wg_private))
 }
 
@@ -755,23 +690,8 @@ pub async fn provision_wg(model: &str, locale: &str, jwt: Option<&str>) -> Resul
 
 pub async fn fetch_device(device_id: &str, token: &str) -> Result<AccountData> {
     let path = format!("/{}/reg/{}", consts::API_VERSION, device_id);
-    let url = format!("{}{}", consts::API_URL, path);
 
-    let direct = send_with_retry("device refresh", || {
-        Ok(http_client()?
-            .get(&url)
-            .headers(base_headers())
-            .bearer_auth(token))
-    })
-    .await;
-
-    match direct {
-        Ok(account) => Ok(account),
-        Err(primary) => {
-            log::debug!("[!] device refresh failed over the direct route: {primary}");
-            fallback_call("device refresh", "GET", &path, None, Some(token), None).await
-        }
-    }
+    api_call("device refresh", "GET", &path, None, Some(token), None).await
 }
 
 pub fn endpoint_from(reg: &AccountData) -> String {
@@ -792,19 +712,12 @@ pub async fn refresh_profile(identity: Identity) -> Identity {
     let reg = match fetch_device(&identity.device_id, &identity.access_token).await {
         Ok(reg) => reg,
         Err(AetherError::IdentityRefused(reason)) => {
-            // The account says this device is gone. Say so loudly: the tunnel
-            // built on it will still complete a handshake and then carry nothing,
-            // which reads as "connected but no internet" and is otherwise very
-            // hard to attribute.
             log::warn!(
                 "[-] cloudflare no longer accepts the saved identity for device {}: {reason}",
                 identity.device_id
             );
             log::warn!(
-                "[-] the tunnel would handshake but carry no traffic until this identity is replaced"
-            );
-            crate::ffi::record_log(
-                "The saved WARP registration was rejected; registering a fresh one",
+                "[-] the tunnel will handshake but carry no traffic until this identity is replaced"
             );
             return Identity {
                 refused: true,
@@ -812,8 +725,6 @@ pub async fn refresh_profile(identity: Identity) -> Identity {
             };
         }
         Err(error) => {
-            // We could not ask — timeout, 5xx, flagged address. The saved profile
-            // is still the best information available, so keep it.
             log::warn!("[!] could not reach the account api to check the identity: {error}");
             log::warn!("[!] carrying on with the saved profile; it may be out of date");
             return identity;
@@ -850,7 +761,6 @@ pub async fn refresh_profile(identity: Identity) -> Identity {
         organization,
         gateway_proxy,
         assigned_endpoint,
-        // The API answered, so whatever we thought before, this identity is live.
         refused: false,
         ..identity
     }
@@ -939,18 +849,6 @@ pub struct MasqueEnrollment {
     pub key_pem: Vec<u8>,
     pub issued_at: u64,
     pub renewed: bool,
-    /// Gateway the account assigns *after* the MASQUE key is enrolled.
-    ///
-    /// This is not the same address as the one from `/reg`. A fresh registration
-    /// is `tunnel_type: wireguard` and hands back a WireGuard endpoint — often a
-    /// website-CDN address such as `104.16.192.82`, which has no connect-ip
-    /// listener at all. Enrolling the secp256r1 key with `tunnel_type: masque`
-    /// makes the API return a real MASQUE gateway (measured: `162.159.198.2`).
-    ///
-    /// The response used to be dropped on the floor (`Ok(_) =>`), so the client
-    /// kept dialling the stale WireGuard endpoint as its only "account" peer.
-    /// Empty when the response carried no endpoint.
-    pub assigned_endpoint: String,
 }
 
 pub async fn ensure_masque_enrolled(identity: &Identity) -> Result<MasqueEnrollment> {
@@ -962,7 +860,6 @@ pub async fn ensure_masque_enrolled(identity: &Identity) -> Result<MasqueEnrollm
             key_pem: identity.key_pem.clone(),
             issued_at: identity.cert_issued_at,
             renewed: false,
-            assigned_endpoint: identity.assigned_endpoint.clone(),
         });
     }
 
@@ -972,20 +869,6 @@ pub async fn ensure_masque_enrolled(identity: &Identity) -> Result<MasqueEnrollm
         log::info!("[+] enrolling MASQUE key for device {}", identity.device_id);
     }
 
-    renew_masque_certificate(identity).await
-}
-
-/// Enrol a brand-new MASQUE key regardless of what is on disk.
-///
-/// Split out of [`ensure_masque_enrolled`], which returns the saved certificate
-/// untouched whenever it is present and not near expiry. That early return is
-/// right for a normal connect and wrong for the one case the field log exposed:
-/// a gateway that read the certificate and *refused* it (TLS alert 49
-/// `access_denied` after the connect-ip request). Such a certificate is fresh by
-/// the clock and useless on the wire, so the only thing that clears it is asking
-/// the API for another one. Without this entry point every reconnect replayed the
-/// same refused certificate against the same gateways forever.
-pub async fn renew_masque_certificate(identity: &Identity) -> Result<MasqueEnrollment> {
     let keypair = generate_masque_keypair()?;
     match enroll_key(
         &identity.device_id,
@@ -995,32 +878,15 @@ pub async fn renew_masque_certificate(identity: &Identity) -> Result<MasqueEnrol
     )
     .await
     {
-        Ok(updated) => {
-            // Read the gateway out of the enrollment response. Registration was
-            // tunnel_type wireguard, so until now the only "account" peer the
-            // client knew was a WireGuard endpoint that does not serve
-            // connect-ip. This response is the first time the API names a real
-            // MASQUE gateway.
-            let assigned_endpoint = endpoint_from(&updated);
-            if assigned_endpoint.is_empty() {
-                log::info!("[+] MASQUE key enrolled");
-            } else {
-                log::info!("[+] MASQUE key enrolled; gateway {assigned_endpoint}");
-            }
+        Ok(_) => {
+            log::info!("[+] MASQUE key enrolled");
             Ok(MasqueEnrollment {
                 cert_pem: keypair.cert_pem,
                 key_pem: keypair.key_pem,
                 issued_at: now_unix(),
                 renewed: true,
-                assigned_endpoint,
             })
         }
-        // A refusal must not be softened by the fallback below. The device is
-        // gone, so the certificate on disk — however fresh — belongs to an account
-        // that no longer exists, and keeping it produces exactly the failure this
-        // whole change is meant to surface: a tunnel that handshakes and carries
-        // nothing. Propagate it so the caller can re-register.
-        Err(AetherError::IdentityRefused(reason)) => Err(AetherError::IdentityRefused(reason)),
         Err(error) if cert_still_usable(identity) => {
             log::warn!(
                 "[!] key enrollment failed ({error}); keeping the certificate already on disk"
@@ -1030,7 +896,6 @@ pub async fn renew_masque_certificate(identity: &Identity) -> Result<MasqueEnrol
                 key_pem: identity.key_pem.clone(),
                 issued_at: identity.cert_issued_at,
                 renewed: false,
-                assigned_endpoint: identity.assigned_endpoint.clone(),
             })
         }
         Err(error) => Err(error),
@@ -1072,6 +937,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_long_rejection_in_any_script_is_cut_without_panicking() {
+        let body = format!("{}{}", "x".repeat(219), "é".repeat(200));
+        let described = describe_rejection(reqwest::StatusCode::BAD_REQUEST, &body);
+        assert!(described.contains('…'));
+    }
+
+    #[test]
     fn the_certificate_lives_far_longer_than_a_day() {
         assert!(MASQUE_CERT_LIFETIME_DAYS >= 365);
         assert!(MASQUE_CERT_LIFETIME_SECS > 86_400 * 300);
@@ -1101,80 +973,6 @@ mod tests {
     #[test]
     fn a_certificate_issued_in_the_future_counts_as_expiring() {
         assert!(masque_cert_expiring(now_unix() + 86_400));
-    }
-
-    /// 401, 404 and 410 mean the device record is gone.
-    #[test]
-    fn the_codes_that_mean_the_identity_is_gone() {
-        for status in [
-            reqwest::StatusCode::UNAUTHORIZED,
-            reqwest::StatusCode::NOT_FOUND,
-            reqwest::StatusCode::GONE,
-        ] {
-            assert!(refuses_identity(status), "{status} means a dead identity");
-        }
-    }
-
-    /// 403 is the flagged-address case, and it is the one that must NOT trigger a
-    /// re-registration: on an Iranian carrier Cloudflare returns it for the
-    /// network, not the device. Treating it as a dead identity would throw away a
-    /// perfectly good registration on every connect from a flagged IP.
-    #[test]
-    fn a_flagged_network_is_not_mistaken_for_a_dead_identity() {
-        assert!(
-            !refuses_identity(reqwest::StatusCode::FORBIDDEN),
-            "403 is cloudflare refusing the address, the identity may be fine"
-        );
-        assert!(
-            !refuses_identity(reqwest::StatusCode::TOO_MANY_REQUESTS),
-            "429 is rate limiting, not a dead identity"
-        );
-    }
-
-    #[test]
-    fn a_server_or_transport_problem_is_not_a_dead_identity() {
-        for status in [
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            reqwest::StatusCode::BAD_GATEWAY,
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            reqwest::StatusCode::GATEWAY_TIMEOUT,
-            reqwest::StatusCode::REQUEST_TIMEOUT,
-        ] {
-            assert!(
-                !refuses_identity(status),
-                "{status} should be retried, not treated as a dead identity"
-            );
-        }
-    }
-
-    /// The two classifications must never overlap: retrying a dead identity wastes
-    /// five attempts, and re-registering on a retryable error throws away a good
-    /// account. Checked across the whole 4xx/5xx range rather than by example.
-    #[test]
-    fn anything_worth_retrying_is_never_called_a_dead_identity() {
-        for code in 400..600u16 {
-            let status = reqwest::StatusCode::from_u16(code).unwrap();
-            assert!(
-                !(worth_retrying(status) && refuses_identity(status)),
-                "{status} cannot be both retryable and a dead identity"
-            );
-        }
-    }
-
-    /// The camouflaged API route reports a bare `u16`, so it classifies the codes
-    /// itself. That duplicate list is the thing most likely to drift out of step
-    /// with `refuses_identity`, so pin them together.
-    #[test]
-    fn the_camouflaged_route_agrees_with_refuses_identity() {
-        for code in 400..600u16 {
-            let status = reqwest::StatusCode::from_u16(code).unwrap();
-            let fallback_says = matches!(code, 401 | 404 | 410);
-            assert_eq!(
-                fallback_says,
-                refuses_identity(status),
-                "the two refusal checks disagree about {code}"
-            );
-        }
     }
 
     fn sample_identity(cert_issued_at: u64, with_cert: bool) -> Identity {
@@ -1275,9 +1073,75 @@ mod tests {
         assert!(retry_after(&headers).is_none());
     }
 
+    #[test]
+    fn an_enroll_address_is_an_ip_address_or_a_domain_name_with_or_without_a_port() {
+        let address = |value: Option<&str>| {
+            match value {
+                Some(value) => std::env::set_var("AETHER_ENROLL_ADDRESS", value),
+                None => std::env::remove_var("AETHER_ENROLL_ADDRESS"),
+            }
+            enroll_address().map_err(|e| e.to_string())
+        };
+        let at = |host: &str, port: u16| -> std::result::Result<(String, u16), String> {
+            Ok((host.to_string(), port))
+        };
+        assert_eq!(address(None), at("api.cloudflareclient.com", 443));
+        assert_eq!(address(Some("  ")), at("api.cloudflareclient.com", 443));
+        assert_eq!(address(Some(" 188.114.97.6 ")), at("188.114.97.6", 443));
+        assert_eq!(address(Some("188.114.97.6:443")), at("188.114.97.6", 443));
+        assert_eq!(address(Some("188.114.97.6:2053")), at("188.114.97.6", 2053));
+        assert_eq!(
+            address(Some("[2606:4700::6810:1]")),
+            at("2606:4700::6810:1", 443)
+        );
+        assert_eq!(
+            address(Some("2606:4700::6810:1")),
+            at("2606:4700::6810:1", 443)
+        );
+        assert_eq!(
+            address(Some("[2606:4700::6810:1]:8443")),
+            at("2606:4700::6810:1", 8443)
+        );
+        assert_eq!(
+            address(Some("edge.example.com")),
+            at("edge.example.com", 443)
+        );
+        assert_eq!(
+            address(Some("edge.example.com:8443")),
+            at("edge.example.com", 8443)
+        );
+        for refused in [
+            "188.114.97.6:0",
+            "188.114.97.6:65536",
+            "edge.example.com:https",
+            "https://edge.example.com",
+            "edge example.com",
+        ] {
+            let said = address(Some(refused)).expect_err(refused);
+            assert_eq!(
+                said,
+                format!(
+                    "api: --enroll-address: {refused} is no IP address or domain name, with or without a port"
+                )
+            );
+            assert!(check_enroll_address().is_err());
+        }
+        std::env::remove_var("AETHER_ENROLL_ADDRESS");
+        assert!(check_enroll_address().is_ok());
+    }
+
+    #[test]
+    fn a_run_starts_without_the_api_key_of_the_run_before() {
+        // No other test calls the WARP API, so none sees the key change here.
+        remember_api_ech(vec![1, 2, 3]);
+        assert_eq!(api_ech_in_use(), Some(vec![1, 2, 3]));
+        forget_api_ech();
+        assert_eq!(api_ech_in_use(), None);
+    }
+
     #[tokio::test]
-    #[ignore = "registers a real warp device over the camouflaged route"]
-    async fn the_camouflaged_route_can_register_a_real_device() {
+    #[ignore = "registers a real warp device"]
+    async fn the_api_registers_a_real_device() {
         let (_, public) = generate_x25519_keypair();
         let body = Registration {
             key: public,
@@ -1295,9 +1159,9 @@ mod tests {
         let encoded = serde_json::to_vec(&body).expect("encode");
         let path = format!("/{}/reg", consts::API_VERSION);
 
-        let account = fallback_call("registration", "POST", &path, Some(encoded), None, None)
+        let account = api_call("registration", "POST", &path, Some(&encoded), None, None)
             .await
-            .expect("the camouflaged route should register a device");
+            .expect("the API should register a device");
 
         println!(
             "device={} ipv4={}",
@@ -1314,5 +1178,61 @@ mod tests {
         assert!(!pair.cert_pem.is_empty());
         assert!(!pair.key_pem.is_empty());
         assert!(!masque_cert_expiring(now_unix()));
+    }
+}
+
+#[cfg(test)]
+mod identity_refusal_tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn the_codes_that_mean_the_identity_is_gone() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::GONE,
+        ] {
+            assert!(refuses_identity(status), "{status} means a dead identity");
+        }
+    }
+
+    #[test]
+    fn a_flagged_network_is_not_mistaken_for_a_dead_identity() {
+        assert!(
+            !refuses_identity(StatusCode::FORBIDDEN),
+            "403 is cloudflare refusing the address, the identity may be fine"
+        );
+        assert!(
+            !refuses_identity(StatusCode::TOO_MANY_REQUESTS),
+            "429 is rate limiting, not a dead identity"
+        );
+    }
+
+    #[test]
+    fn a_server_or_transport_problem_is_not_a_dead_identity() {
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+        ] {
+            assert!(
+                !refuses_identity(status),
+                "{status} should be retried, not treated as a dead identity"
+            );
+        }
+    }
+
+    #[test]
+    fn anything_worth_retrying_is_never_called_a_dead_identity() {
+        for code in 400..600u16 {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(
+                !(worth_retrying(status) && refuses_identity(status)),
+                "{status} cannot be both retryable and a dead identity"
+            );
+        }
     }
 }

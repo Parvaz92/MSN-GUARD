@@ -3,26 +3,6 @@ pub const API_VERSION: &str = "v0a4471";
 
 pub const CONNECT_SNI: &str = "consumer-masque.cloudflareclient.com";
 pub const L4_CONNECT_SNI: &str = "consumer-masque-proxy.cloudflareclient.com";
-
-/// The SNI to send on a MASQUE ClientHello, after the optional mixed-case pass.
-///
-/// Every place that builds a MASQUE or probe configuration reads the SNI from
-/// here rather than from [CONNECT_SNI] directly, so a single switch changes
-/// all of them at once: the probe, the H3 path and the H2 fallback must agree,
-/// or a probe would pass a connection that then fails.
-///
-/// When [crate::sni_case] is off this returns the constant byte-identical;
-/// when it is on, the name is re-cased per call, which is per connection by
-/// construction.
-pub fn connect_sni() -> String {
-    crate::sni_case::mix(CONNECT_SNI)
-}
-
-/// The L4 MASQUE variant, same treatment. Separate from [connect_sni] because
-/// it is a different hostname and must never be folded into one.
-pub fn l4_connect_sni() -> String {
-    crate::sni_case::mix(L4_CONNECT_SNI)
-}
 pub const CONNECT_URI: &str = "https://cloudflareaccess.com";
 
 pub const ECH_PUBLIC_NAME: &str = "cloudflare-ech.com";

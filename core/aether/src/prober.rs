@@ -15,20 +15,13 @@ pub const MASQUE_DOCUMENTED_CIDRS_V4: &[&str] = &["162.159.197.0/24", "162.159.1
 pub const MASQUE_DOH_CIDRS_V4: &[&str] = &["162.159.36.0/24", "162.159.46.0/24"];
 
 pub const MASQUE_CIDRS_V4: &[&str] = &[
-    // 162.159.199.0/24 leads: its .1 and .2 answered connect-ip on 4 of 4
-    // attempts at 80 ms, the best result of any range measured. This range was
-    // missing from the list entirely, so the two most reliable gateways on the
-    // fleet were unreachable by seed and by sweep alike.
-    "162.159.199.0/24",
-    // 162.159.198.0/24 second: .2 and .1 also answer connect-ip, and the account
-    // API assigns 162.159.198.2 after a MASQUE key is enrolled.
-    "162.159.198.0/24",
-    "162.159.197.0/24",
     "162.159.196.0/24",
     "162.159.195.0/24",
     "162.159.192.0/24",
     "162.159.193.0/24",
     "162.159.204.0/24",
+    "162.159.197.0/24",
+    "162.159.198.0/24",
     "172.65.251.0/24",
     "188.114.96.0/24",
     "188.114.97.0/24",
@@ -38,63 +31,17 @@ pub const MASQUE_CIDRS_V4: &[&str] = &[
     "162.159.46.0/24",
 ];
 
-/// MASQUE gateway seeds, in dial order.
-///
-/// Order is measured, not guessed, and the measurement had to be repeated
-/// before it was trustworthy. Probed 2026-09-02 from an uncensored host with a
-/// **freshly enrolled** device certificate, judging each address only by whether
-/// it answered the connect-ip CONNECT, **four attempts each**:
-///
-/// ```text
-/// 162.159.199.1   4/4 :status 200   best 80ms
-/// 162.159.199.2   4/4 :status 200   best 87ms
-/// 162.159.198.2   3/4 :status 200   best 81ms  (the endpoint the API assigns)
-/// 162.159.198.1   2/4 :status 200   best 113ms
-/// 162.159.197.1   0/4
-/// 162.159.197.2   0/4
-/// 162.159.197.3   0/4
-/// 162.159.204.2   0/4
-/// 162.159.204.3   0/4
-/// 162.159.196.1   0/4
-/// 162.159.196.2   0/4
-/// 162.159.195.1   0/4
-/// 162.159.192.1   0/4
-/// 162.159.193.1   0/4
-/// ```
-///
-/// Three findings, in order of how much they cost:
-///
-///   * **One probe is not a verdict.** Every gateway that works missed at least
-///     one of four attempts, and `162.159.198.1` missed two. An earlier pass
-///     here classified each address from a single sample and wrote off
-///     `162.159.199.1` and `.2` — the two best gateways on the fleet — as dead.
-///     Anything that ranks these addresses must sample repeatedly.
-///   * **162.159.199.0/24 was missing from the codebase entirely**, seeds and
-///     CIDR list alike, so its gateways could not be reached by any path.
-///   * **"Completes the QUIC handshake" is not evidence of a gateway.** The
-///     197.x and 204.x addresses finish QUIC and TLS, then never answer
-///     connect-ip. Ranking by handshake is what previously put four addresses
-///     that cannot serve MASQUE ahead of ones that can.
-///
-/// Nothing is deleted: the 0/4 addresses stay reachable through the CIDR sweep
-/// and the deep scan. The order just stops spending the user's connect budget
-/// on them first.
 pub const MASQUE_SEEDS: &[&str] = &[
-    "162.159.199.1",
-    "162.159.199.2",
+    "162.159.196.1",
+    "162.159.195.1",
+    "162.159.192.1",
+    "162.159.197.3",
+    "162.159.197.1",
     "162.159.198.2",
     "162.159.198.1",
-    "162.159.197.1",
-    "162.159.204.2",
+    "162.159.193.1",
 ];
 
-/// The addresses measured answering `:status 200` to connect-ip, best first.
-///
-/// Kept separate from [`MASQUE_SEEDS`] because the start path needs to know
-/// *which* peers are worth a second chance on another UDP port. Retrying an
-/// ordinary Cloudflare edge on UDP/500 is pointless — it has no connect-ip
-/// listener on any port — while retrying a real gateway there is the only
-/// escape from a carrier that degrades UDP/443 to this range specifically.
 pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
     "162.159.199.1",
     "162.159.199.2",
@@ -102,58 +49,9 @@ pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
     "162.159.198.1",
 ];
 
-pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
-
-/// Alternate UDP ports a verified gateway was measured serving connect-ip on.
-///
-/// Ordered by field evidence first, then measured hit rate — see the note on
-/// 1701 below for why those two disagree.
-///
-/// Two attempts per (gateway, port) across all four verified gateways with an
-/// enrolled certificate, counting only connect-ip `:status 200`:
-///
-/// ```text
-///                :500  :1701  :4500  :8095  :4443  :8443
-/// 162.159.199.1   2/2   2/2    2/2    2/2    1/2    1/2
-/// 162.159.199.2   1/2   0/2    1/2    2/2    1/2    2/2
-/// 162.159.198.2   1/2   2/2    1/2    1/2    2/2    2/2
-/// 162.159.198.1   2/2   0/2    1/2    2/2    1/2    1/2
-///                ----  ----   ----   ----   ----   ----
-///                 6/8   4/8    5/8    7/8    5/8    6/8
-/// ```
-///
-/// Every one of the six ports answers on at least one gateway, which corrects an
-/// earlier claim here that 4443 and 8443 complete TLS but never answer
-/// connect-ip. That claim came from a single-sample run — the same mistake that
-/// mis-ranked the seed list. 4443 and 8443 are still left out of the start-path
-/// ladder to hold the connect budget at four rungs, and the sweep still reaches
-/// them through [`MASQUE_PORTS`].
-///
-/// This run measured hit rate only, not latency. The earlier single-sample pass
-/// timed 500/1701/4500/8095 at 86–129 ms, the same class as 443, which is what
-/// the design argument below rests on: it is the same gateway and the same
-/// HTTP/3 data plane, so the alternate port costs nothing but the dial.
-///
-/// 1701 leads despite ranking last on total hits, because the spread above is
-/// sampling noise on an uncensored path — no port here is actually unreachable
-/// from a VPS — and it says nothing about which port survives Iranian DPI. 1701
-/// is the only one with field evidence: it is where WireGuard-over-WARP
-/// connected from inside Iran while UDP/443 was being dropped. Field evidence
-/// outranks VPS hit rate for ordering.
-///
-/// Caveat worth knowing before trusting a rung: 1701 answered 2/2 on
-/// `162.159.199.1` and `162.159.198.2` but 0/2 on `162.159.199.2` and
-/// `162.159.198.1`, and the ladder pairs each port with the first two verified
-/// gateways. So the 1701 pair is one measured-good rung followed by one
-/// measured-dead rung. Left as is because per-port gateway tables in a const are
-/// worse than one wasted 5 s dial, but if the ladder ever needs shortening, that
-/// rung is the first to cut.
-///
-/// This is why the escape from a blocked UDP/443 belongs here and not in the
-/// HTTP/2 pass: another UDP port on the same gateway keeps QUIC, keeps the
-/// throughput, and is known to work. HTTP/2 over TCP is not served connect-ip
-/// by any public Cloudflare edge at all.
 pub const MASQUE_ALT_PORTS: &[u16] = &[1701, 8095, 500, 4500];
+
+pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
     "2606:4700:d0::/48",
@@ -250,7 +148,7 @@ pub enum ScanMode {
     Turbo,
     Balanced,
     Thorough,
-    Stealth,
+    Verified,
     Ironclad,
 }
 
@@ -259,7 +157,7 @@ impl ScanMode {
         match s.trim().to_lowercase().as_str() {
             "turbo" | "fast" => ScanMode::Turbo,
             "thorough" | "deep" | "pro" => ScanMode::Thorough,
-            "stealth" | "quiet" => ScanMode::Stealth,
+            "verified" | "proven" | "stealth" | "quiet" => ScanMode::Verified,
             "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,
             _ => ScanMode::Balanced,
         }
@@ -270,7 +168,7 @@ impl ScanMode {
             ScanMode::Turbo => "turbo",
             ScanMode::Balanced => "balanced",
             ScanMode::Thorough => "thorough",
-            ScanMode::Stealth => "stealth",
+            ScanMode::Verified => "verified",
             ScanMode::Ironclad => "ironclad",
         }
     }
@@ -307,15 +205,15 @@ impl ScanMode {
                 full_subnet: true,
                 sample_per_cidr: 0,
             },
-            ScanMode::Stealth => Strategy {
-                concurrency: 3,
-                per_probe_timeout: Duration::from_millis(12000),
-                overall_deadline: Duration::from_secs(180),
-                quiet_after_first: Duration::from_secs(25),
+            ScanMode::Verified => Strategy {
+                concurrency: 16,
+                per_probe_timeout: Duration::from_millis(5000),
+                overall_deadline: Duration::from_secs(60),
+                quiet_after_first: Duration::from_secs(8),
                 target_successes: 4,
                 early_exit_first: false,
                 full_subnet: false,
-                sample_per_cidr: 64,
+                sample_per_cidr: 48,
             },
             ScanMode::Ironclad => Strategy {
                 concurrency: 4,
@@ -353,20 +251,14 @@ pub struct MasqueProbe {
     pub key_pem: Arc<[u8]>,
     pub ech_config_list: Option<Arc<[u8]>>,
     pub noize: NoizeConfig,
-    pub tls_curve_preset: crate::TlsCurvePreset,
     pub ports: Vec<u16>,
     pub ip: IpScan,
     pub local_ipv4: Ipv4Addr,
 }
 
 pub async fn host_has_ipv6() -> bool {
-    match tokio::net::UdpSocket::bind("[::]:0").await {
-        Ok(sock) => {
-            if crate::platform::protect_socket(&sock).is_err() {
-                return false;
-            }
-            sock.connect("[2606:4700:d0::a29f:c001]:443").await.is_ok()
-        }
+    match crate::egress::udp_bind("[::]:0".parse().expect("a wildcard address")) {
+        Ok(sock) => sock.connect("[2606:4700:d0::a29f:c001]:443").await.is_ok(),
         Err(_) => false,
     }
 }
@@ -483,30 +375,6 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     }
 }
 
-pub async fn verify_cached_gateways(
-    probe: &MasqueProbe,
-    gateways: Vec<SocketAddr>,
-) -> Option<ProbeResult> {
-    let stream = futures::stream::iter(gateways.into_iter().map(|gateway| {
-        verify_one(
-            probe,
-            gateway.ip(),
-            gateway.port(),
-            Duration::from_secs(6),
-            false,
-        )
-    }))
-    .buffer_unordered(3);
-    tokio::pin!(stream);
-
-    while let Some(result) = stream.next().await {
-        if result.is_some() {
-            return result;
-        }
-    }
-    None
-}
-
 async fn verify_one(
     probe: &MasqueProbe,
     ip: IpAddr,
@@ -522,6 +390,7 @@ async fn verify_one(
             path: probe.path.clone(),
             cert_pem: probe.cert_pem.to_vec(),
             key_pem: probe.key_pem.to_vec(),
+            ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
             noize: probe.noize.clone(),
             local_ipv4: probe.local_ipv4,
             local_ipv4_str: probe.local_ipv4.to_string(),
@@ -542,36 +411,26 @@ async fn verify_one(
         };
     }
 
-    let transport = if crate::masque_h2::enabled() {
-        "HTTP/2"
-    } else {
-        "HTTP/3"
-    };
-    crate::ffi::record_log(format!("Scanning {ip}:{port} via {transport}"));
     if crate::masque_h2::enabled() {
         let cfg = crate::masque_h2::H2TunnelConfig {
             peer: SocketAddr::new(ip, port),
-            sni: crate::consts::l4_connect_sni(),
+            sni: probe.sni.clone(),
             authority: probe.authority.clone(),
             path: probe.path.clone(),
             cert_pem: probe.cert_pem.to_vec(),
             key_pem: probe.key_pem.to_vec(),
             local_ipv4: probe.local_ipv4,
             quiet: true,
-            // A prober run is a throwaway verify, not a session: it must not
-            // announce the app "connected" while the real tunnel is still
-            // being chosen.
-            announce: false,
-            pin_endpoint: false,
-            expected_pins: Vec::new(),
+            pin_endpoint: true,
+            expected_pins: crate::consts::MASQUE_PINS
+                .iter()
+                .map(|p| p.to_vec())
+                .collect(),
+            ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
         };
         return match crate::masque_h2::verify_h2(&cfg, timeout).await {
-            Ok(rtt) => {
-                crate::ffi::record_log(format!("Accepted {ip}:{port} ({rtt:?})"));
-                Some(ProbeResult { ip, port, rtt })
-            }
+            Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
             Err(e) => {
-                crate::ffi::record_log(format!("Rejected {ip}:{port}: {e}"));
                 log::trace!("h2 probe {ip}:{port} -> {e}");
                 None
             }
@@ -587,32 +446,14 @@ async fn verify_one(
         key_pem: probe.key_pem.to_vec(),
         ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
         noize: probe.noize.clone(),
-        tls_curve_preset: probe.tls_curve_preset,
         timeout,
         local_ipv4: probe.local_ipv4,
     };
 
-    let verify = async {
-        let rtt = quic::verify_masque(&vp).await?;
-        if ironclad {
-            quic::verify_masque(&vp).await?;
-        }
-        Ok::<_, AetherError>(rtt)
-    };
-
-    match tokio::time::timeout(timeout, verify).await {
-        Ok(Ok(rtt)) => {
-            crate::ffi::record_log(format!("Accepted {ip}:{port} ({rtt:?})"));
-            Some(ProbeResult { ip, port, rtt })
-        }
-        Ok(Err(e)) => {
-            crate::ffi::record_log(format!("Rejected {ip}:{port}: {e}"));
-            log::debug!("probe {ip}:{port} -> {e}");
-            None
-        }
-        Err(_) => {
-            crate::ffi::record_log(format!("Rejected {ip}:{port}: probe timeout"));
-            log::debug!("probe {ip}:{port} timed out; probe future dropped");
+    match quic::verify_masque(&vp).await {
+        Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
+        Err(e) => {
+            log::trace!("probe {ip}:{port} -> {e}");
             None
         }
     }
@@ -629,54 +470,12 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    // Seeds on the primary port, then the same seeds on every alternate port,
-    // and only then the wide CIDR sweep.
-    //
-    // The alternate ports used to sit at the very end of the queue, behind
-    // thousands of addresses on 443. A carrier that drops UDP/443 but leaves
-    // UDP/500 and UDP/4500 alone therefore never reached them: the 120 s scan
-    // deadline expired mid-sweep. A field log from Irancell showed 4433 probes
-    // across 2735 addresses without a single non-443 port being tried, while
-    // WireGuard — which starts at 2408 — connected immediately on the same SIM.
-    //
-    // Eight seeds times six alternate ports is 48 extra probes at concurrency
-    // 16-20, so a network where 443 works still selects a gateway from the
-    // first batch and never pays for them.
     if ip.want_v4() {
         for a in &seeds {
             if seen.insert((IpAddr::V4(*a), primary)) {
                 out.push((IpAddr::V4(*a), primary));
             }
         }
-    }
-    if ip.want_v6() {
-        for a in &seeds6 {
-            if seen.insert((IpAddr::V6(*a), primary)) {
-                out.push((IpAddr::V6(*a), primary));
-            }
-        }
-    }
-
-    if ip.want_v4() {
-        for a in &seeds {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V4(*a), port)) {
-                    out.push((IpAddr::V4(*a), port));
-                }
-            }
-        }
-    }
-    if ip.want_v6() {
-        for a in &seeds6 {
-            for &port in ports {
-                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
-                    out.push((IpAddr::V6(*a), port));
-                }
-            }
-        }
-    }
-
-    if ip.want_v4() {
         let cidr_hosts: Vec<Vec<Ipv4Addr>> = masque_cidrs_v4()
             .iter()
             .map(|c| {
@@ -700,6 +499,11 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     }
 
     if ip.want_v6() {
+        for a in &seeds6 {
+            if seen.insert((IpAddr::V6(*a), primary)) {
+                out.push((IpAddr::V6(*a), primary));
+            }
+        }
         let per = if st.sample_per_cidr == 0 {
             96
         } else {
@@ -716,6 +520,25 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
                     if seen.insert((IpAddr::V6(*a), primary)) {
                         out.push((IpAddr::V6(*a), primary));
                     }
+                }
+            }
+        }
+    }
+
+    if ip.want_v4() {
+        for a in &seeds {
+            for &port in ports {
+                if port != primary && seen.insert((IpAddr::V4(*a), port)) {
+                    out.push((IpAddr::V4(*a), port));
+                }
+            }
+        }
+    }
+    if ip.want_v6() {
+        for a in &seeds6 {
+            for &port in ports {
+                if port != primary && seen.insert((IpAddr::V6(*a), port)) {
+                    out.push((IpAddr::V6(*a), port));
                 }
             }
         }
@@ -848,57 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn every_seed_is_tried_on_every_alternate_port_before_the_cidr_sweep() {
-        let st = ScanMode::Balanced.strategy();
-        let candidates = build_candidates(&st, MASQUE_PORTS, IpScan::V4);
-        let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
-
-        // The head of the queue is the seeds on 443, then the seeds on the
-        // alternate ports. Nothing from the wide sweep may come before them.
-        let head = seeds.len() * MASQUE_PORTS.len();
-        assert!(candidates.len() > head, "the sweep should still be there");
-        for (i, (ip, port)) in candidates.iter().take(head).enumerate() {
-            let ip = match ip {
-                IpAddr::V4(v4) => *v4,
-                IpAddr::V6(_) => panic!("v4-only scan produced a v6 candidate at {i}"),
-            };
-            assert!(seeds.contains(&ip), "{ip}:{port} at {i} is not a seed");
-        }
-        for &port in MASQUE_PORTS {
-            for seed in &seeds {
-                let want = (IpAddr::V4(*seed), port);
-                let at = candidates.iter().position(|c| *c == want);
-                assert!(at.is_some_and(|at| at < head), "{seed}:{port} is not early");
-            }
-        }
-    }
-
-    #[test]
-    fn the_primary_port_still_wins_the_very_first_probes() {
-        // A network where UDP/443 works must not pay for the alternate ports:
-        // the first batch the scanner dispatches is still seeds on 443.
-        let st = ScanMode::Balanced.strategy();
-        let candidates = build_candidates(&st, MASQUE_PORTS, IpScan::V4);
-        let seeds = MASQUE_SEEDS.len();
-        for (ip, port) in candidates.iter().take(seeds) {
-            assert_eq!(*port, 443, "{ip}:{port} should be on the primary port");
-        }
-    }
-
-    #[test]
-    fn the_cidr_sweep_only_ever_uses_the_primary_port() {
-        let st = ScanMode::Balanced.strategy();
-        let candidates = build_candidates(&st, MASQUE_PORTS, IpScan::V4);
-        let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
-        for (ip, port) in &candidates {
-            let IpAddr::V4(v4) = ip else { continue };
-            if !seeds.contains(v4) {
-                assert_eq!(*port, 443, "swept {ip} on {port}, which multiplies the scan");
-            }
-        }
-    }
-
-    #[test]
     fn without_a_team_the_range_order_is_left_alone() {
         std::env::remove_var("AETHER_TEAM");
         assert_eq!(
@@ -934,9 +706,12 @@ mod tests {
     }
 
     async fn quic_answers(peer: SocketAddr, timeout: Duration) -> Option<Duration> {
-        let bind = if peer.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let bind = if peer.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
         let sock = tokio::net::UdpSocket::bind(bind).await.ok()?;
-        crate::platform::protect_socket(&sock).ok()?;
         sock.connect(peer).await.ok()?;
         let local = sock.local_addr().ok()?;
 
@@ -952,8 +727,8 @@ mod tests {
         rand::rng().fill(&mut scid[..]);
         let scid = quiche::ConnectionId::from_ref(&scid);
 
-        let sni = crate::consts::connect_sni();
-        let mut conn = quiche::connect(Some(&sni), &scid, local, peer, &mut config).ok()?;
+        let sni = crate::consts::CONNECT_SNI;
+        let mut conn = quiche::connect(Some(sni), &scid, local, peer, &mut config).ok()?;
 
         let mut out = [0u8; 1350];
         let (written, _) = conn.send(&mut out).ok()?;
@@ -1171,5 +946,43 @@ mod tests {
         for seed in MASQUE_SEEDS_V6 {
             assert!(seed.parse::<Ipv6Addr>().is_ok(), "{seed}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_ironclad_check_offers_the_ech_key_of_its_scan() {
+        let _setting = crate::upstream::hold_setting().await;
+        // The check builds its TLS with the fingerprint the options give.
+        let _options = crate::tls::hold_options().await;
+        let identity = crate::account::handshake_identity();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = peer.local_addr().unwrap();
+        let probe = |ech: Option<Vec<u8>>| MasqueProbe {
+            sni: crate::consts::CONNECT_SNI.to_string(),
+            authority: quic::default_authority().to_string(),
+            path: quic::default_path().to_string(),
+            cert_pem: Arc::from(identity.cert_pem.clone()),
+            key_pem: Arc::from(identity.key_pem.clone()),
+            ech_config_list: ech.map(Arc::from),
+            noize: crate::noize::from_profile("off"),
+            ports: vec![address.port()],
+            ip: IpScan::V4,
+            local_ipv4: Ipv4Addr::new(172, 16, 0, 2),
+        };
+        let timeout = Duration::from_secs(5);
+
+        // Given a key BoringSSL offers nothing from (its one config is of another version), the
+        // check sends no ClientHello; the version bait may go out before it.
+        let unusable = probe(Some(vec![0, 6, 0xfe, 0x0c, 0, 2, 0, 0]));
+        let checked = verify_one(&unusable, address.ip(), address.port(), timeout, true).await;
+        assert!(checked.is_none());
+        assert!(!quic::hears_a_client_hello(&peer, Duration::from_millis(300)).await);
+
+        // Without a key, the same check does send one, with the server name in the clear.
+        let plain = probe(None);
+        let check = tokio::spawn(async move {
+            verify_one(&plain, address.ip(), address.port(), timeout, true).await
+        });
+        assert!(quic::hears_a_client_hello(&peer, Duration::from_secs(4)).await);
+        check.abort();
     }
 }

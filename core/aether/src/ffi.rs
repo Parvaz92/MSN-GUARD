@@ -1,831 +1,870 @@
-use std::collections::VecDeque;
+#![allow(clippy::missing_safety_doc)]
+
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-/// Installs a panic hook that keeps the *message*, which `catch_unwind`
-/// otherwise throws away. The JNI layer turns a panic into a bare
-/// "panic in Aether native core" and the tunnel just dies, so without this the
-/// log line that a user pastes back carries no clue to the cause.
-///
-/// The hook re-stores the payload through [set_last_error] and writes it into
-/// the persisted log, where both the next read of `lastError` and the exported
-/// log file can reach it.
-fn install_panic_hook() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let next = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let where_ = info
-                .location()
-                .map(|l| format!("{}:{}", l.file(), l.line()))
-                .unwrap_or_else(|| "<unknown>".into());
-            let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = info.payload().downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<non-string panic payload>".to_string()
-            };
-            let line = format!("PANIC {where_}: {payload}");
-            set_last_error(line);
-            next(info);
-        }));
-    });
+use futures::FutureExt;
+use parking_lot::Mutex;
+use serde_json::{json, Value};
+
+use crate::account::Identity;
+use crate::api;
+use crate::zerotrust;
+
+type Reply = std::result::Result<Value, String>;
+
+fn runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .ok()
+        })
+        .as_ref()
 }
 
-#[cfg(test)]
-fn last_error_for_test() -> String {
-    LAST_ERROR
+fn next_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+enum JobState {
+    Running,
+    Done(Value),
+}
+
+struct Job {
+    cancel: api::Cancel,
+    state: Arc<Mutex<JobState>>,
+}
+
+fn jobs() -> &'static Mutex<HashMap<u64, Job>> {
+    static JOBS: OnceLock<Mutex<HashMap<u64, Job>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn identities() -> &'static Mutex<HashMap<u64, Arc<Identity>>> {
+    static IDENTITIES: OnceLock<Mutex<HashMap<u64, Arc<Identity>>>> = OnceLock::new();
+    IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn sessions() -> &'static Mutex<HashMap<u64, Arc<tokio::sync::Mutex<zerotrust::EmailSignIn>>>> {
+    static SESSIONS: OnceLock<
+        Mutex<HashMap<u64, Arc<tokio::sync::Mutex<zerotrust::EmailSignIn>>>>,
+    > = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn into_c_string(text: String) -> *mut c_char {
+    match CString::new(text) {
+        Ok(value) => value.into_raw(),
+        Err(_) => CString::new("{\"ok\":false,\"error\":\"the reply held a null byte\"}")
+            .expect("static reply")
+            .into_raw(),
+    }
+}
+
+fn ok_value(value: Value) -> Value {
+    match value {
+        Value::Object(mut fields) => {
+            fields.insert("ok".to_string(), Value::Bool(true));
+            Value::Object(fields)
+        }
+        other => json!({"ok": true, "result": other}),
+    }
+}
+
+fn error_value(message: String) -> Value {
+    json!({"ok": false, "error": message})
+}
+
+fn respond<F>(work: F) -> *mut c_char
+where
+    F: FnOnce() -> Reply,
+{
+    let value = match catch_unwind(AssertUnwindSafe(work)) {
+        Ok(Ok(value)) => ok_value(value),
+        Ok(Err(message)) => error_value(message),
+        Err(_) => error_value("the core panicked".to_string()),
+    };
+    into_c_string(value.to_string())
+}
+
+unsafe fn read_str(raw: *const c_char) -> std::result::Result<String, String> {
+    if raw.is_null() {
+        return Err("a required argument was null".to_string());
+    }
+    CStr::from_ptr(raw)
+        .to_str()
+        .map(|value| value.to_string())
+        .map_err(|_| "an argument was not valid utf-8".to_string())
+}
+
+unsafe fn read_json<T: serde::de::DeserializeOwned>(
+    raw: *const c_char,
+) -> std::result::Result<T, String> {
+    let text = read_str(raw)?;
+    serde_json::from_str(&text).map_err(|e| format!("the payload is not usable json: {e}"))
+}
+
+fn spawn_job<F, Fut>(work: F) -> Reply
+where
+    F: FnOnce(api::Cancel) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Reply> + Send,
+{
+    let runtime = runtime().ok_or_else(|| "could not start the async runtime".to_string())?;
+    let cancel = api::Cancel::new();
+    let state = Arc::new(Mutex::new(JobState::Running));
+    let id = next_id();
+
+    jobs().lock().insert(
+        id,
+        Job {
+            cancel: cancel.clone(),
+            state: state.clone(),
+        },
+    );
+
+    runtime.spawn(async move {
+        let outcome = AssertUnwindSafe(work(cancel)).catch_unwind().await;
+        let reply = match outcome {
+            Ok(Ok(value)) => ok_value(value),
+            Ok(Err(message)) => error_value(message),
+            Err(_) => error_value("the core panicked".to_string()),
+        };
+        *state.lock() = JobState::Done(reply);
+    });
+
+    Ok(json!({"job": id}))
+}
+
+fn identity_of(id: u64) -> std::result::Result<Arc<Identity>, String> {
+    identities()
         .lock()
-        .unwrap()
-        .to_str()
-        .unwrap_or("")
-        .to_string()
-}
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
-
-use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
-
-use crate::{
-    platform, EndpointDiscovery, IpScan, MasqueTransport, Protocol, ScanMode, StartOptions,
-    TlsCurvePreset, TunnelAddresses,
-};
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Event {
-    Status {
-        status: String,
-        detail: Option<String>,
-    },
-    Traffic {
-        tx: u64,
-        rx: u64,
-    },
-    /// The tunnel's own exit address, measured from inside the tunnel.
-    ///
-    /// Separate from `Status` because it arrives later than "connected" and can
-    /// arrive more than once (a reconnect re-measures).
-    ///
-    /// No country field: the core cannot determine one. DNS exposes the RIR
-    /// registration (US for all of Cloudflare) but not a geolocation database,
-    /// and those disagree — 104.28.214.161 is registered to ARIN/US and
-    /// geolocates to Tehran. The app resolves the country from this address.
-    ExitIp {
-        ip: String,
-    },
-    Log {
-        message: String,
-    },
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| format!("there is no identity {id}"))
 }
 
-pub type EventCallback = unsafe extern "C" fn(json: *const c_char);
-
-static EVENT_CALLBACK: RwLock<Option<EventCallback>> = RwLock::new(None);
-static LAST_ERROR: LazyLock<Mutex<CString>> =
-    LazyLock::new(|| Mutex::new(CString::new("").unwrap()));
-static LAST_RESULT: LazyLock<Mutex<CString>> =
-    LazyLock::new(|| Mutex::new(CString::new("").unwrap()));
-static LAST_LOG: LazyLock<Mutex<CString>> = LazyLock::new(|| Mutex::new(CString::new("").unwrap()));
-static LOGS: LazyLock<Mutex<VecDeque<String>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
-static LOG_PATH: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
-const MAX_LOG_FILE_BYTES: u64 = 512 * 1024;
-static RUNNING: AtomicBool = AtomicBool::new(false);
-static READY: AtomicBool = AtomicBool::new(false);
-static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-static STOP_NOTIFY: OnceLock<Notify> = OnceLock::new();
-
-#[no_mangle]
-pub extern "C" fn aether_set_event_callback(callback: Option<EventCallback>) {
-    *EVENT_CALLBACK.write().unwrap() = callback;
+fn session_of(
+    id: u64,
+) -> std::result::Result<Arc<tokio::sync::Mutex<zerotrust::EmailSignIn>>, String> {
+    sessions()
+        .lock()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| format!("there is no sign-in session {id}"))
 }
 
-pub(crate) fn emit_event(event: Event) {
-    let Some(callback) = *EVENT_CALLBACK.read().unwrap() else {
-        return;
-    };
-    if let Ok(json) = serde_json::to_string(&event) {
-        if let Ok(c_str) = CString::new(json) {
-            unsafe { callback(c_str.as_ptr()) };
-        }
+fn keep_identity(identity: Identity) -> Value {
+    let summary = api::IdentitySummary::of(&identity);
+    let id = next_id();
+    identities().lock().insert(id, Arc::new(identity));
+    json!({"identity": id, "summary": summary})
+}
+
+fn describe(error: crate::error::AetherError) -> String {
+    error.to_string()
+}
+
+/// The ECH key of a job whose payload asks for ECH (`want`) on `transport`: none for WireGuard,
+/// which has no TLS handshake to hide a name in; for MASQUE, the key the lookup finds, or the
+/// error that ends the job before any handshake, which would send the server name in the clear.
+async fn job_ech(
+    want: bool,
+    transport: api::Transport,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    if want && transport == api::Transport::Masque {
+        api::fetch_ech_config().await.map(Some).map_err(describe)
+    } else {
+        Ok(None)
     }
 }
 
-pub(crate) fn emit_status(status: impl ToString, detail: Option<String>) {
-    emit_event(Event::Status {
-        status: status.to_string(),
-        detail,
-    });
+#[derive(serde::Deserialize)]
+struct TeamPayload {
+    team: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
 }
 
-pub(crate) fn emit_traffic(tx: u64, rx: u64) {
-    emit_event(Event::Traffic { tx, rx });
-}
-
-pub(crate) fn emit_exit_ip(ip: String) {
-    emit_event(Event::ExitIp { ip });
-}
-
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct NativeStartOptions {
-    config_path: String,
-    protocol: String,
-    listen: String,
-    wireguard_config_path: Option<String>,
-    masque_config_path: Option<String>,
-    forced_peer: Option<String>,
-    forced_inner_peer: Option<String>,
-    scan_mode: String,
-    ip_scan: String,
-    obfuscation_profile: Option<String>,
-    obfuscation_parameters: Option<String>,
-    retry_obfuscation_profiles: bool,
-    endpoint_cache_path: Option<String>,
-    endpoint_discovery: String,
-    masque_transport: String,
-    tls_curve_preset: String,
-    wireguard_data_check: bool,
-    log_level: Option<String>,
-    perf_profile: Option<String>,
-    h2_fragmentation: Option<bool>,
-    mixed_case_sni: Option<bool>,
-    dns_servers: Option<String>,
-    route_block: Option<String>,
-    route_direct: Option<String>,
-    routes_file: Option<String>,
-    team: Option<String>,
-    access_client_id: Option<String>,
-    access_client_secret: Option<String>,
-    access_token: Option<String>,
-    access_email: Option<String>,
-    gateway: bool,
-    upstream_proxy: Option<String>,
-    /// `ip:port` for the HTTP CONNECT proxy, or empty/absent for none.
-    ///
-    /// Android-only channel for what the CLI reads from `AETHER_HTTP_PROXY`: a
-    /// process cannot set an environment variable on itself before the library is
-    /// already loaded and running, so LAN sharing on the WARP transports had no way
-    /// to ask for the HTTP listener at all before this field existed.
-    http_proxy: Option<String>,
-    /// `ip:port` of a SOCKS5 listener to route the account API through.
-    ///
-    /// Android-only channel for what the CLI would set as `AETHER_SOCKS_PROXY`.
-    /// A fresh install on a filtered carrier cannot reach
-    /// api.cloudflareclient.com from its own link, so SHARD is brought up first
-    /// and the registration rides its listener. See [crate::account::socks_proxy_addr].
-    socks_proxy: Option<String>,
-}
-
-impl Default for NativeStartOptions {
-    fn default() -> Self {
-        Self {
-            config_path: String::new(),
-            protocol: "masque".into(),
-            listen: "127.0.0.1:1819".into(),
-            wireguard_config_path: None,
-            masque_config_path: None,
-            forced_peer: None,
-            forced_inner_peer: None,
-            scan_mode: "balanced".into(),
-            ip_scan: "v4".into(),
-            obfuscation_profile: None,
-            obfuscation_parameters: None,
-            retry_obfuscation_profiles: true,
-            endpoint_cache_path: None,
-            endpoint_discovery: "cache".into(),
-            masque_transport: "h3".into(),
-            tls_curve_preset: "chrome".into(),
-            wireguard_data_check: true,
-            log_level: None,
-            perf_profile: None,
-            h2_fragmentation: None,
-            mixed_case_sni: None,
-            dns_servers: None,
-            route_block: None,
-            route_direct: None,
-            routes_file: None,
-            team: None,
-            access_client_id: None,
-            access_client_secret: None,
-            access_token: None,
-            access_email: None,
-            gateway: false,
-            upstream_proxy: None,
-            http_proxy: None,
-            socks_proxy: None,
-        }
+impl TeamPayload {
+    fn credentials(&self) -> std::result::Result<api::TeamCredentials, String> {
+        let mut credentials = api::TeamCredentials::new(&self.team).map_err(describe)?;
+        credentials.client_id = self.client_id.clone();
+        credentials.client_secret = self.client_secret.clone();
+        credentials.token = self.token.clone();
+        credentials.email = self.email.clone();
+        Ok(credentials)
     }
 }
 
-impl TryFrom<NativeStartOptions> for StartOptions {
-    type Error = String;
+#[derive(serde::Deserialize)]
+struct OpenPayload {
+    path: String,
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    locale: Option<String>,
+    #[serde(default)]
+    team: Option<TeamPayload>,
+}
 
-    fn try_from(value: NativeStartOptions) -> Result<Self, Self::Error> {
-        if value.config_path.trim().is_empty() {
-            return Err("config_path is required".into());
-        }
+#[derive(serde::Deserialize)]
+struct ScanPayload {
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    ports: Option<Vec<u16>>,
+    #[serde(default)]
+    excluded: Option<Vec<String>>,
+    #[serde(default)]
+    ech: Option<bool>,
+}
 
-        let mut options = StartOptions::new(Protocol::parse(&value.protocol), value.config_path);
-        options.listen = parse_address("listen", &value.listen)?;
-        options.wireguard_config_path = value.wireguard_config_path;
-        options.masque_config_path = value.masque_config_path;
-        options.forced_peer = value
-            .forced_peer
-            .map(|peer| parse_address("forced_peer", &peer))
-            .transpose()?;
-        options.forced_inner_peer = value
-            .forced_inner_peer
-            .map(|peer| parse_address("forced_inner_peer", &peer))
-            .transpose()?;
-        options.scan_mode = ScanMode::parse(&value.scan_mode);
-        options.ip_scan = IpScan::parse(&value.ip_scan);
-        options.obfuscation_profile = value.obfuscation_profile;
-        options.obfuscation_parameters = value
-            .obfuscation_parameters
-            .filter(|parameters| !parameters.trim().is_empty());
-        options.retry_obfuscation_profiles = value.retry_obfuscation_profiles;
-        options.endpoint_cache_path = value
-            .endpoint_cache_path
-            .filter(|path| !path.trim().is_empty());
-        options.endpoint_discovery = EndpointDiscovery::parse(&value.endpoint_discovery);
-        options.masque_transport = MasqueTransport::parse(&value.masque_transport);
-        options.tls_curve_preset = TlsCurvePreset::parse(&value.tls_curve_preset);
-        options.wireguard_data_check = value.wireguard_data_check;
-        options.log_level = value.log_level.filter(|level| !level.trim().is_empty());
-        options.perf_profile = value
-            .perf_profile
-            .filter(|profile| !profile.trim().is_empty());
-        options.h2_fragmentation = value.h2_fragmentation;
-        options.mixed_case_sni = value.mixed_case_sni;
-        options.dns_servers = value.dns_servers.filter(|value| !value.trim().is_empty());
-        options.route_block = value.route_block.filter(|value| !value.trim().is_empty());
-        options.route_direct = value.route_direct.filter(|value| !value.trim().is_empty());
-        options.routes_file = value.routes_file.filter(|value| !value.trim().is_empty());
-        options.team = value.team.filter(|value| !value.trim().is_empty());
-        options.access_client_id = value
-            .access_client_id
-            .filter(|value| !value.trim().is_empty());
-        options.access_client_secret = value
-            .access_client_secret
-            .filter(|value| !value.trim().is_empty());
-        options.access_token = value.access_token.filter(|value| !value.trim().is_empty());
-        options.access_email = value.access_email.filter(|value| !value.trim().is_empty());
-        options.gateway = value.gateway;
-        options.upstream_proxy = value.upstream_proxy.filter(|v| !v.trim().is_empty());
-        options.http_proxy = match value.http_proxy.as_deref().map(str::trim) {
-            None | Some("") => None,
-            Some(raw) => Some(parse_address("http_proxy", raw)?),
-        };
-        // The account API proxy is read as an environment variable by the
-        // registration path, which runs before any tunnel exists and therefore
-        // cannot be handed a StartOptions field. Setting it here is the only
-        // bridge between the Android config and account::register.
-        if let Some(raw) = value.socks_proxy.as_deref().map(str::trim) {
-            if !raw.is_empty() {
-                // SAFETY: this runs once per start, before any registration
-                // attempt, on the same thread that will make the call. The
-                // registration path reads it immediately and the value is
-                // cleared by the caller's next start without it.
-                std::env::set_var("AETHER_SOCKS_PROXY", raw);
-            } else {
-                std::env::set_var("AETHER_SOCKS_PROXY", "");
-            }
-        } else {
-            std::env::set_var("AETHER_SOCKS_PROXY", "");
-        }
-        Ok(options)
+#[derive(serde::Deserialize)]
+struct TunnelPayload {
+    peer: String,
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    socks: Option<String>,
+    #[serde(default)]
+    http: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    keepalive: Option<u16>,
+    #[serde(default)]
+    ech: Option<bool>,
+}
+
+fn transport_of(raw: &Option<String>) -> api::Transport {
+    match raw {
+        Some(value) => api::Transport::parse(value),
+        None => api::Transport::Masque,
     }
 }
 
-fn parse_address(name: &str, value: &str) -> Result<SocketAddr, String> {
-    value
+fn socket_of(raw: &str, label: &str) -> std::result::Result<SocketAddr, String> {
+    raw.trim()
         .parse()
-        .map_err(|_| format!("invalid {name}: {value}"))
+        .map_err(|_| format!("{label} '{raw}' is not an address:port"))
 }
 
-fn set_last_error(error: impl ToString) {
-    let clean = error.to_string().replace('\0', " ");
-    if !clean.is_empty() {
-        persist_log_line(&format!("ERROR {clean}"));
-    }
-    *LAST_ERROR.lock().unwrap() = CString::new(clean).unwrap();
+#[no_mangle]
+pub extern "C" fn aether_version() -> *mut c_char {
+    respond(|| Ok(json!({"version": env!("CARGO_PKG_VERSION")})))
 }
 
-fn clear_logs() {
-    LOGS.lock().unwrap().clear();
-    *LAST_LOG.lock().unwrap() = CString::new("").unwrap();
-    persist_log_line("--- new session ---");
-}
-
-pub(crate) fn set_log_path(path: Option<String>) {
-    if let Some(ref path) = path {
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.len() > MAX_LOG_FILE_BYTES {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-    *LOG_PATH.lock().unwrap() = path;
-}
-
-fn persist_log_line(line: &str) {
-    let path = LOG_PATH.lock().unwrap().clone();
-    let Some(path) = path else {
+#[no_mangle]
+pub unsafe extern "C" fn aether_string_free(raw: *mut c_char) {
+    if raw.is_null() {
         return;
-    };
-    let stamp = chrono::Local::now().format("%H:%M:%S");
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| {
-            use std::io::Write;
-            writeln!(file, "{stamp}  {line}")
-        });
-}
-
-pub(crate) fn record_log(message: impl ToString) {
-    let text = message.to_string().replace('\0', " ");
-    emit_event(Event::Log {
-        message: text.clone(),
-    });
-    persist_log_line(&text);
-    let snapshot = {
-        let mut logs = LOGS.lock().unwrap();
-        if logs.len() == 400 {
-            logs.pop_front();
-        }
-        logs.push_back(text);
-        logs.iter().cloned().collect::<Vec<_>>().join("\n")
-    };
-    *LAST_LOG.lock().unwrap() = CString::new(snapshot).unwrap();
-}
-
-fn set_last_result(result: impl ToString) {
-    *LAST_RESULT.lock().unwrap() = CString::new(result.to_string()).unwrap();
-}
-
-unsafe fn options_from_json(json: *const c_char) -> Result<StartOptions, String> {
-    if json.is_null() {
-        return Err("configuration pointer is null".into());
     }
-
-    // SAFETY: caller promises valid, NUL-terminated string for this call.
-    let json = unsafe { CStr::from_ptr(json) }
-        .to_str()
-        .map_err(|error| format!("configuration is not UTF-8: {error}"))?;
-    serde_json::from_str::<NativeStartOptions>(json)
-        .map_err(|error| error.to_string())
-        .and_then(StartOptions::try_from)
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        drop(CString::from_raw(raw));
+    }));
 }
 
-fn stop_notify() -> &'static Notify {
-    STOP_NOTIFY.get_or_init(Notify::new)
-}
-
-async fn wait_for_stop() {
-    loop {
-        let notified = stop_notify().notified();
-        if STOP_REQUESTED.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
-    }
-}
-
-struct RunningGuard;
-
-impl Drop for RunningGuard {
-    fn drop(&mut self) {
-        RUNNING.store(false, Ordering::Release);
-        READY.store(false, Ordering::Release);
-    }
-}
-
-/// Starts Aether on the calling thread from a UTF-8 JSON configuration.
-///
-/// Returns 0 when the tunnel exits normally, -1 for invalid input, -2 for a
-/// runtime/tunnel error, and -3 if a panic was contained at the FFI boundary.
-/// The Android caller must invoke this on a worker thread.
 #[no_mangle]
-pub unsafe extern "C" fn aether_start_json(json: *const c_char) -> i32 {
-    unsafe { aether_start_json_inner(json, None) }
-}
-
-/// Starts Aether in Android TUN mode. The caller retains ownership of `tun_fd`.
-#[no_mangle]
-pub unsafe extern "C" fn aether_start_json_with_tun(json: *const c_char, tun_fd: i32) -> i32 {
-    if tun_fd < 0 {
-        set_last_error("TUN file descriptor is invalid");
-        return -1;
-    }
-    unsafe { aether_start_json_inner(json, Some(tun_fd)) }
-}
-
-unsafe fn aether_start_json_inner(json: *const c_char, tun_fd: Option<i32>) -> i32 {
-    install_panic_hook();
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let mut options = match unsafe { options_from_json(json) } {
-            Ok(options) => options,
-            Err(error) => {
-                set_last_error(error);
-                return -1;
-            }
-        };
-        options.tun_fd = tun_fd;
-
-        if RUNNING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            set_last_error("Aether tunnel already running");
-            return -2;
+pub extern "C" fn aether_job_poll(id: u64) -> *mut c_char {
+    respond(|| {
+        let registry = jobs().lock();
+        let job = registry
+            .get(&id)
+            .ok_or_else(|| format!("there is no job {id}"))?;
+        let state = job.state.lock();
+        match &*state {
+            JobState::Running => Ok(json!({"state": "running"})),
+            JobState::Done(result) => Ok(json!({"state": "done", "result": result})),
         }
-        let _running = RunningGuard;
-        STOP_REQUESTED.store(false, Ordering::Release);
-        READY.store(false, Ordering::Release);
-        set_last_error("");
-        clear_logs();
-        emit_status("starting", None);
-        record_log("Native tunnel started");
+    })
+}
 
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                set_last_error(error);
-                return -2;
+#[no_mangle]
+pub extern "C" fn aether_job_cancel(id: u64) -> *mut c_char {
+    respond(|| {
+        let registry = jobs().lock();
+        let job = registry
+            .get(&id)
+            .ok_or_else(|| format!("there is no job {id}"))?;
+        job.cancel.cancel();
+        Ok(json!({"cancelled": id}))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn aether_job_free(id: u64) -> *mut c_char {
+    respond(|| {
+        let removed = jobs().lock().remove(&id);
+        match removed {
+            Some(job) => {
+                job.cancel.cancel();
+                Ok(json!({"freed": id}))
             }
-        };
+            None => Ok(json!({"freed": Value::Null})),
+        }
+    })
+}
 
-        runtime.block_on(async {
-            tokio::select! {
-                result = crate::start(options) => match result {
-                    Ok(()) => 0,
-                    Err(error) => {
-                        set_last_error(error);
-                        -2
-                    }
-                },
-                _ = wait_for_stop() => 0,
+#[no_mangle]
+pub unsafe extern "C" fn aether_identity_open(payload: *const c_char) -> *mut c_char {
+    respond(|| {
+        let payload: OpenPayload = unsafe { read_json(payload) }?;
+        let transport = transport_of(&payload.transport);
+
+        let mut request = api::ProvisionRequest::for_transport(transport);
+        if let Some(model) = payload.model {
+            request.model = model;
+        }
+        if let Some(locale) = payload.locale {
+            request.locale = locale;
+        }
+
+        let team = match &payload.team {
+            Some(team) => Some(team.credentials()?),
+            None => None,
+        };
+        let team_name = team.as_ref().map(|team| team.team.clone());
+        request.team = team;
+
+        let path = api::identity_path(&payload.path, transport, team_name.as_deref());
+
+        spawn_job(move |_| async move {
+            let identity = api::open_identity(&path, &request)
+                .await
+                .map_err(describe)?;
+            let mut reply = keep_identity(identity);
+            if let Value::Object(fields) = &mut reply {
+                fields.insert("path".to_string(), Value::String(path.clone()));
+                fields.insert(
+                    "lastconn_path".to_string(),
+                    Value::String(api::lastconn_path(&path)),
+                );
+            }
+            Ok(reply)
+        })
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn aether_identity_summary(id: u64) -> *mut c_char {
+    respond(|| {
+        let identity = identity_of(id)?;
+        Ok(json!({"summary": api::IdentitySummary::of(&identity)}))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn aether_identity_free(id: u64) -> *mut c_char {
+    respond(|| {
+        identities().lock().remove(&id);
+        Ok(json!({"freed": id}))
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aether_scan_start(identity: u64, payload: *const c_char) -> *mut c_char {
+    respond(|| {
+        let payload: ScanPayload = unsafe { read_json(payload) }?;
+        let identity = identity_of(identity)?;
+        let transport = transport_of(&payload.transport);
+
+        let mut request = api::ScanRequest::for_transport(transport);
+        if let Some(profile) = &payload.profile {
+            request = request.with_profile(profile);
+        }
+        if let Some(mode) = &payload.mode {
+            request.mode = mode.clone();
+        }
+        if let Some(ip) = &payload.ip {
+            request.ip = crate::prober::IpScan::parse(ip);
+        }
+        if let Some(ports) = payload.ports {
+            if !ports.is_empty() {
+                request.ports = ports;
+            }
+        }
+        if let Some(excluded) = payload.excluded {
+            for raw in excluded {
+                if let Ok(address) = raw.trim().parse::<SocketAddr>() {
+                    request.excluded.insert(address);
+                }
+            }
+        }
+
+        let want_ech = payload.ech.unwrap_or(false);
+
+        spawn_job(move |cancel| async move {
+            let mut request = request;
+            request.ech_config_list = job_ech(want_ech, request.transport).await?;
+            let endpoint = api::scan(&identity, &request, &cancel)
+                .await
+                .map_err(describe)?;
+            Ok(json!({"endpoint": endpoint}))
+        })
+    })
+}
+
+fn tunnel_spec_of(payload: &TunnelPayload) -> std::result::Result<api::TunnelSpec, String> {
+    let transport = transport_of(&payload.transport);
+    let mut spec = api::TunnelSpec::for_transport(transport);
+
+    if let Some(profile) = &payload.profile {
+        spec = spec.with_profile(profile);
+    }
+    if let Some(socks) = &payload.socks {
+        spec.socks = socket_of(socks, "the socks address")?;
+    }
+    if let Some(http) = &payload.http {
+        spec.http = Some(socket_of(http, "the http proxy address")?);
+    }
+    if let Some(keepalive) = payload.keepalive {
+        spec.keepalive = keepalive;
+    }
+    Ok(spec)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aether_verify_start(identity: u64, payload: *const c_char) -> *mut c_char {
+    respond(|| {
+        let payload: TunnelPayload = unsafe { read_json(payload) }?;
+        let identity = identity_of(identity)?;
+        let peer = socket_of(&payload.peer, "the peer address")?;
+        let spec = tunnel_spec_of(&payload)?;
+        let want_ech = payload.ech.unwrap_or(false);
+
+        spawn_job(move |cancel| async move {
+            let mut spec = spec;
+            spec.ech = job_ech(want_ech, spec.transport).await?;
+            let reachable = api::verify_endpoint(&identity, peer, &spec, &cancel)
+                .await
+                .map_err(describe)?;
+            Ok(json!({"reachable": reachable}))
+        })
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aether_tunnel_start(identity: u64, payload: *const c_char) -> *mut c_char {
+    respond(|| {
+        let payload: TunnelPayload = unsafe { read_json(payload) }?;
+        let identity = identity_of(identity)?;
+        let peer = socket_of(&payload.peer, "the peer address")?;
+        let spec = tunnel_spec_of(&payload)?;
+        let want_ech = payload.ech.unwrap_or(false);
+
+        spawn_job(move |cancel| async move {
+            let mut spec = spec;
+            spec.ech = job_ech(want_ech, spec.transport).await?;
+
+            match api::connect(&identity, peer, &spec, &cancel).await {
+                Ok(()) => Ok(json!({"state": "closed"})),
+                Err(crate::error::AetherError::Cancelled) => Ok(json!({"state": "stopped"})),
+                Err(e) => Err(describe(e)),
             }
         })
-    }));
-
-    match result {
-        Ok(code) => code,
-        Err(_) => {
-            // The panic hook (install_panic_hook) already stored the real
-            // "PANIC file:line: payload" through set_last_error, and that is the
-            // message worth surfacing. Overwriting it unconditionally here turns
-            // every crash report into the same useless string, which is exactly
-            // why two field logs (14, 15) show "panic in Aether native core" with
-            // no location. Fall back to it only when the hook never ran — a panic
-            // on a thread the hook was not installed for.
-            let existing = LAST_ERROR.lock().map(|g| g.to_str().unwrap_or("").to_string()).unwrap_or_default();
-            if existing.is_empty() {
-                set_last_error("panic in Aether native core");
-            }
-            -3
-        }
-    }
-}
-
-/// Loads or provisions account identity and stores JSON addresses in last_result.
-#[no_mangle]
-pub unsafe extern "C" fn aether_prepare_json(json: *const c_char) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let options = match unsafe { options_from_json(json) } {
-            Ok(options) => options,
-            Err(error) => {
-                set_last_error(error);
-                return -1;
-            }
-        };
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                set_last_error(error);
-                return -2;
-            }
-        };
-
-        match runtime.block_on(crate::prepare(&options)) {
-            Ok(TunnelAddresses {
-                ipv4,
-                ipv6,
-                gateway_proxy,
-                organization,
-            }) => {
-                set_last_result(serde_json::json!({
-                    "ipv4": ipv4,
-                    "ipv6": ipv6,
-                    "gateway_proxy": gateway_proxy,
-                    "organization": organization,
-                }));
-                0
-            }
-            Err(error) => {
-                set_last_error(error);
-                -2
-            }
-        }
-    }));
-
-    match result {
-        Ok(code) => code,
-        Err(_) => {
-            let existing = LAST_ERROR.lock().map(|g| g.to_str().unwrap_or("").to_string()).unwrap_or_default();
-            if existing.is_empty() {
-                set_last_error("panic in Aether native core");
-            }
-            -3
-        }
-    }
-}
-
-unsafe fn required_text(value: *const c_char, name: &str) -> Result<String, String> {
-    if value.is_null() {
-        return Err(format!("{name} is required"));
-    }
-    let value = unsafe { CStr::from_ptr(value) }
-        .to_str()
-        .map_err(|error| format!("{name} is not UTF-8: {error}"))?
-        .trim()
-        .to_string();
-    if value.is_empty() {
-        Err(format!("{name} is required"))
-    } else {
-        Ok(value)
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn aether_zt_request_email_code(
-    team: *const c_char,
-    email: *const c_char,
-) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let team = match unsafe { required_text(team, "team") } {
-            Ok(value) => value,
-            Err(error) => {
-                set_last_error(error);
-                return -1;
-            }
-        };
-        let email = match unsafe { required_text(email, "email") } {
-            Ok(value) => value,
-            Err(error) => {
-                set_last_error(error);
-                return -1;
-            }
-        };
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                set_last_error(error);
-                return -2;
-            }
-        };
-        match runtime.block_on(crate::zerotrust::request_email_code(&team, &email)) {
-            Ok(()) => {
-                set_last_error("");
-                0
-            }
-            Err(error) => {
-                set_last_error(error);
-                -2
-            }
-        }
-    }));
-    result.unwrap_or_else(|_| {
-        set_last_error("panic while requesting the Zero Trust email code");
-        -3
     })
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn aether_zt_confirm_email_code(code: *const c_char) -> i32 {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let code = match unsafe { required_text(code, "code") } {
-            Ok(value) => value,
-            Err(error) => {
-                set_last_error(error);
-                return -1;
+pub unsafe extern "C" fn aether_core_start(arguments: *const c_char) -> *mut c_char {
+    respond(|| {
+        let arguments: Vec<String> = if arguments.is_null() {
+            Vec::new()
+        } else {
+            let text = unsafe { read_str(arguments) }?;
+            match text.trim().is_empty() {
+                true => Vec::new(),
+                false => serde_json::from_str(&text).map_err(|e| {
+                    format!("the argument list is not a json array of strings: {e}")
+                })?,
             }
         };
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                set_last_error(error);
-                return -2;
+
+        spawn_job(move |cancel| async move {
+            let attempt = crate::run_with(arguments);
+            tokio::select! {
+                biased;
+                _ = cancel.wait() => Ok(json!({"state": "stopped"})),
+                outcome = attempt => match outcome {
+                    Ok(()) => Ok(json!({"state": "closed"})),
+                    Err(e) => Err(describe(e)),
+                },
             }
-        };
-        match runtime.block_on(crate::zerotrust::confirm_email_code(&code)) {
-            Ok(token) => {
-                set_last_result(serde_json::json!({ "token": token }));
-                set_last_error("");
-                0
-            }
-            Err(error) => {
-                set_last_error(error);
-                -2
-            }
-        }
-    }));
-    result.unwrap_or_else(|_| {
-        set_last_error("panic while confirming the Zero Trust email code");
-        -3
+        })
     })
 }
 
-/// Returns the most recent native error. Copy it before another native call.
 #[no_mangle]
-pub extern "C" fn aether_last_error() -> *const c_char {
-    LAST_ERROR.lock().unwrap().as_ptr()
+pub unsafe extern "C" fn aether_team_sign_in(payload: *const c_char) -> *mut c_char {
+    respond(|| {
+        let payload: TeamPayload = unsafe { read_json(payload) }?;
+        let credentials = payload.credentials()?;
+
+        spawn_job(move |_| async move {
+            let token = api::team_sign_in(&credentials).await.map_err(describe)?;
+            Ok(json!({"token": token}))
+        })
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn aether_last_result() -> *const c_char {
-    LAST_RESULT.lock().unwrap().as_ptr()
+pub unsafe extern "C" fn aether_team_code_request(payload: *const c_char) -> *mut c_char {
+    respond(|| {
+        let payload: TeamPayload = unsafe { read_json(payload) }?;
+        let email = payload
+            .email
+            .clone()
+            .ok_or_else(|| "an email address is needed to request a login code".to_string())?;
+        let credentials = payload.credentials()?;
+
+        spawn_job(move |_| async move {
+            let session = api::team_email_code_request(&credentials, &email)
+                .await
+                .map_err(describe)?;
+            let email = session.email().to_string();
+            let id = next_id();
+            sessions()
+                .lock()
+                .insert(id, Arc::new(tokio::sync::Mutex::new(session)));
+            Ok(json!({"session": id, "email": email}))
+        })
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn aether_last_log() -> *const c_char {
-    LAST_LOG.lock().unwrap().as_ptr()
+pub extern "C" fn aether_team_code_resend(session: u64) -> *mut c_char {
+    respond(|| {
+        let session = session_of(session)?;
+
+        spawn_job(move |_| async move {
+            let mut guard = session.lock().await;
+            api::team_email_code_resend(&mut guard)
+                .await
+                .map_err(describe)?;
+            Ok(json!({"sent": true}))
+        })
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn aether_version() -> *const c_char {
-    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
+pub unsafe extern "C" fn aether_team_code_submit(session: u64, code: *const c_char) -> *mut c_char {
+    respond(|| {
+        let code = unsafe { read_str(code) }?;
+        let session = session_of(session)?;
+
+        spawn_job(move |_| async move {
+            let guard = session.lock().await;
+            let token = api::team_email_code_submit(&guard, &code)
+                .await
+                .map_err(describe)?;
+            match token {
+                Some(token) => Ok(json!({"signed_in": true, "token": token})),
+                None => Ok(json!({"signed_in": false})),
+            }
+        })
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn aether_set_socket_protector(protector: Option<platform::SocketProtector>) {
-    platform::set_socket_protector(protector);
-}
-
-/// Requests shutdown of the active native tunnel. Returns 1 if running, else 0.
-#[no_mangle]
-pub extern "C" fn aether_stop() -> i32 {
-    if !RUNNING.load(Ordering::Acquire) {
-        return 0;
-    }
-
-    STOP_REQUESTED.store(true, Ordering::Release);
-    stop_notify().notify_waiters();
-    1
+pub extern "C" fn aether_team_session_free(id: u64) -> *mut c_char {
+    respond(|| {
+        sessions().lock().remove(&id);
+        Ok(json!({"freed": id}))
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn aether_is_running() -> i32 {
-    i32::from(RUNNING.load(Ordering::Acquire))
+pub unsafe extern "C" fn aether_team_token_set(token: *const c_char) -> *mut c_char {
+    respond(|| {
+        let token = unsafe { read_str(token) }?;
+        let runtime = runtime().ok_or_else(|| "could not start the async runtime".to_string())?;
+        runtime
+            .block_on(api::team_use_token(&token))
+            .map_err(describe)?;
+        Ok(json!({"stored": true}))
+    })
 }
 
 #[no_mangle]
-pub extern "C" fn aether_is_ready() -> i32 {
-    i32::from(READY.load(Ordering::Acquire))
-}
-
-pub(crate) fn mark_ready() {
-    READY.store(true, Ordering::Release);
-    emit_status("connected", None);
+pub extern "C" fn aether_team_token_clear() -> *mut c_char {
+    respond(|| {
+        let runtime = runtime().ok_or_else(|| "could not start the async runtime".to_string())?;
+        runtime.block_on(api::team_forget_token());
+        Ok(json!({"cleared": true}))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn take(raw: *mut c_char) -> Value {
+        assert!(!raw.is_null(), "the reply pointer must not be null");
+        let text = unsafe { CStr::from_ptr(raw) }
+            .to_str()
+            .expect("utf-8 reply")
+            .to_string();
+        unsafe { aether_string_free(raw) };
+        serde_json::from_str(&text).expect("the reply must be json")
+    }
+
+    fn text_of(value: &str) -> CString {
+        CString::new(value).expect("no null bytes")
+    }
+
     #[test]
-    fn the_panic_hook_keeps_the_message_instead_of_losing_it() {
-        // A panic in the native core is the difference between a crash report
-        // a user can paste and "the tunnel died". The hook has to survive the
-        // round trip through catch_unwind with its payload intact.
-        install_panic_hook();
-        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            panic!("the field log should show this exact string");
+    fn the_version_comes_back_as_json() {
+        let reply = take(aether_version());
+        assert_eq!(reply["ok"], json!(true));
+        assert_eq!(reply["version"], json!(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn freeing_a_null_string_is_harmless() {
+        unsafe { aether_string_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn a_null_payload_is_reported_instead_of_crashing() {
+        let reply = take(unsafe { aether_identity_open(std::ptr::null()) });
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"].as_str().unwrap().contains("null"));
+    }
+
+    #[test]
+    fn a_payload_that_is_not_json_is_reported() {
+        let payload = text_of("not json at all");
+        let reply = take(unsafe { aether_identity_open(payload.as_ptr()) });
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"].as_str().unwrap().contains("usable json"));
+    }
+
+    #[test]
+    fn an_unknown_identity_is_reported() {
+        let reply = take(aether_identity_summary(999_999));
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("no identity 999999"));
+    }
+
+    #[test]
+    fn an_unknown_job_is_reported() {
+        let reply = take(aether_job_poll(999_999));
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"].as_str().unwrap().contains("no job 999999"));
+    }
+
+    #[test]
+    fn freeing_a_job_that_was_never_there_is_not_an_error() {
+        let reply = take(aether_job_free(999_999));
+        assert_eq!(reply["ok"], json!(true));
+        assert_eq!(reply["freed"], Value::Null);
+    }
+
+    #[test]
+    fn a_bad_team_name_is_rejected_before_any_request_is_made() {
+        let payload = text_of("{\"team\":\"bad name!\"}");
+        let reply = take(unsafe { aether_team_sign_in(payload.as_ptr()) });
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"].as_str().unwrap().contains("not a usable"));
+    }
+
+    #[test]
+    fn requesting_a_code_without_an_email_is_rejected() {
+        let payload = text_of("{\"team\":\"acme\"}");
+        let reply = take(unsafe { aether_team_code_request(payload.as_ptr()) });
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"].as_str().unwrap().contains("email"));
+    }
+
+    #[test]
+    fn a_token_that_is_not_a_jwt_is_refused() {
+        let token = text_of("not-a-jwt");
+        let reply = take(unsafe { aether_team_token_set(token.as_ptr()) });
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"].as_str().unwrap().contains("jwt"));
+    }
+
+    #[test]
+    fn a_job_runs_to_completion_and_can_be_polled() {
+        let started = respond(|| spawn_job(|_| async { Ok(json!({"done": true})) }));
+        let started = take(started);
+        assert_eq!(started["ok"], json!(true));
+        let id = started["job"].as_u64().expect("a job id");
+
+        let mut result = Value::Null;
+        for _ in 0..200 {
+            let polled = take(aether_job_poll(id));
+            if polled["state"] == json!("done") {
+                result = polled["result"].clone();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["done"], json!(true));
+        take(aether_job_free(id));
+    }
+
+    #[test]
+    fn a_job_that_panics_is_reported_instead_of_hanging() {
+        let started = take(respond(|| {
+            spawn_job(|_| async { panic!("the job blew up") })
         }));
-        assert!(payload.is_err());
-        let stored = last_error_for_test();
-        assert!(
-            stored.contains("the field log should show this exact string"),
-            "the hook must keep the panic message, got: {stored}"
-        );
-        assert!(
-            stored.contains("PANIC"),
-            "must be tagged for grep, got: {stored}"
-        );
+        let id = started["job"].as_u64().expect("a job id");
+
+        let mut result = Value::Null;
+        for _ in 0..200 {
+            let polled = take(aether_job_poll(id));
+            if polled["state"] == json!("done") {
+                result = polled["result"].clone();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["error"], json!("the core panicked"));
+        take(aether_job_free(id));
     }
 
     #[test]
-    fn a_caught_panic_keeps_the_hook_message_and_is_not_overwritten() {
-        // The catch_unwind handler used to call set_last_error("panic in Aether
-        // native core") unconditionally, which clobbered the "PANIC file:line:
-        // payload" the hook had just stored. Two field logs arrived with the
-        // generic string and no location, so this is the regression that made
-        // an overnight crash undiagnosable. The handler now defers to the hook
-        // and only falls back when nothing was stored.
-        install_panic_hook();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            panic!("run_warp_in_warp: forwarder guard dropped out of order");
+    fn a_cancelled_job_reports_that_it_was_cancelled() {
+        let started = take(respond(|| {
+            spawn_job(|cancel| async move {
+                cancel.wait().await;
+                Err("cancelled".to_string())
+            })
         }));
-        assert!(result.is_err(), "the panic must be caught, not escape");
-        let stored = last_error_for_test();
-        assert!(
-            stored.contains("run_warp_in_warp: forwarder guard dropped out of order"),
-            "the hook message must survive the catch, got: {stored}"
-        );
-        assert!(
-            !stored.trim().eq("panic in Aether native core"),
-            "the generic fallback must not overwrite a real panic message"
-        );
+        let id = started["job"].as_u64().expect("a job id");
+
+        take(aether_job_cancel(id));
+
+        let mut result = Value::Null;
+        for _ in 0..200 {
+            let polled = take(aether_job_poll(id));
+            if polled["state"] == json!("done") {
+                result = polled["result"].clone();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["error"], json!("cancelled"));
+        take(aether_job_free(id));
     }
 
     #[test]
-    fn parses_android_start_options() {
-        let native: NativeStartOptions = serde_json::from_str(
-            r#"{"config_path":"/data/user/0/app/files/aether.toml","protocol":"masque","masque_transport":"h2"}"#,
-        )
-        .unwrap();
-        let options = StartOptions::try_from(native).unwrap();
-
-        assert_eq!(options.protocol, Protocol::Masque);
-        assert_eq!(options.masque_transport, MasqueTransport::H2);
-        assert_eq!(options.listen, "127.0.0.1:1819".parse().unwrap());
-        assert_eq!(options.scan_mode, ScanMode::Balanced);
-        assert_eq!(options.tls_curve_preset, TlsCurvePreset::Chrome);
-        assert!(options.wireguard_data_check);
+    fn the_core_refuses_an_argument_list_that_is_not_a_json_array() {
+        let payload = text_of("--socks 127.0.0.1:1819");
+        let reply = take(unsafe { aether_core_start(payload.as_ptr()) });
+        assert_eq!(reply["ok"], json!(false));
+        assert!(reply["error"].as_str().unwrap().contains("json array"));
     }
 
     #[test]
-    fn parses_advanced_android_start_options() {
-        let native: NativeStartOptions = serde_json::from_str(
-            r#"{"config_path":"aether.toml","tls_curve_preset":"compatibility","wireguard_data_check":false,"log_level":"debug","perf_profile":"high","h2_fragmentation":true,"dns_servers":"9.9.9.9","route_block":"ads.example","team":"acme","gateway":true}"#,
-        )
-        .unwrap();
-        let options = StartOptions::try_from(native).unwrap();
-
-        assert_eq!(options.tls_curve_preset, TlsCurvePreset::Compatibility);
-        assert!(!options.wireguard_data_check);
-        assert_eq!(options.log_level.as_deref(), Some("debug"));
-        assert_eq!(options.perf_profile.as_deref(), Some("high"));
-        assert_eq!(options.h2_fragmentation, Some(true));
-        assert_eq!(options.dns_servers.as_deref(), Some("9.9.9.9"));
-        assert_eq!(options.route_block.as_deref(), Some("ads.example"));
-        assert_eq!(options.team.as_deref(), Some("acme"));
-        assert!(options.gateway);
+    fn an_unparsable_socks_address_is_reported() {
+        let payload = text_of("{\"peer\":\"1.2.3.4:443\",\"socks\":\"not-an-address\"}");
+        let reply = take(unsafe { aether_tunnel_start(1, payload.as_ptr()) });
+        assert_eq!(reply["ok"], json!(false));
     }
 
     #[test]
-    fn rejects_missing_config_path() {
-        let native: NativeStartOptions = serde_json::from_str("{}").unwrap();
-        assert!(StartOptions::try_from(native).is_err());
+    fn an_unparsable_peer_is_reported() {
+        let payload = text_of("{\"peer\":\"nonsense\"}");
+        let reply = take(unsafe { aether_verify_start(1, payload.as_ptr()) });
+        assert_eq!(reply["ok"], json!(false));
+    }
+
+    /// The result of the job `started` names, once it is done, within `wait`.
+    fn finished(started: Value, wait: std::time::Duration) -> Value {
+        assert_eq!(started["ok"], json!(true), "{started}");
+        let id = started["job"].as_u64().expect("a job id");
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            let polled = take(aether_job_poll(id));
+            if polled["state"] == json!("done") {
+                take(aether_job_free(id));
+                return polled["result"].clone();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("job {id} was not done within {wait:?}");
     }
 
     #[test]
-    fn parses_forced_inner_peer() {
-        // The nested transports read this to give the second hop its own edge.
-        // A bad value here is a hard start failure, not a silent no-op.
-        let native: NativeStartOptions = serde_json::from_str(
-            r#"{"config_path":"aether.toml","forced_peer":"188.114.96.96:890","forced_inner_peer":"162.159.198.1:443"}"#,
-        )
-        .unwrap();
-        let options = StartOptions::try_from(native).unwrap();
+    fn a_job_that_asks_for_ech_does_not_start_without_a_key_it_can_offer() {
+        // The lookup would go through AETHER_UPSTREAM, and a check through the TLS options.
+        let runtime = runtime().expect("the runtime");
+        let _setting = runtime.block_on(crate::upstream::hold_setting());
+        let _options = runtime.block_on(crate::tls::hold_options());
+        // The one test that names the resolver of the ECH lookup: an address that turns the
+        // connection down, so that the lookup fails.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let resolver = closed.local_addr().expect("its address");
+        drop(closed);
+        std::env::set_var("AETHER_ECH_DNS", format!("tcp://{resolver}"));
+
+        // WireGuard has no TLS handshake to hide a name in, and a job that does not ask for
+        // ECH looks no key up.
         assert_eq!(
-            options.forced_peer,
-            Some("188.114.96.96:890".parse().unwrap())
+            runtime.block_on(job_ech(true, api::Transport::WireGuard)),
+            Ok(None)
         );
         assert_eq!(
-            options.forced_inner_peer,
-            Some("162.159.198.1:443".parse().unwrap())
+            runtime.block_on(job_ech(false, api::Transport::Masque)),
+            Ok(None)
         );
-    }
 
-    #[test]
-    fn inner_peer_defaults_to_none() {
-        // Nobody who upgrades sets this: the field must be absent-and-None, or
-        // every existing user's WoW would suddenly try to dial a new address.
-        let native: NativeStartOptions = serde_json::from_str(
-            r#"{"config_path":"aether.toml","forced_peer":"188.114.96.96:890"}"#,
-        )
-        .unwrap();
-        let options = StartOptions::try_from(native).unwrap();
-        assert!(options.forced_inner_peer.is_none());
+        let identity = keep_identity(crate::account::handshake_identity())["identity"]
+            .as_u64()
+            .expect("an identity id");
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("a peer");
+        let payload = text_of(&format!(
+            "{{\"peer\":\"{}\",\"socks\":\"127.0.0.1:0\",\"ech\":true}}",
+            peer.local_addr().expect("its address")
+        ));
+        let verify = take(unsafe { aether_verify_start(identity, payload.as_ptr()) });
+        let tunnel = take(unsafe { aether_tunnel_start(identity, payload.as_ptr()) });
+        for started in [verify, tunnel] {
+            let result = finished(started, std::time::Duration::from_secs(30));
+            assert_eq!(result["ok"], json!(false), "{result}");
+            let error = result["error"].as_str().expect("an error");
+            assert!(error.contains(crate::tls::NO_ECH_KEY), "{error}");
+        }
+        std::env::remove_var("AETHER_ECH_DNS");
+        identities().lock().remove(&identity);
+
+        // Neither job sent the peer anything.
+        peer.set_nonblocking(true).expect("non-blocking");
+        let mut packet = [0u8; 2048];
+        assert!(peer.recv_from(&mut packet).is_err());
     }
 }

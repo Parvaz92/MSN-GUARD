@@ -223,13 +223,6 @@ impl RuleSet {
         self.block.is_empty() && self.direct.is_empty()
     }
 
-    /// Whether any rule in this set names a *domain* rather than an address or
-    /// a port.
-    ///
-    /// This is what decides whether a TUN front end has to peek at the
-    /// ClientHello at all. Address and port rules work on the IP the SYN
-    /// already carries; only domain rules need the name read off the wire. So
-    /// when this is false, the sniff path costs nothing and is never taken.
     pub fn has_domain_rules(&self) -> bool {
         self.block.iter().chain(self.direct.iter()).any(|rule| {
             matches!(
@@ -442,6 +435,16 @@ mod tests {
         assert!(is_private("fd00::1".parse().unwrap()));
         assert!(is_private("fe80::1".parse().unwrap()));
         assert!(!is_private("2606:4700::1111".parse().unwrap()));
+    }
+
+    #[test]
+    fn domain_rules_are_reported_so_a_tunnel_can_recover_the_name() {
+        assert!(!rules("", "").has_domain_rules());
+        assert!(!rules("10.0.0.0/8, port:25", "private").has_domain_rules());
+        assert!(rules("ads.example", "").has_domain_rules());
+        assert!(rules("", "keyword:internal").has_domain_rules());
+        assert!(rules("", r"regexp:^ad[0-9]+\.").has_domain_rules());
+        assert!(rules("full:example.com", "").has_domain_rules());
     }
 
     #[test]

@@ -297,26 +297,22 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-static TOKEN_CACHE: tokio::sync::Mutex<Option<(String, String)>> =
-    tokio::sync::Mutex::const_new(None);
-static PENDING_EMAIL_LOGIN: tokio::sync::Mutex<Option<EmailSignIn>> =
-    tokio::sync::Mutex::const_new(None);
+static TOKEN_CACHE: tokio::sync::Mutex<Option<String>> = tokio::sync::Mutex::const_new(None);
 
 pub async fn resolve_token(settings: &TeamSettings) -> Result<String> {
-    {
-        let mut cache = TOKEN_CACHE.lock().await;
-        if let Some((team, cached)) = cache.as_ref() {
-            if team == &settings.team && !jwt_expired(cached, crate::account::now_unix()) {
-                log::debug!("[zerotrust] reusing the enrolment token from this session");
-                return Ok(cached.clone());
-            }
-            log::debug!("[zerotrust] the cached enrolment token expired; signing in again");
-            *cache = None;
+    let mut cache = TOKEN_CACHE.lock().await;
+
+    if let Some(cached) = cache.as_ref() {
+        if !jwt_expired(cached, crate::account::now_unix()) {
+            log::debug!("[zerotrust] reusing the enrolment token from this session");
+            return Ok(cached.clone());
         }
+        log::debug!("[zerotrust] the cached enrolment token expired; signing in again");
+        *cache = None;
     }
 
     let token = sign_in(settings).await?;
-    *TOKEN_CACHE.lock().await = Some((settings.team.clone(), token.clone()));
+    *cache = Some(token.clone());
     Ok(token)
 }
 
@@ -333,14 +329,16 @@ pub async fn store_token(token: &str) -> Result<()> {
             "that token has already expired; sign in again to get a fresh one".into(),
         ));
     }
-    *TOKEN_CACHE.lock().await = Some((String::new(), token.to_string()));
+    *TOKEN_CACHE.lock().await = Some(token.to_string());
     Ok(())
 }
 
 pub async fn cached_token() -> Option<String> {
-    TOKEN_CACHE.lock().await.clone().and_then(|(_, token)| {
-        (!jwt_expired(&token, crate::account::now_unix())).then_some(token)
-    })
+    TOKEN_CACHE
+        .lock()
+        .await
+        .clone()
+        .filter(|token| !jwt_expired(token, crate::account::now_unix()))
 }
 
 pub async fn clear_token() {
@@ -361,7 +359,10 @@ async fn sign_in(settings: &TeamSettings) -> Result<String> {
                 "the supplied access token has expired; sign in again to get a fresh one".into(),
             ));
         }
-        log::info!("[+] using the access token supplied for team {}", settings.team);
+        log::info!(
+            "[+] using the access token supplied for team {}",
+            settings.team
+        );
         return Ok(token.clone());
     }
 
@@ -384,12 +385,23 @@ async fn sign_in(settings: &TeamSettings) -> Result<String> {
 }
 
 fn access_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(crate::consts::UA_REGISTER)
-        .timeout(AUTH_TIMEOUT)
-        .cookie_store(true)
-        .build()
-        .map_err(|e| AetherError::Api(format!("access client: {e}")))
+    through_upstream(
+        reqwest::Client::builder()
+            .user_agent(crate::consts::UA_REGISTER)
+            .timeout(AUTH_TIMEOUT)
+            // TLS server-certificate verification disabled (unconditional).
+            .danger_accept_invalid_certs(true)
+            .cookie_store(true),
+    )?
+    .build()
+    .map_err(|e| AetherError::Api(format!("access client: {e}")))
+}
+
+fn through_upstream(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder> {
+    match crate::upstream::configured() {
+        Some(upstream) => Ok(builder.proxy(upstream.as_reqwest_proxy()?)),
+        None => Ok(builder),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -425,7 +437,7 @@ impl EmailSignIn {
 
     pub async fn resend_code(&mut self) -> Result<()> {
         if let Some(nonce) =
-            send_email_code(&self.client, &self.verify_url, &self.email, None).await?
+            request_email_code(&self.client, &self.verify_url, &self.email, None).await?
         {
             self.nonce = nonce;
         }
@@ -498,7 +510,7 @@ pub async fn begin_email_signin(settings: &TeamSettings, email: &str) -> Result<
         ))
     })?;
 
-    let nonce = send_email_code(&client, &verify_url, email, Some(&login_url))
+    let nonce = request_email_code(&client, &verify_url, email, Some(&login_url))
         .await?
         .ok_or_else(|| {
             AetherError::Api(
@@ -517,43 +529,7 @@ pub async fn begin_email_signin(settings: &TeamSettings, email: &str) -> Result<
     })
 }
 
-/// Android FFI: start an email OTP session and remember it for `confirm_email_code`.
-pub async fn request_email_code(team: &str, email: &str) -> Result<()> {
-    let team = normalize_team(team)
-        .ok_or_else(|| AetherError::Api("enter a valid Zero Trust team name".into()))?;
-    let email = email.trim();
-    if email.is_empty() || !email.contains('@') {
-        return Err(AetherError::Api("enter a valid email address".into()));
-    }
-    let settings = TeamSettings {
-        team,
-        email: Some(email.to_string()),
-        ..Default::default()
-    };
-    let session = begin_email_signin(&settings, email).await?;
-    *PENDING_EMAIL_LOGIN.lock().await = Some(session);
-    Ok(())
-}
-
-/// Android FFI: submit the emailed OTP for the pending session.
-pub async fn confirm_email_code(code: &str) -> Result<String> {
-    let mut pending = PENDING_EMAIL_LOGIN.lock().await;
-    let session = pending.as_mut().ok_or_else(|| {
-        AetherError::Api("request a fresh email code before confirming it".into())
-    })?;
-    match session.submit_code(code).await? {
-        CodeOutcome::Token(token) => {
-            *TOKEN_CACHE.lock().await = Some((session.team().to_string(), token.clone()));
-            *pending = None;
-            Ok(token)
-        }
-        CodeOutcome::Rejected(status) => Err(AetherError::Api(format!(
-            "the login code was not accepted (status {status}); check it or request a fresh code"
-        ))),
-    }
-}
-
-async fn send_email_code(
+async fn request_email_code(
     client: &reqwest::Client,
     verify_url: &str,
     email: &str,
@@ -694,12 +670,16 @@ async fn fetch_token_with_service_token(settings: &TeamSettings) -> Result<Strin
         settings.team_domain()
     );
 
-    let client = reqwest::Client::builder()
-        .user_agent(crate::consts::UA_REGISTER)
-        .timeout(AUTH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| AetherError::Api(format!("access client: {e}")))?;
+    let client = through_upstream(
+        reqwest::Client::builder()
+            .user_agent(crate::consts::UA_REGISTER)
+            .timeout(AUTH_TIMEOUT)
+            // TLS server-certificate verification disabled (unconditional).
+            .danger_accept_invalid_certs(true)
+            .redirect(reqwest::redirect::Policy::none()),
+    )?
+    .build()
+    .map_err(|e| AetherError::Api(format!("access client: {e}")))?;
 
     let response = client
         .get(&url)
