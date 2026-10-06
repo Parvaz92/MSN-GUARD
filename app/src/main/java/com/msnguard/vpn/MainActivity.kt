@@ -7124,6 +7124,9 @@ class MainActivity : Activity() {
         val next = autoScanIndex + 1
         if (next >= AUTO_SCAN_LADDER.size) {
             ConnectionLog.record("Auto Scan: no transport carried traffic on this network")
+            // Latch even when nothing carried: the scan is done either way.
+            // Otherwise every later cold start repeats the whole ladder.
+            preferences().edit().putBoolean(AUTO_SCAN_DONE, true).apply()
             endAutoScan(restoreSelection = true)
             return false
         }
@@ -7172,34 +7175,14 @@ class MainActivity : Activity() {
      * starts at the connect and the gate runs after the handshake.
      */
     private fun autoScanBudgetMs(protocol: Protocol): Long = when (protocol) {
-        // On a fresh install the WARP transports have to register through SHARD
-        // before they can handshake, and that is what this budget has to cover:
-        // raising xray, racing the pool, the registration itself, then the scan.
-        // 32 s fit only the scan, so on a phone with no saved identity the ladder
-        // gave up on WireGuard before the identity it was waiting for had landed —
-        // the scan advanced to MASQUE, which then connected on the identity SHARD
-        // had just fetched, and WireGuard looked broken when it had only been
-        // timed out.
-        Protocol.WIREGUARD -> if (!IdentityProvisioner.hasIdentity(this, "wireguard")) {
-            120_000L
-        } else {
-            32_000L
-        }
-        // Same reasoning for the other WARP transports: without an identity they
-        // all have to register through SHARD first, and their budgets were sized
-        // for a phone that already had one.
-        Protocol.MASQUE -> if (!IdentityProvisioner.hasIdentity(this, "masque")) {
-            120_000L
-        } else if (CoreConfig.mimArmed(this)) {
-            75_000L
-        } else {
-            48_000L
-        }
-        Protocol.WARP_IN_WARP -> if (!IdentityProvisioner.hasIdentity(this, "gool")) {
-            120_000L
-        } else {
-            55_000L
-        }
+        // ECH fast lane: with AETHER_ECH=auto the WARP transports no longer raise
+        // SHARD to fetch a missing identity — the engine fetches the
+        // ECHConfigList and registers on its own link, exactly as in the FCAE
+        // log. So the old "hasIdentity → 120s" branch never fires and the scan
+        // budget is always the fast one: the fresh-install penalty is gone.
+        Protocol.WIREGUARD -> 32_000L
+        Protocol.MASQUE -> if (CoreConfig.mimArmed(this)) 75_000L else 48_000L
+        Protocol.WARP_IN_WARP -> 55_000L
         else -> 45_000L
     }
 

@@ -316,12 +316,32 @@ object CoreConfig {
             out["AETHER_MASQUE_H2_FRAGMENT"] = "1"
         }
 
-        // Identity provisioning through SHARD. When the carrier has blocked the
-        // account API, this points the core's registration at a SOCKS listener
-        // that is already on the open internet, so a fresh install can obtain an
-        // identity it could not get from its own link. The engine reads a
-        // socks5:// URL in AETHER_UPSTREAM.
-        if (socksProxyForCore.isNotBlank()) {
+        // Distributed identity via ECH — EXACTLY as FCAE does.
+        // FCAE never raised SHARD and never set AETHER_UPSTREAM for a fresh
+        // install; its log says:
+        //   fetched ECHConfigList (71 bytes) for cloudflare-ech.com via udp://1.1.1.1:53
+        //   fetched ECHConfigList automatically for the WARP API (71 bytes)
+        //   registration went over ECH
+        // That path is inside the engine: with AETHER_ECH=auto the engine
+        // looks the ECHConfigList up over udp://1.1.1.1:53 for
+        // cloudflare-ech.com and offers it on the api.cloudflareclient.com
+        // ClientHello, so the register goes encrypted and is not named on the
+        // wire. On a filtered carrier it is the ONLY way the API answers.
+        // Enabling it is the whole fix for (1) and (3): the engine provisions
+        // on its own link, no SHARD session, no probe, no timeout.
+        if (socksProxyForCore.isBlank()) {
+            if (text("aether_ech", "").isBlank()) {
+                out["AETHER_ECH"] = "auto"
+            } else {
+                out["AETHER_ECH"] = text("aether_ech", "auto")
+            }
+            // Same for the AETHER_UPSTREAM comment above: with AETHER_ECH the
+            // carrier no longer dictates an uplink for the account API.
+            // AETHER_UPSTREAM is kept only for the two transports that have no
+            // account at all (Psiphon, Tor) and for the case a future setting
+            // explicitly wants a proxy — otherwise it stays unset, exactly as
+            // in the FCAE run whose log you sent.
+        } else if (socksProxyForCore.isNotBlank()) {
             out["AETHER_UPSTREAM"] = socksProxyForCore
         }
 
