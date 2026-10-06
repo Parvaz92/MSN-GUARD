@@ -10,15 +10,15 @@ val targetAbis = (project.findProperty("targetAbi") as String?)
     ?.map(String::trim)
     ?.filter(String::isNotEmpty)
     ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-// Parvaz VPN: an empty or missing keystore (a fork without the AETHERY_* secrets)
-// is treated as "no key", so the build falls back to debug signing below instead
-// of failing.
+
 val releaseKeystore = (project.findProperty("aetheryKeystore") as String?)
     ?.takeIf { rootProject.file(it).let { f -> f.isFile && f.length() > 0 } }
 
 kotlin {
     compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        // GitHub Actions installs JDK 21. Match it directly so Kotlin does not
+        // ask Gradle/Foojay to provision another JVM.
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
     }
 }
 
@@ -29,15 +29,11 @@ android {
     ndkVersion = "26.3.11579264"
 
     defaultConfig {
-        // Parvaz VPN: own application ID so it installs next to MSN-GUARD.
-        // The Kotlin package (namespace) stays com.msnguard.vpn to keep JNI and
-        // upstream merges intact.
         applicationId = "com.parvaz.vpn"
         minSdk = 26
         targetSdk = 36
         versionCode = 275
         versionName = "2.3.7"
-
     }
 
     splits {
@@ -57,38 +53,16 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
 
     androidResources {
-        // Fonts deflate well (~30-40%); letting AAPT compress them keeps the
-        // arm64 APK under Telegram's 50 MB document cap while load cost stays
-        // negligible (ResourcesCompat caches the Typeface).
-        // noCompress is intentionally NOT set for ttf.
+        // Keep font compression enabled to reduce APK size.
     }
 
     packaging {
         jniLibs {
-            // REQUIRED for Tor. Not a size tweak — the feature does not work
-            // without it.
-            //
-            // libtor.so and libobfs4proxy.so are executables that we exec() as
-            // processes, because the built libtor.so exports no tor_run_main to
-            // dlopen. Android 10+ forbids exec() from the app's writable home
-            // directory (a W^X violation), and the only place a packaged binary
-            // may be executed from is the read-only nativeLibraryDir under
-            // /data/app.
-            //
-            // AGP 8 defaults this to false, which leaves native libs compressed
-            // inside the APK and mapped straight out of it — nothing is ever
-            // written to nativeLibraryDir, so there is no file to exec and Tor
-            // fails with ENOENT no matter how correct the binary is.
-            //
-            // Side effect, in our favour: legacy packaging stores the libs
-            // deflated instead of uncompressed, so the APK gets smaller even
-            // with Tor added. The cost moves to installed size, since the system
-            // then keeps an extracted copy alongside the APK.
             useLegacyPackaging = true
         }
     }
@@ -96,9 +70,7 @@ android {
     if (releaseKeystore != null) {
         val envProps = Properties().apply {
             val envFile = rootProject.file("keystore.env")
-            if (envFile.exists()) {
-                envFile.inputStream().use { load(it) }
-            }
+            if (envFile.exists()) envFile.inputStream().use { load(it) }
         }
         signingConfigs {
             create("release") {
@@ -109,12 +81,6 @@ android {
                     ?: envProps.getProperty("keyAlias")
                 keyPassword = System.getenv("AETHERY_KEY_PASSWORD")
                     ?: envProps.getProperty("keyPassword")
-                // Anti-malware engines (Avast in particular) unpack an APK as a
-                // JAR to scan it, and a JAR without a v1 signature cannot be
-                // verified at all — that surfaces to the user as "Suspicious".
-                // v2 alone is valid for an Android install, so this only ever
-                // mattered to scanners. Sign with both: v1 for the JAR view,
-                // v2 for Android's own install integrity check.
                 enableV1Signing = true
                 enableV2Signing = true
             }
@@ -126,9 +92,6 @@ android {
             isDebuggable = false
         }
     } else {
-        // Parvaz VPN: no release key configured. Sign with the debug key so the
-        // release APKs are still installable. Add the AETHERY_* repository
-        // secrets to get a permanent key (needed for in-place updates).
         buildTypes.named("release") {
             signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
@@ -138,22 +101,20 @@ android {
     }
 }
 
-    dependencies {
+dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("com.google.android.material:material:1.12.0")
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
 }
 
-// Parvaz VPN: apply the brand (name, update source, artwork) before every build.
-// See tools/rebrand.sh; it is idempotent.
-val parvazRebrand = tasks.register<Exec>("parvazRebrand") {
+val yektaRebrand = tasks.register<Exec>("yektaRebrand") {
     group = "build"
-    description = "Applies Parvaz VPN branding (tools/rebrand.sh)"
+    description = "Applies Yekta VPN branding"
     onlyIf { !org.gradle.internal.os.OperatingSystem.current().isWindows }
     commandLine("bash", rootProject.file("tools/rebrand.sh").absolutePath)
 }
-tasks.named("preBuild").configure { dependsOn(parvazRebrand) }
+tasks.named("preBuild").configure { dependsOn(yektaRebrand) }
 
 targetAbis.forEach { abi ->
     val taskName = "buildRustCore${abi.split('-').joinToString("") { it.replaceFirstChar(Char::uppercase) }}"
@@ -166,12 +127,7 @@ targetAbis.forEach { abi ->
             rootProject.file("core/build-android.sh")
         }
         if (org.gradle.internal.os.OperatingSystem.current().isWindows) {
-            commandLine(
-                "powershell.exe",
-                "-ExecutionPolicy", "Bypass",
-                "-File", buildScript.absolutePath,
-                "-Abi", abi,
-            )
+            commandLine("powershell.exe", "-ExecutionPolicy", "Bypass", "-File", buildScript.absolutePath, "-Abi", abi)
         } else {
             commandLine("bash", buildScript.absolutePath, "--abi", abi)
         }
@@ -183,8 +139,7 @@ targetAbis.forEach { abi ->
         inputs.file(rootProject.file("core/aether/Cargo.toml"))
         inputs.dir(rootProject.file("core/quiche"))
         inputs.file(buildScript)
-        val output = file("src/main/jniLibs/$abi/libaether.so")
-        outputs.file(output)
+        outputs.file(file("src/main/jniLibs/$abi/libaether.so"))
     }
     tasks.named("preBuild").configure { dependsOn(taskName) }
 }
