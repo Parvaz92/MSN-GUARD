@@ -85,18 +85,9 @@ bool job_finished(unsigned long long id) {
     return text.find("\"state\":\"done\"") != std::string::npos;
 }
 
-// Blocks until the tunnel job ends, then frees the job. Runs on its own
-// worker thread so the caller (the VpnService) stays free to own the TUN.
-void run_job(unsigned long long id) {
-    while (!job_finished(id)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_job_mu);
-        if (g_job == id) g_job = 0;
-    }
-    // Freeing drops the engine's registry entry; the SOCKS/HTTP listeners
-    // are owned by the task behind the job and go with it.
+// Frees the job's registry entry. The SOCKS/HTTP listeners are owned by the
+// task behind the job and go with it, so dropping the job tears them down.
+void free_job(unsigned long long id) {
     const char* reply = aether_job_free(id);
     if (reply != nullptr) aether_string_free(reply);
 }
@@ -181,8 +172,20 @@ Java_com_msnguard_vpn_NativeCore_nativeStart(JNIEnv*, jobject, jstring, jint) {
     g_job = id;
     LOGI("aether_core_start -> job %llu", id);
 
-    // The tunnel runs until cancelled; poll it off the caller's thread.
-    std::thread(run_job, id).detach();
+    // Block until the tunnel exits — the old aether_start_json_with_tun did
+    // exactly this, and every Kotlin caller (the VpnService worker, the chain
+    // ladder) depends on it: the `finally` that tears down the TUN and runs
+    // the reconnect ladder only runs when this returns. Returning immediately
+    // after job creation left the host with a live engine it had already
+    // decided to stop.
+    while (!job_finished(id)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_job_mu);
+        if (g_job == id) g_job = 0;
+    }
+    free_job(id);
     return 0;
 }
 
@@ -205,15 +208,16 @@ Java_com_msnguard_vpn_NativeCore_nativeStop(JNIEnv*, jobject) {
 
     const char* reply = aether_job_cancel(id);
     if (reply != nullptr) aether_string_free(reply);
-    // run_job notices the finished state and frees the job; give it a beat.
-    for (int i = 0; i < 50 && g_job != 0; ++i) {
+    // The blocked nativeStart/nativeStartProxy notices the finished state and
+    // frees the job itself; wait for it so the engine is fully stopped before
+    // the caller tears down its own listener.
+    for (int i = 0; i < 100 && g_job != 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     {
         std::lock_guard<std::mutex> lock(g_job_mu);
         if (g_job == id) {
-            const char* fr = aether_job_free(id);
-            if (fr != nullptr) aether_string_free(fr);
+            free_job(id);
             g_job = 0;
         }
     }
