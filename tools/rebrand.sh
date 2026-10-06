@@ -6,22 +6,12 @@
 # licensed under the GNU Affero General Public License v3.0. This script swaps
 # the user-visible name and artwork right before Gradle compiles, so the large
 # upstream source files stay identical in git and upstream merges stay painless.
-#
-# Deliberately left untouched:
-#   * raw.githubusercontent.com/mbm110/... feeds (node list, smart-split, policy)
-#   * LogCipher.kt / SettingsBackup.kt: file-format markers, not branding
-#   * Kotlin package com.msnguard.vpn and application ID com.parvaz.vpn, so existing
-#     Yekta installations receive updates instead of becoming a second app
-#   * Update checks are pointed at this fork's own GitHub Releases
-#
-# Gradle runs this automatically before every build. It is idempotent.
-# Manual run: bash tools/rebrand.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 BRAND="${BRAND:-Yekta VPN}"
 APP_ID="${APP_ID:-com.parvaz.vpn}"
-REPO="${REPO:-Parvaz92/MSN-GUARD}"
+REPO="${REPO:-Parvaz92/Yekta-VPN}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/app/src/main/java/com/msnguard/vpn"
 RES="$ROOT/app/src/main/res"
