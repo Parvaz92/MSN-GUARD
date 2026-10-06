@@ -99,6 +99,7 @@ Java_com_msnguard_vpn_NativeCore_nativeVersion(JNIEnv* env, jobject) {
     const char* v = aether_version();
     std::string text(v ? v : "");
     if (v) aether_string_free(v);
+    if (!text.empty()) LOGI("aether version: %s", text.c_str());
     return env->NewStringUTF(text.c_str());
 }
 
@@ -179,6 +180,25 @@ Java_com_msnguard_vpn_NativeCore_nativeStart(JNIEnv*, jobject, jstring, jint) {
     }
     LOGI("aether_core_start -> job %llu", id);
 
+    // Report the job's outcome from a detached thread. The engine logs its own
+    // banner through env_logger, but when the job dies before logging anything
+    // (a bad option, a bind failure, a panic) the host sees only -1. This
+    // thread is what makes that visible without blocking start().
+    std::thread([id]() {
+        for (int i = 0; i < 600; i++) {  // up to 60s
+            const char* probe = aether_job_poll(id);
+            if (probe == nullptr) { LOGE("job %llu: poll returned null", id); return; }
+            std::string seen(probe);
+            aether_string_free(probe);
+            if (seen.find("\"state\":\"done\"") != std::string::npos) {
+                LOGE("job %llu finished: %s", id, seen.c_str());
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        LOGE("job %llu: still running after 60s", id);
+    }).detach();
+
     // Non-blocking: return immediately. The tunnel keeps running until
     // nativeStop cancels the job. Polling is done by IsRunning / the
     // watchdog; the worker thread that called start is freed for UI /
@@ -206,10 +226,24 @@ Java_com_msnguard_vpn_NativeCore_nativeStop(JNIEnv*, jobject) {
 
     const char* reply = aether_job_cancel(id);
     if (reply != nullptr) aether_string_free(reply);
-    // Don't block here either — IsRunning will notice the finished job and
-    // free it. A short grace sleep so the SOCKS listener has time to close
-    // before the caller immediately starts a new job on the same port.
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // Wait for the job to actually reach Done. The SOCKS listener is owned by
+    // the task behind the job; cancelling only signals the cancel token, so a
+    // start() that immediately follows would find g_job != 0 ("aether already
+    // running") and the listener still bound on the port the new one needs.
+    // 300 ms is what an orderly shutdown takes; the poll below covers the rest.
+    for (int i = 0; i < 30; i++) {
+        const char* probe = aether_job_poll(id);
+        if (probe == nullptr) break;
+        std::string seen(probe);
+        aether_string_free(probe);
+        if (seen.find("\"state\":\"done\"") != std::string::npos) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    free_job(id);
+    {
+        std::lock_guard<std::mutex> lock(g_job_mu);
+        if (g_job == id) g_job = 0;
+    }
     return 0;
 }
 
@@ -239,7 +273,30 @@ Java_com_msnguard_vpn_NativeCore_nativeIsReady(JNIEnv* env, jobject) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_msnguard_vpn_NativeCore_nativeLastError(JNIEnv* env, jobject) {
-    return env->NewStringUTF("");
+    // 2.3.0 reports failure through the job registry, not a global string. A
+    // dead job's reason is in its Done payload: {"state":"done","result":
+    // {"ok":false,"error":"..."}}. Without this, a tunnel that exits with code
+    // -1 showed the user a bare number and logcat showed nothing either, so a
+    // registration failure looked identical to a port bind failure.
+    unsigned long long id = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_job_mu);
+        id = g_job;
+    }
+    if (id == 0) return env->NewStringUTF("");
+    const char* reply = aether_job_poll(id);
+    if (reply == nullptr) return env->NewStringUTF("");
+    std::string text(reply);
+    aether_string_free(reply);
+    if (text.find("\"ok\":false") == std::string::npos) return env->NewStringUTF("");
+    // Extract the error message.
+    size_t at = text.find("\"error\"");
+    if (at == std::string::npos) return env->NewStringUTF(text.c_str());
+    at = text.find('"', at + 7);
+    if (at == std::string::npos) return env->NewStringUTF(text.c_str());
+    size_t end = text.find('"', at + 1);
+    if (end == std::string::npos) return env->NewStringUTF(text.c_str());
+    return env->NewStringUTF(text.substr(at + 1, end - at - 1).c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL

@@ -7237,6 +7237,13 @@ class MainActivity : Activity() {
 
     /** Clears the scan's state. [restoreSelection] puts the user's own pick back. */
     private fun endAutoScan(restoreSelection: Boolean) {
+        // The scan is over either way — it verified, the ladder ran out, or the
+        // user cancelled it. Latching here is the fix for "Auto Scan runs on
+        // every connect": previously only completeAutoScan() (a rung that
+        // carried traffic) set AUTO_SCAN_DONE, so a cancelled scan or one that
+        // found nothing re-ran the whole ladder on the next tap — 100 times if
+        // the user tapped 100 times.
+        preferences().edit().putBoolean(AUTO_SCAN_DONE, true).apply()
         autoScanIndex = -1
         autoScanToken++
         autoScanSettling = false

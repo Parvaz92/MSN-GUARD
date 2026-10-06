@@ -44,7 +44,21 @@ object NativeCore {
         return ""
     }
 
-    fun start(config: String, tunFd: Int): Int = nativeStart(config, tunFd)
+    fun start(config: String, tunFd: Int): Int {
+        // A leftover job is the difference between a fresh connect and a
+        // reconnect that always fails. nativeStart returns -1 with
+        // "aether already running as job N" whenever g_job != 0, and the engine
+        // sets that the moment aether_core_start replies — so a reconnect that
+        // races its own teardown, or a job whose exit the host has not polled
+        // for yet, hits this on every attempt and the tunnel can never come
+        // back. Cancelling and freeing here is idempotent and is the only way
+        // to make a reconnect a real restart.
+        if (nativeIsRunning()) {
+            android.util.Log.w("NativeCore", "start(): a previous aether job is still registered — cancelling before a new one")
+            nativeStop()
+        }
+        return nativeStart(config, tunFd)
+    }
 
     /**
      * Start the core with no Android TUN, exposing a local SOCKS5 listener.
@@ -56,7 +70,16 @@ object NativeCore {
      *
      * Blocks until the tunnel exits, like [start] — call it on a worker thread.
      */
-    fun startProxy(config: String): Int = nativeStartProxy(config)
+    fun startProxy(config: String): Int {
+        // Same leftover-job guard as start(): this is the path WARP/MASQUE/Gool
+        // actually take in 2.3.0 (the engine owns no TUN), so the reconnect
+        // loop hits this one.
+        if (nativeIsRunning()) {
+            android.util.Log.w("NativeCore", "startProxy(): a previous aether job is still registered — cancelling before a new one")
+            nativeStop()
+        }
+        return nativeStartProxy(config)
+    }
     fun stop(): Int = nativeStop()
     fun isRunning(): Boolean = nativeIsRunning()
     fun isReady(): Boolean = nativeIsReady()
