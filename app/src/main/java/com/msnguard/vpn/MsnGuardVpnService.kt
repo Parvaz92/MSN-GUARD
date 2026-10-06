@@ -3887,6 +3887,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // to the default handler and takes the process down instead of
                     // failing this one rung.
                     try {
+                        // NON-BLOCKING in aether 2.3.0: 0 means the job was
+                        // accepted and is running. Only a non-zero result is a
+                        // failure — reading 0 as an exit made this leg report
+                        // itself dead the instant it started.
                         val result = NativeCore.startProxy(config)
                         if (result != 0 && !stopRequested.get()) {
                             val detail = NativeCore.lastError()
@@ -4463,8 +4467,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // Announcing it now would be the fake-connected bug again — the
                     // listener binds before the tunnel is verified.
                     startWatchdog()
-                    // Blocks until the core exits, exactly like the VPN branch's
-                    // NativeCore.start below.
+                    // NON-BLOCKING in aether 2.3.0: 0 means the job was accepted
+                    // and is running, not that the core exited. See the VPN
+                    // branch for the full reasoning; the same inversion applies
+                    // here, and this proxy path had it too.
                     val proxyResult = NativeCore.startProxy(effectiveConfig)
                     // Teardown is NOT done here. `return@execute` from inside a try
                     // still runs the shared `finally`, so detaching, flushing the
@@ -4473,7 +4479,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // double-schedule the reconnect: the finally re-reads
                     // nativeExitWasUnexpected and would fire a second attempt at a
                     // tunnel that is already coming back up.
-                    nativeExitWasUnexpected = !stopRequested.get()
+                    nativeExitWasUnexpected = !stopRequested.get() && proxyResult != 0
                     if (proxyResult != 0 && !stopRequested.get()) {
                         val detail = NativeCore.lastError()
                             .ifBlank { "Tunnel exited with code $proxyResult" }
@@ -4487,6 +4493,8 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                             storedConfig = unpinnedStoredConfig ?: storedConfig
                         }
                         if (!willAutoReconnect()) sendStatus(STATUS_FAILED, detail)
+                    } else if (proxyResult == 0 && !stopRequested.get()) {
+                        ConnectionLog.record("aether job running — identity/scan in progress")
                     } else if (stopRequested.get()) {
                         // Not under a quick reconnect: MainActivity's DISCONNECTED
                         // branch would paint "Not connected" and the tile would flip
@@ -4587,24 +4595,41 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     ConnectionLog.record("Scanning gateways for VPN (native fallback)")
                     TunnelStatus.isNativeTunMode = true; vpnModeActive.set(true); startWatchdog()
                     val fbResult = NativeCore.start(effectiveConfig, tun!!.fd)
+                    // Same non-blocking contract as the TunEngine branch above:
+                    // 0 means the aether job STARTED, not that it exited. Reading
+                    // it as an exit made this fallback kill the engine it had
+                    // just launched.
                     val fbDead = !stopRequested.get()
                     if (fbResult != 0 && !stopRequested.get()) {
                         val d = NativeCore.lastError().ifBlank { "Tunnel exited with code $fbResult" }
                         ConnectionLog.record("Native tunnel exited: $d")
                         if (startedWithExitPin) { clearExitPin("the pinned endpoint failed"); startedWithExitPin = false; storedConfig = unpinnedStoredConfig ?: storedConfig }
                         if (!willAutoReconnect()) sendStatus(STATUS_FAILED, d)
+                    } else if (fbResult == 0 && !stopRequested.get()) {
+                        ConnectionLog.record("aether job running — identity/scan in progress")
                     } else if (stopRequested.get()) {
                         if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting…")) else sendStatus(STATUS_DISCONNECTED)
                     } else { ConnectionLog.record("Native tunnel stopped unexpectedly"); if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly") }
-                    nativeExitWasUnexpected = fbDead
+                    nativeExitWasUnexpected = fbDead && fbResult != 0
                 } else {
                     ConnectionLog.record("TunEngine ${TunEngineManager.current(this).label} → $warpListen")
                     startWatchdog()
                     val result = NativeCore.startProxy(warpJson)
 
-                // Did the tunnel end on its own, i.e. without the user asking?
-                // That is the case auto-reconnect exists for, and it has to be
-                // decided here where the exit reason is still known.
+                // aether 2.3.0's nativeStart is NON-BLOCKING: it returns 0 the
+                // moment aether_core_start accepts the job, not when the tunnel
+                // exits. So the old reading of the return code is inverted here.
+                //   result != 0  -> the job was REFUSED (-1: already running, bad
+                //                   option, bind failure). This is the real failure.
+                //   result == 0  -> the job is RUNNING. The engine is still
+                //                   provisioning the identity and scanning; treating
+                //                   that as "the tunnel stopped" is what killed and
+                //                   restarted the engine every 5 s, so the
+                //                   registration never completed and no transport
+                //                   ever connected.
+                // The tunnel's real end is reported by the watchdog's
+                // NativeCore.isRunning() poll and by nativeLastError(), not by
+                // this return value.
                 val diedOnItsOwn = !stopRequested.get()
                 if (result != 0 && !stopRequested.get()) {
                     val detail = NativeCore.lastError().ifBlank { "Tunnel exited with code $result" }
@@ -4622,6 +4647,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         storedConfig = unpinnedStoredConfig ?: storedConfig
                     }
                     if (!willAutoReconnect()) sendStatus(STATUS_FAILED, detail)
+                } else if (result == 0 && !stopRequested.get()) {
+                    // The job is up. Nothing exited — the engine owns the
+                    // lifecycle from here and the watchdog watches it.
+                    ConnectionLog.record("aether job running — identity/scan in progress")
                 } else if (stopRequested.get()) {
                     // Same as the SOCKS branch above: no DISCONNECTED under a pending
                     // reconnect, or the UI blinks "Not connected" mid-restart.
@@ -4634,7 +4663,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     ConnectionLog.record("Native tunnel stopped unexpectedly")
                     if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly")
                 }
-                nativeExitWasUnexpected = diedOnItsOwn
+                nativeExitWasUnexpected = diedOnItsOwn && result != 0
                 }
             } catch (error: Exception) {
                 val detail = NativeCore.lastError().ifBlank { error.message ?: "Tunnel setup failed" }
