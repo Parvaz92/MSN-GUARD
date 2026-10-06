@@ -3223,15 +3223,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // and publish CONNECTED the instant it answers. Without this
                 // branch the tunnel would work while the UI said "Connecting".
                 if (socksConnectPending.get()) {
-                    val port = socksListenerPortForWatchdog
-                    if (port != null && socksListenerAccepting(port)) {
+                    if (socksListenerAccepting()) {
                         socksConnectPending.set(false)
                         connected.set(true)
                         TunnelStatus.isProxyMode = proxyMode
                         TunnelStatus.isNativeTunMode = false
                         repostNotification()
                         sendStatus(STATUS_CONNECTED)
-                        ConnectionLog.record("aether SOCKS listener up at 127.0.0.1:$port (late) — connected")
+                        ConnectionLog.record("aether SOCKS listener up (late) — connected")
                     }
                     // Whether or not it landed, do not run the dead-tunnel
                     // checks below: nothing is established yet, so tunnelIsDead()
