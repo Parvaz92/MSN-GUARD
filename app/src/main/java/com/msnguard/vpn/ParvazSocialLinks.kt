@@ -25,7 +25,7 @@ object ParvazSocialLinks {
             setStroke(dp(1), Color.argb(80, 79, 227, 193))
         }
         addView(TextView(activity).apply {
-            text = "خبرهای پرواز"
+            text = "خبرهای یکتا"
             setTextColor(Color.WHITE)
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
@@ -40,7 +40,7 @@ object ParvazSocialLinks {
         addView(row(activity, "تلگرام  @NabzKhabarOfficial", TELEGRAM, dp(34)))
     }.also { card ->
         card.isFocusable = true
-        card.contentDescription = "لینک‌های شبکه‌های اجتماعی پرواز"
+        card.contentDescription = "لینک‌های شبکه‌های اجتماعی یکتا"
     }
 
     private fun row(activity: MainActivity, title: String, url: String, height: Int) = TextView(activity).apply {
