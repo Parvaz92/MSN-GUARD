@@ -322,10 +322,16 @@ object CoreConfig {
         out["AETHER_LOG_LEVEL"] = text("log_level", "info")
         out["AETHER_PERF_PROFILE"] = text("perf_profile", "auto")
 
-        // H2 fragmentation. The engine reads a truthy AETHER_MASQUE_H2_FRAGMENT
-        // and a "lo-hi" size and delay range.
+        // H2 fragmentation. FCAE sends AETHER_MASQUE_H2_FRAGMENT_SNI only when
+        // fragment_enabled is true (config.rs: if fragment_enabled { ... SNI ... } else { None }).
+        // Mixed-case SNI when fragmentation is OFF would be a behaviour FCAE never has
+        // — so gate it the same way, not independently.
         if (text("h2_fragmentation", "on") == "on") {
             out["AETHER_MASQUE_H2_FRAGMENT"] = "1"
+            // Only while fragmented; FCAE nests SNI inside the fragment branch.
+            if (bool("mixed_case_sni", false)) {
+                out["AETHER_MASQUE_H2_FRAGMENT_SNI"] = "1"
+            }
         }
 
         // Distributed identity via ECH — EXACTLY as FCAE does.
@@ -383,14 +389,6 @@ object CoreConfig {
         }
         text("route_direct").ifBlank { "" }.takeIf { it.isNotBlank() }?.let {
             out["AETHER_ROUTE_DIRECT"] = it
-        }
-
-        // Mixed-case SNI (L×Box spec 028): randomise the casing of the SNI
-        // hostname on every ClientHello. Off by default — it changes bytes on
-        // the wire, so it must be opt-in per network. The engine reads a truthy
-        // AETHER_MASQUE_H2_FRAGMENT_SNI.
-        if (bool("mixed_case_sni", false)) {
-            out["AETHER_MASQUE_H2_FRAGMENT_SNI"] = "1"
         }
 
         return out
