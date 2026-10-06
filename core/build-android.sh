@@ -117,6 +117,13 @@ RUST_ENV_SUFFIX="${TARGET_TRIPLE^^}"
 RUST_ENV_SUFFIX="${RUST_ENV_SUFFIX//-/_}"
 RUST_TARGET_SUFFIX="${TARGET_TRIPLE//-/_}"
 
+# boring-sys 5.2 links libc++ dynamically by default, which makes libaether.so
+# NEEDED libc++_shared.so. The APK does not ship it (the other engines are C),
+# so dlopen fails and the app will not even start. Statically link and bundle
+# libc++ instead — the fix CluvexStudio shipped in aether 6cf29b3.
+# Scope: keep it only on this target (upstream used _<target> not plain).
+export "BORING_BSSL_RUST_CPPLIB_${RUST_TARGET_SUFFIX}=static:-bundle=c++"
+
 export "CARGO_TARGET_${RUST_ENV_SUFFIX}_LINKER=$BIN/${CLANG_PREFIX}${API}-clang"
 export "CARGO_TARGET_${RUST_ENV_SUFFIX}_AR=$BIN/llvm-ar"
 export "AR_${RUST_TARGET_SUFFIX}=$BIN/llvm-ar"
