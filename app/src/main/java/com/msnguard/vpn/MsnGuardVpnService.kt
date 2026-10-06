@@ -4448,7 +4448,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // mark_ready() once a data plane exists, and onEvent forwards it.
                     // Announcing it now would be the fake-connected bug again — the
                     // listener binds before the tunnel is verified.
-                    startWatchdog()
+                    // Not startWatchdog() either: aether 2.3.0's job model emits
+                    // nothing, so the watchdog would run its liveness probe against
+                    // a listener that does not exist yet. waitForSocksReady() arms
+                    // it once the listener answers.
                     // NON-BLOCKING in aether 2.3.0: 0 means the job was accepted
                     // and is running, not that the core exited. See the VPN
                     // branch for the full reasoning; the same inversion applies
@@ -4583,7 +4586,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     val fbAddr = NativeCore.prepare(effectiveConfig)
                     tun = Builder().setSession("MSN-GUARD").setMtu(1330).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr, TunEnginePref.LEGACY).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
                     ConnectionLog.record("Scanning gateways for VPN (native fallback)")
-                    TunnelStatus.isNativeTunMode = true; vpnModeActive.set(true); startWatchdog()
+                    TunnelStatus.isNativeTunMode = true; vpnModeActive.set(true)
+                    // Not startWatchdog(): see the TunEngine branch above. The
+                    // engine is still registering when this returns, and a watchdog
+                    // armed now kills it before the listener exists.
                     val fbResult = NativeCore.start(effectiveConfig, tun!!.fd)
                     // Same non-blocking contract as the TunEngine branch above:
                     // 0 means the aether job STARTED, not that it exited. Reading
@@ -4608,7 +4614,16 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     nativeExitWasUnexpected = fbDead && fbResult != 0
                 } else {
                     ConnectionLog.record("TunEngine ${TunEngineManager.current(this).label} → $warpListen")
-                    startWatchdog()
+                    // Deliberately NOT startWatchdog() here. aether 2.3.0's job
+                    // model emits nothing to the host, so for the first minute or
+                    // more the only thing alive is the job itself — the engine is
+                    // still fetching the ECHConfigList, registering and scanning.
+                    // A watchdog armed now watches nothing and the SOCKS probe it
+                    // runs has no listener to find yet, so it killed the tunnel
+                    // 30 s in every time (field log line: "wd: the tn stopped
+                    // carrying traffic — reconnecting"). startWatchdog() is called
+                    // by waitForSocksReady() once the listener actually answers,
+                    // which is the first honest signal the tunnel exists.
                     val result = NativeCore.startProxy(warpJson)
 
                 // aether 2.3.0's nativeStart is NON-BLOCKING: it returns 0 the
@@ -5078,6 +5093,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     repostNotification()
                     sendStatus(STATUS_CONNECTED)
                     ConnectionLog.record("aether SOCKS listener up at $listenAddress — connected")
+                    // Now the tunnel exists, so the watchdog has something to
+                    // watch. Arming it earlier killed the engine while it was
+                    // still registering (see the comment at the startProxy call).
+                    startWatchdog()
                     return
                 } catch (_: java.io.IOException) {
                     // Still provisioning the identity or scanning. Try again.
