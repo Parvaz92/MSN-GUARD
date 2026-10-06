@@ -22,10 +22,8 @@ jobs:
         id: sync
         run: |
           set -e
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git fetch https://github.com/mbm110/MSN-GUARD.git master
 
           if git merge-base --is-ancestor FETCH_HEAD HEAD; then
@@ -48,7 +46,6 @@ jobs:
           git add -A
           git commit -m "Sync MSN-GUARD update into Yekta VPN" || true
           git push origin master
-
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Set up Java
@@ -68,23 +65,52 @@ jobs:
       - name: Set up Rust
         if: steps.sync.outputs.changed == 'true'
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          curl --proto '=https' --tlsv1.2 --tlsv1.3 -sSf \
+            https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
-
           rustup target add \
             aarch64-linux-android \
             armv7-linux-androideabi \
             x86_64-linux-android
-
           cargo install cargo-ndk
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build APKs
+      - name: Prepare permanent signing key
         if: steps.sync.outputs.changed == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.AETHERY_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.AETHERY_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.AETHERY_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.AETHERY_KEY_PASSWORD }}
         run: |
-          chmod +x gradlew
-          chmod +x tools/rebrand.sh
-          ./gradlew assembleRelease
+          set -e
+
+          test -n "$KEYSTORE_BASE64" || {
+            echo "AETHERY_KEYSTORE_BASE64 is missing"
+            exit 1
+          }
+
+          echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
+
+          cat > keystore.env <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+
+          test -s release.keystore
+
+      - name: Build signed APKs
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          AETHERY_KEYSTORE_PASSWORD: ${{ secrets.AETHERY_KEYSTORE_PASSWORD }}
+          AETHERY_KEY_ALIAS: ${{ secrets.AETHERY_KEY_ALIAS }}
+          AETHERY_KEY_PASSWORD: ${{ secrets.AETHERY_KEY_PASSWORD }}
+        run: |
+          set -e
+          chmod +x gradlew tools/rebrand.sh
+          ./gradlew assembleRelease \
+            -PaetheryKeystore=release.keystore
 
       - name: Publish automatic Release
         if: steps.sync.outputs.changed == 'true'
@@ -93,7 +119,9 @@ jobs:
         run: |
           set -e
 
-          version=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts | head -1)
+          version=$(grep -oP 'versionName = "\K[^"]+' \
+            app/build.gradle.kts | head -1)
+
           tag="v${version}"
 
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -101,11 +129,12 @@ jobs:
           fi
 
           cat > release-notes.md <<EOF
-          Automatic update from MSN-GUARD upstream.
+          Yekta VPN automatic update.
 
-          Yekta VPN modified source under AGPL-3.0.
           Version: ${version}
+          Signed with the Yekta VPN release key.
           Android architectures: arm64-v8a, armeabi-v7a, x86_64.
+          Modified source under AGPL-3.0.
           EOF
 
           gh release create "$tag" \
