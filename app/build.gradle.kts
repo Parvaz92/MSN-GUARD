@@ -10,7 +10,11 @@ val targetAbis = (project.findProperty("targetAbi") as String?)
     ?.map(String::trim)
     ?.filter(String::isNotEmpty)
     ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-val releaseKeystore = project.findProperty("aetheryKeystore") as String?
+// Parvaz VPN: an empty or missing keystore (a fork without the AETHERY_* secrets)
+// is treated as "no key", so the build falls back to debug signing below instead
+// of failing.
+val releaseKeystore = (project.findProperty("aetheryKeystore") as String?)
+    ?.takeIf { rootProject.file(it).let { f -> f.isFile && f.length() > 0 } }
 
 kotlin {
     compilerOptions {
@@ -25,7 +29,10 @@ android {
     ndkVersion = "26.3.11579264"
 
     defaultConfig {
-        applicationId = "com.msnguard.vpn"
+        // Parvaz VPN: own application ID so it installs next to MSN-GUARD.
+        // The Kotlin package (namespace) stays com.msnguard.vpn to keep JNI and
+        // upstream merges intact.
+        applicationId = "com.parvaz.vpn"
         minSdk = 26
         targetSdk = 36
         versionCode = 269
@@ -118,6 +125,16 @@ android {
             isShrinkResources = false
             isDebuggable = false
         }
+    } else {
+        // Parvaz VPN: no release key configured. Sign with the debug key so the
+        // release APKs are still installable. Add the AETHERY_* repository
+        // secrets to get a permanent key (needed for in-place updates).
+        buildTypes.named("release") {
+            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = false
+            isShrinkResources = false
+            isDebuggable = false
+        }
     }
 }
 
@@ -127,6 +144,16 @@ android {
     implementation("com.google.android.material:material:1.12.0")
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
 }
+
+// Parvaz VPN: apply the brand (name, update source, artwork) before every build.
+// See tools/rebrand.sh; it is idempotent.
+val parvazRebrand = tasks.register<Exec>("parvazRebrand") {
+    group = "build"
+    description = "Applies Parvaz VPN branding (tools/rebrand.sh)"
+    onlyIf { !org.gradle.internal.os.OperatingSystem.current().isWindows }
+    commandLine("bash", rootProject.file("tools/rebrand.sh").absolutePath)
+}
+tasks.named("preBuild").configure { dependsOn(parvazRebrand) }
 
 targetAbis.forEach { abi ->
     val taskName = "buildRustCore${abi.split('-').joinToString("") { it.replaceFirstChar(Char::uppercase) }}"

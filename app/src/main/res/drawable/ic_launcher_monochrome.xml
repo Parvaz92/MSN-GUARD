@@ -1,10 +1,6 @@
-<!-- Monochrome layer for Android 13+ themed icons.
-     The launcher paints this with the user's wallpaper colours and applies the
-     same mask as the other layers, so the glyph must sit inside the guaranteed
-     safe zone: the centre 66dp of a 108dp canvas.
-
-     Source path is authored in a 24x24 viewport (shared with the status-bar
-     icon), so it is scaled by 66/24 = 2.75 and offset by (108-66)/2 = 21. -->
+<!-- Monochrome layer for Android 13+ themed icons (Parvaz VPN paper plane).
+     Glyph authored in a 24x24 viewport and scaled into the 66dp safe zone of the
+     108dp canvas: scale 66/24 = 2.75, offset (108-66)/2 = 21. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
@@ -17,7 +13,9 @@
         android:scaleY="2.75">
         <path
             android:fillColor="#FFFFFF"
-            android:fillType="evenOdd"
-            android:pathData="M12,2 L4,5 v6 c0,5.55 3.84,10.74 8,12 c4.16,-1.26 8,-6.45 8,-12 V5 L12,2 z M7,8 h2.2 L12,12.5 L14.8,8 H17 v8 h-2 v-5 L12.8,14.5 h-1.6 L9,11 v5 H7 V8 z" />
+            android:pathData="M2.5,11.2 L21.5,3.5 L10.2,13.6 Z" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M11,14.6 L21.5,3.5 L14.8,20.8 Z" />
     </group>
 </vector>

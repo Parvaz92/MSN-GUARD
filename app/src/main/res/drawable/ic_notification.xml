@@ -1,3 +1,4 @@
+<!-- Parvaz VPN status-bar / tile glyph: a folded paper plane. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp"
     android:height="24dp"
@@ -5,6 +6,8 @@
     android:viewportHeight="24">
     <path
         android:fillColor="#FFFFFF"
-        android:fillType="evenOdd"
-        android:pathData="M12,2 L4,5 v6 c0,5.55 3.84,10.74 8,12 c4.16,-1.26 8,-6.45 8,-12 V5 L12,2 z M7,8 h2.2 L12,12.5 L14.8,8 H17 v8 h-2 v-5 L12.8,14.5 h-1.6 L9,11 v5 H7 V8 z" />
+        android:pathData="M2.5,11.2 L21.5,3.5 L10.2,13.6 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M11,14.6 L21.5,3.5 L14.8,20.8 Z" />
 </vector>
