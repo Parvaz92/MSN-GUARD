@@ -10,18 +10,19 @@ import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/** Small, dismissible-by-navigation promotion for Younes's public channels. */
+/** Small in-app promotion for Younes's public news channels. */
 object ParvazSocialLinks {
     private const val INSTAGRAM = "https://instagram.com/Nabz.moamma"
     private const val TELEGRAM = "https://t.me/NabzKhabarOfficial"
 
     fun build(activity: MainActivity): View = LinearLayout(activity).apply {
+        fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
         orientation = LinearLayout.VERTICAL
-        setPadding(activity.dp(16), activity.dp(10), activity.dp(16), activity.dp(10))
+        setPadding(dp(16), dp(10), dp(16), dp(10))
         background = GradientDrawable().apply {
-            cornerRadius = activity.dp(18).toFloat()
+            cornerRadius = dp(18).toFloat()
             setColor(Color.argb(34, 79, 227, 193))
-            setStroke(activity.dp(1), Color.argb(80, 79, 227, 193))
+            setStroke(dp(1), Color.argb(80, 79, 227, 193))
         }
         addView(TextView(activity).apply {
             text = "خبرهای پرواز"
@@ -33,21 +34,21 @@ object ParvazSocialLinks {
             text = "برای خبرهای جدید ما را دنبال کنید"
             setTextColor(Color.LTGRAY)
             textSize = 12f
-            setPadding(0, activity.dp(2), 0, activity.dp(7))
+            setPadding(0, dp(2), 0, dp(7))
         })
-        addView(row(activity, "اینستاگرام  @Nabz.moamma", INSTAGRAM))
-        addView(row(activity, "تلگرام  NabzKhabarOfficial", TELEGRAM))
+        addView(row(activity, "اینستاگرام  @Nabz.moamma", INSTAGRAM, dp(34)))
+        addView(row(activity, "تلگرام  NabzKhabarOfficial", TELEGRAM, dp(34)))
     }.also { card ->
         card.isFocusable = true
         card.contentDescription = "لینک‌های شبکه‌های اجتماعی پرواز"
     }
 
-    private fun row(activity: MainActivity, title: String, url: String) = TextView(activity).apply {
+    private fun row(activity: MainActivity, title: String, url: String, height: Int) = TextView(activity).apply {
         text = title
         textSize = 13f
         setTextColor(Color.rgb(159, 255, 228))
         gravity = Gravity.CENTER_VERTICAL
-        minHeight = activity.dp(34)
+        minHeight = height
         isClickable = true
         isFocusable = true
         setOnClickListener {
