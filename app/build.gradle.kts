@@ -6,19 +6,14 @@ plugins {
 }
 
 val targetAbis = (project.findProperty("targetAbi") as String?)
-    ?.split(',')
-    ?.map(String::trim)
-    ?.filter(String::isNotEmpty)
+    ?.split(',')?.map(String::trim)?.filter(String::isNotEmpty)
     ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
-
 val releaseKeystore = (project.findProperty("aetheryKeystore") as String?)
     ?.takeIf { rootProject.file(it).let { f -> f.isFile && f.length() > 0 } }
 
 kotlin {
     compilerOptions {
-        // GitHub Actions installs JDK 21. Match it directly so Kotlin does not
-        // ask Gradle/Foojay to provision another JVM.
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
@@ -53,19 +48,11 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_21
-        targetCompatibility = JavaVersion.VERSION_21
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
-    androidResources {
-        // Keep font compression enabled to reduce APK size.
-    }
-
-    packaging {
-        jniLibs {
-            useLegacyPackaging = true
-        }
-    }
+    packaging { jniLibs { useLegacyPackaging = true } }
 
     if (releaseKeystore != null) {
         val envProps = Properties().apply {
@@ -75,12 +62,9 @@ android {
         signingConfigs {
             create("release") {
                 storeFile = rootProject.file(releaseKeystore)
-                storePassword = System.getenv("AETHERY_KEYSTORE_PASSWORD")
-                    ?: envProps.getProperty("storePassword")
-                keyAlias = System.getenv("AETHERY_KEY_ALIAS")
-                    ?: envProps.getProperty("keyAlias")
-                keyPassword = System.getenv("AETHERY_KEY_PASSWORD")
-                    ?: envProps.getProperty("keyPassword")
+                storePassword = System.getenv("AETHERY_KEYSTORE_PASSWORD") ?: envProps.getProperty("storePassword")
+                keyAlias = System.getenv("AETHERY_KEY_ALIAS") ?: envProps.getProperty("keyAlias")
+                keyPassword = System.getenv("AETHERY_KEY_PASSWORD") ?: envProps.getProperty("keyPassword")
                 enableV1Signing = true
                 enableV2Signing = true
             }
@@ -121,16 +105,8 @@ targetAbis.forEach { abi ->
     tasks.register<Exec>(taskName) {
         group = "build"
         description = "Builds Aether for Android $abi"
-        val buildScript = if (org.gradle.internal.os.OperatingSystem.current().isWindows) {
-            rootProject.file("core/build-android.ps1")
-        } else {
-            rootProject.file("core/build-android.sh")
-        }
-        if (org.gradle.internal.os.OperatingSystem.current().isWindows) {
-            commandLine("powershell.exe", "-ExecutionPolicy", "Bypass", "-File", buildScript.absolutePath, "-Abi", abi)
-        } else {
-            commandLine("bash", buildScript.absolutePath, "--abi", abi)
-        }
+        val buildScript = if (org.gradle.internal.os.OperatingSystem.current().isWindows) rootProject.file("core/build-android.ps1") else rootProject.file("core/build-android.sh")
+        if (org.gradle.internal.os.OperatingSystem.current().isWindows) commandLine("powershell.exe", "-ExecutionPolicy", "Bypass", "-File", buildScript.absolutePath, "-Abi", abi) else commandLine("bash", buildScript.absolutePath, "--abi", abi)
         environment("ANDROID_HOME", android.sdkDirectory.absolutePath)
         environment("ANDROID_SDK_ROOT", android.sdkDirectory.absolutePath)
         environment("ANDROID_NDK_HOME", "${android.sdkDirectory.absolutePath}/ndk/26.3.11579264")
