@@ -12,6 +12,9 @@ val releaseKeystore = (project.findProperty("aetheryKeystore") as String?)
     ?.takeIf { rootProject.file(it).let { f -> f.isFile && f.length() > 0 } }
 
 kotlin {
+    // This is the missing piece: Kotlin was still requesting its default
+    // JetBrains JDK 21 even though Gradle itself ran on JDK 17.
+    jvmToolchain(17)
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
