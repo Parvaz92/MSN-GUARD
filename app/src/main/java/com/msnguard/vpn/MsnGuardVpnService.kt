@@ -216,6 +216,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     @Volatile
     private var socksListenerPortForWatchdog: Int? = null
 
+    /**
+     * Set when aether's listener had not come up before [waitForSocksReady]'s
+     * deadline while the job was still alive. That is a slow scan, not a
+     * failure, and the moment the listener finally answers the watchdog has to
+     * publish CONNECTED — otherwise the tunnel works and the UI sits on
+     * "Connecting" forever. Read and cleared by [startWatchdog].
+     */
+    private val socksConnectPending = AtomicBoolean(false)
+
     private var tun: ParcelFileDescriptor? = null
     private var lastTrafficSampleMs = 0L
     private var currentTx = 0L
@@ -3207,6 +3216,29 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         watchdogTask = ladderScheduler.scheduleWithFixedDelay({
             try {
                 if (stopRequested.get() || userInitiatedStop.get()) return@scheduleWithFixedDelay
+                // A slow aether connect (identity provisioning over a dead UDP
+                // path can take minutes) outlives waitForSocksReady's deadline
+                // with the listener still down. That is not a dead tunnel — it
+                // is one that has not arrived yet — so probe for the listener
+                // and publish CONNECTED the instant it answers. Without this
+                // branch the tunnel would work while the UI said "Connecting".
+                if (socksConnectPending.get()) {
+                    val port = socksListenerPortForWatchdog
+                    if (port != null && socksListenerAccepting(port)) {
+                        socksConnectPending.set(false)
+                        connected.set(true)
+                        TunnelStatus.isProxyMode = proxyMode
+                        TunnelStatus.isNativeTunMode = false
+                        repostNotification()
+                        sendStatus(STATUS_CONNECTED)
+                        ConnectionLog.record("aether SOCKS listener up at 127.0.0.1:$port (late) — connected")
+                    }
+                    // Whether or not it landed, do not run the dead-tunnel
+                    // checks below: nothing is established yet, so tunnelIsDead()
+                    // would report the still-provisioning job as broken and
+                    // tear the session down before it had a chance.
+                    return@scheduleWithFixedDelay
+                }
                 if (!connected.get()) return@scheduleWithFixedDelay
                 val dead = tunnelIsDead() ?: return@scheduleWithFixedDelay
                 // SHARD can usually be repaired without a disconnect: the pool has
@@ -5103,10 +5135,24 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 }
                 Thread.sleep(SOCKS_READY_POLL_MS)
             }
-            // The deadline passed with no listener. The job is still running, so
-          // this is a slow scan rather than a crash — leave it to the watchdog
-          // and keep the UI honest about the state it is actually in.
-            ConnectionLog.record("aether SOCKS listener not up after ${SOCKS_READY_TIMEOUT_MS / 1000}s; still working")
+            // The deadline passed with no listener. The aether job is still
+            // running, so this is a slow scan (identity provisioning over a
+            // UDP-killed network can take many minutes) rather than a crash —
+            // but the probe loop has stopped, so nothing would ever publish
+            // CONNECTED even if the listener came up a second later. That was
+            // the real "works but the UI says Connecting" bug.
+            //
+            // Keep probing on the watchdog's own tick instead of a separate
+            // thread: it is already scheduled, it already knows the port, and
+            // its liveness probe is the same socket test used here. Setting the
+            // pending flag makes its next tick publish CONNECTED the moment the
+            // listener answers, so a slow connect still lands on the UI.
+            ConnectionLog.record(
+                "aether SOCKS listener not up after ${SOCKS_READY_TIMEOUT_MS / 1000}s; " +
+                    "aether still working — watchdog will publish CONNECTED when it lands"
+            )
+            socksConnectPending.set(true)
+            startWatchdog()
         } catch (_: InterruptedException) {
             // A disconnect during the wait; the caller has already torn down.
         }
