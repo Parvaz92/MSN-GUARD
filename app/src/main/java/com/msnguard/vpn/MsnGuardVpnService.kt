@@ -3575,17 +3575,48 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 currentProtocol.contains("GOOL"))
         ) {
             if (!NativeCore.isRunning()) return "the tunnel process stopped"
-            // aether 2.3.0 never emits "traffic" events to the host (the job
-            // model publishes nothing but the job registry), so the byte
-            // counters this branch used to read never move and the watchdog
-            // condemned a fully working tunnel after two 30 s ticks. The honest
-            // liveness test on this path is the engine's own SOCKS listener:
-            // it is bound only after the tunnel validates and it stops
-            // accepting the moment the job dies, so a successful connect means
-            // the data plane is live. Same probe waitForSocksReady uses, one
-            // loopback connect, no radio traffic.
-            if (!socksListenerAccepting()) return "the tunnel stopped carrying traffic"
-            return null
+            // 2.3.19: the SOCKS-only probe was false-positive 47 times in one
+            // field log (2.3.17, BadVPN/WireGuard): every reconnect had just
+            // re-established a healthy tunnel and SOCKS was still momentarily
+            // busy after a Burst of downlink, so a single 1 s connect timeout
+            // condemned it and the watchdog looped. The byte counters from
+            // NativeCore.statsSnapshot() are ground truth here — they are the
+            // same cumulative atomics the traffic UI already polls — so they
+            // outrank the probe the same way SHARD treats rx movement as an
+            // unconditional pass.
+            val snap = NativeCore.statsSnapshot()
+            val tx = snap?.getOrNull(0) ?: -1L
+            val rx = snap?.getOrNull(1) ?: -1L
+            val moved = (tx != nativeLastTx || rx != nativeLastRx) &&
+                !(tx == -1L && rx == -1L)
+            nativeLastTx = tx
+            nativeLastRx = rx
+            if (moved) {
+                nativeIdleTicks = 0
+                return null
+            }
+            // Screen-off idle: not a dead tunnel.
+            if (!isScreenInteractive()) {
+                nativeIdleTicks = 0
+                return null
+            }
+            // Still byte-silent with screen on: now the SOCKS probe decides.
+            // Two strikes (60 s) so one transient miss does not tear a live
+            // tunnel down — same NATIVE_STRIKES_BEFORE_RECONNECT=2 budget SHARD
+            // uses.
+            if (socksListenerAccepting()) {
+                nativeIdleTicks = 0
+                return null
+            }
+            nativeIdleTicks++
+            if (nativeIdleTicks < NATIVE_STRIKES_BEFORE_RECONNECT) {
+                ConnectionLog.record(
+                    "native idle tick $nativeIdleTicks/$NATIVE_STRIKES_BEFORE_RECONNECT — waiting"
+                )
+                return null
+            }
+            nativeIdleTicks = 0
+            return "the tunnel went silent and stopped carrying traffic"
         }
 
         if (currentProtocol.contains("TOR")) {
