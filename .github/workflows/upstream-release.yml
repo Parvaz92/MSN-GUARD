@@ -11,7 +11,6 @@ permissions:
 jobs:
   update-build-release:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Yekta
         uses: actions/checkout@v4
@@ -32,19 +31,19 @@ jobs:
             exit 0
           fi
 
-          git merge --no-edit FETCH_HEAD
+          mkdir -p /tmp/yekta-preserved
+          cp .github/workflows/build.yml /tmp/yekta-preserved/build.yml
+          cp app/build.gradle.kts /tmp/yekta-preserved/app-build.gradle.kts
+          cp settings.gradle.kts /tmp/yekta-preserved/settings.gradle.kts
 
-          git checkout HEAD -- \
-            NOTICE.md \
-            README.md \
-            README.en.md \
-            tools/rebrand.sh \
-            branding \
-            app/src/main/java/com/msnguard/vpn/ParvazSocialLinks.kt \
-            2>/dev/null || true
+          git merge --no-edit -X theirs FETCH_HEAD || true
+          git checkout --theirs .
+          cp /tmp/yekta-preserved/build.yml .github/workflows/build.yml
+          cp /tmp/yekta-preserved/app-build.gradle.kts app/build.gradle.kts
+          cp /tmp/yekta-preserved/settings.gradle.kts settings.gradle.kts
 
           git add -A
-          git commit -m "Sync MSN-GUARD update into Yekta VPN" || true
+          git diff --cached --quiet || git commit -m "Sync MSN-GUARD update into Yekta VPN"
           git push origin master
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
@@ -54,6 +53,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
 
       - name: Set up Android SDK
         if: steps.sync.outputs.changed == 'true'
@@ -65,13 +65,10 @@ jobs:
       - name: Set up Rust
         if: steps.sync.outputs.changed == 'true'
         run: |
-          curl --proto '=https' --tlsv1.2 --tlsv1.3 -sSf \
-            https://sh.rustup.rs | sh -s -- -y
+          set -e
+          curl --proto '=https' --tlsv1.2 --tlsv1.3 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
-          rustup target add \
-            aarch64-linux-android \
-            armv7-linux-androideabi \
-            x86_64-linux-android
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
           cargo install cargo-ndk
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
@@ -84,21 +81,17 @@ jobs:
           KEY_PASSWORD: ${{ secrets.AETHERY_KEY_PASSWORD }}
         run: |
           set -e
-
-          test -n "$KEYSTORE_BASE64" || {
-            echo "AETHERY_KEYSTORE_BASE64 is missing"
-            exit 1
-          }
-
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
           echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
-
-          cat > keystore.env <<EOF
+          test -s release.keystore
+          cat > keystore.env <<EOF2
           storePassword=$KEYSTORE_PASSWORD
           keyAlias=$KEY_ALIAS
           keyPassword=$KEY_PASSWORD
-          EOF
-
-          test -s release.keystore
+          EOF2
 
       - name: Build signed APKs
         if: steps.sync.outputs.changed == 'true'
@@ -109,8 +102,9 @@ jobs:
         run: |
           set -e
           chmod +x gradlew tools/rebrand.sh
-          ./gradlew assembleRelease \
-            -PaetheryKeystore=release.keystore
+          echo "org.gradle.java.installations.auto-download=false" >> gradle.properties
+          echo "kotlin.compiler.execution.strategy=in-process" >> gradle.properties
+          ./gradlew assembleRelease --no-daemon --stacktrace -PaetheryKeystore=release.keystore
 
       - name: Publish automatic Release
         if: steps.sync.outputs.changed == 'true'
@@ -118,27 +112,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-
-          version=$(grep -oP 'versionName = "\K[^"]+' \
-            app/build.gradle.kts | head -1)
-
+          version=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts | head -1)
           tag="v${version}"
-
           if gh release view "$tag" >/dev/null 2>&1; then
             tag="${tag}-$(date -u +%Y%m%d%H%M)"
           fi
-
-          cat > release-notes.md <<EOF
-          Yekta VPN automatic update.
-
-          Version: ${version}
-          Signed with the Yekta VPN release key.
-          Android architectures: arm64-v8a, armeabi-v7a, x86_64.
-          Modified source under AGPL-3.0.
-          EOF
-
-          gh release create "$tag" \
-            app/build/outputs/apk/release/*.apk \
-            --title "Yekta VPN ${tag}" \
-            --notes-file release-notes.md \
-            --latest
+          printf 'Yekta VPN automatic update.\n\nVersion: %s\n' "$version" > release-notes.md
+          gh release create "$tag" app/build/outputs/apk/release/*.apk --title "Yekta VPN ${tag}" --notes-file release-notes.md --latest
