@@ -3132,6 +3132,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * user never asked for much, which is the safe direction: a node is only
      * promoted on evidence, never demoted for lack of it.
      *
+    /**
      * Samples below [SHARD_THROUGHPUT_FLOOR_KBPS] are ignored — a few kilobytes
      * of keepalive traffic in a second is not a measurement — and the result is
      * written at most once per [SHARD_THROUGHPUT_WRITE_INTERVAL_MS] to keep this
@@ -3139,6 +3140,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * value, so one sample taken during congestion cannot mislabel a good node.
      */
     private fun observeShardThroughput(rx: Long) {
+        // 2.3.18: skip entirely while the screen is dark. The peak is a
+        // property of the user's own traffic — with the screen off there is
+        // almost never any, and the rare background burst is not a measurement
+        // worth waking the scheduler's thread for. The counters this compares
+        // are 60 s stale by the time anything reads them, which would throw the
+        // window out of the 500..3000 ms band this relies on anyway.
+        if (!isScreenInteractive()) return
         val now = SystemClock.elapsedRealtime()
         val previousRx = shardSampleRx
         val previousAt = shardSampleAt
@@ -3259,6 +3267,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // When a chained front is active its poller already feeds the pipeline.
                 // Guard against stacking two sources in the same second.
                 if (TorSocksFront.isRunning || ShardSocksFront.isRunning) return@scheduleAtFixedRate
+                // 2.3.18: the screen-off throttle is back, narrower than before.
+                // 2.3.15 removed it because the guards swallowed samples while
+                // `connected` was still being latched — but that is now the only
+                // guard left, and this poller runs 1 Hz for the life of a WARP
+                // session: 3,600 JNI calls + Intents an hour while the phone is
+                // dark and nothing on screen can read them. With the screen off
+                // every SLEEP_SAMPLE_TICKS seconds is still 240/hour, and the
+                // counters are cumulative so the monthly total is identical.
+                if (!isScreenInteractive()) return@scheduleAtFixedRate
                 val snap = NativeCore.statsSnapshot() ?: return@scheduleAtFixedRate
                 if (snap.size < 2) return@scheduleAtFixedRate
                 // Kernel is [up, down]; pipeline is [tx, rx] with the same sense.
@@ -5292,8 +5309,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * goes away with the job. A loopback connect that succeeds therefore means
      * the data plane is live; a refused connect means the tunnel is gone.
      *
-     * One connect, no handshake, no radio traffic — the same probe
+     // One connect, no handshake, no radio traffic — the same probe
      * [waitForSocksReady] uses to publish CONNECTED.
+     *
+     * 2.3.18: this is the native-core liveness check the watchdog runs every
+     * 30 s (and with the screen dark, the watchdog already stretches that —
+     * see the native-idle probe above). The connect itself is still 1 s on
+     * the clock, but while the screen is off nothing can see its answer.
      */
     private fun socksListenerAccepting(): Boolean {
         val port = socksListenerPortForWatchdog ?: return false
