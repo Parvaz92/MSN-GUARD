@@ -216,6 +216,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     @Volatile
     private var socksListenerPortForWatchdog: Int? = null
 
+    /**
+     * Set when aether's listener had not come up before [waitForSocksReady]'s
+     * deadline while the job was still alive. That is a slow scan, not a
+     * failure, and the moment the listener finally answers the watchdog has to
+     * publish CONNECTED — otherwise the tunnel works and the UI sits on
+     * "Connecting" forever. Read and cleared by [startWatchdog].
+     */
+    private val socksConnectPending = AtomicBoolean(false)
+
     private var tun: ParcelFileDescriptor? = null
     private var lastTrafficSampleMs = 0L
     private var currentTx = 0L
@@ -2354,6 +2363,18 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // and the device would stay sealed after the user asked to stop.
                 killSwitchSealed.set(false)
                 cancelAutoReconnect()
+                // From the notification this must actually remove the row.
+                // Field report: the old code called stopTunnel() alone, which
+                // clears `connected`/`tun` but on several OEMs (MIUI/HyperOS)
+                // the foreground notification survives until `stopSelf()` is
+                // processed. If the user tapped Disconnect while the worker
+                // thread still held the session, the system kept the row with
+                // stale actions that then appeared to "do nothing". Defensively
+                // cancel the notification first, then tear down the data path.
+                try {
+                    getSystemService(NotificationManager::class.java)
+                        .cancel(NOTIFICATION_ID)
+                } catch (_: Exception) {}
                 stopTunnel()
             }
             ACTION_PAUSE -> {
@@ -2377,22 +2398,22 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             }
             ACTION_RECONNECT -> {
                 val config = storedConfig
-                if (config != null && (connected.get() || paused.get())) {
-                    // Clearing the pause latch here, not in stopTunnel: this is
-                    // the only path that exits the paused state. Left set, the
-                    // notification would go on showing Reconnect while the
-                    // session was already up.
-                    paused.set(false)
+                // The notification's Reconnect/Pause buttons are expected to work
+                // whenever a config exists — not only while connected/paused. The
+                // previous gate `connected || paused` made both buttons silently
+                // do nothing after the system had torn the TUN down (e.g. kill
+                // switch or failure with auto-reconnect off), which reads as
+                // "the notification is broken".
+                if (config != null) {
+                    val wasPaused = paused.getAndSet(false)
                     ConnectionLog.record(
-                        if (connected.get()) "Quick reconnect requested"
-                        else "Reconnect requested after pause"
+                        if (wasPaused) "Reconnect requested after pause"
+                        else if (connected.get()) "Quick reconnect requested"
+                        else "Reconnect requested"
                     )
                     if (connected.get()) {
                         requestQuickReconnect("user")
                     } else {
-                        // A paused session had already torn the tunnel down, so
-                        // there is nothing to wait for: start it again from the
-                        // last config the user connected with.
                         userInitiatedStop.set(false)
                         killSwitchSealed.set(false)
                         reconnectAttempts = 0
@@ -3207,6 +3228,28 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         watchdogTask = ladderScheduler.scheduleWithFixedDelay({
             try {
                 if (stopRequested.get() || userInitiatedStop.get()) return@scheduleWithFixedDelay
+                // A slow aether connect (identity provisioning over a dead UDP
+                // path can take minutes) outlives waitForSocksReady's deadline
+                // with the listener still down. That is not a dead tunnel — it
+                // is one that has not arrived yet — so probe for the listener
+                // and publish CONNECTED the instant it answers. Without this
+                // branch the tunnel would work while the UI said "Connecting".
+                if (socksConnectPending.get()) {
+                    if (socksListenerAccepting()) {
+                        socksConnectPending.set(false)
+                        connected.set(true)
+                        TunnelStatus.isProxyMode = proxyMode
+                        TunnelStatus.isNativeTunMode = false
+                        repostNotification()
+                        sendStatus(STATUS_CONNECTED)
+                        ConnectionLog.record("aether SOCKS listener up (late) — connected")
+                    }
+                    // Whether or not it landed, do not run the dead-tunnel
+                    // checks below: nothing is established yet, so tunnelIsDead()
+                    // would report the still-provisioning job as broken and
+                    // tear the session down before it had a chance.
+                    return@scheduleWithFixedDelay
+                }
                 if (!connected.get()) return@scheduleWithFixedDelay
                 val dead = tunnelIsDead() ?: return@scheduleWithFixedDelay
                 // SHARD can usually be repaired without a disconnect: the pool has
@@ -3274,6 +3317,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
     private fun stopWatchdog() {
         watchdogTask?.cancel(false)
         watchdogTask = null
+        // A pending late-connect is session-scoped: the next session probes for
+        // its own listener and sets the flag itself, so leaving it set here
+        // would make a fresh session's watchdog announce a connect it never had.
+        socksConnectPending.set(false)
     }
 
     /**
@@ -3812,7 +3859,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             !auto -> 0
             chainMemory in ladder.indices -> chainMemory
             plainHint != null -> plainHint
-            else -> 0
+            else -> {
+                // No history at all — the user just asked WireGuard to go first on
+                // Auto. Without evidence there is no reason to prefer MASQUE over a
+                // plain WireGuard leg that has never been tried on this carrier.
+                val wireguardIndex = ladder.indexOf("wireguard")
+                if (wireguardIndex >= 0) wireguardIndex else 0
+            }
         }
 
         if (!auto) {
@@ -5103,10 +5156,24 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 }
                 Thread.sleep(SOCKS_READY_POLL_MS)
             }
-            // The deadline passed with no listener. The job is still running, so
-          // this is a slow scan rather than a crash — leave it to the watchdog
-          // and keep the UI honest about the state it is actually in.
-            ConnectionLog.record("aether SOCKS listener not up after ${SOCKS_READY_TIMEOUT_MS / 1000}s; still working")
+            // The deadline passed with no listener. The aether job is still
+            // running, so this is a slow scan (identity provisioning over a
+            // UDP-killed network can take many minutes) rather than a crash —
+            // but the probe loop has stopped, so nothing would ever publish
+            // CONNECTED even if the listener came up a second later. That was
+            // the real "works but the UI says Connecting" bug.
+            //
+            // Keep probing on the watchdog's own tick instead of a separate
+            // thread: it is already scheduled, it already knows the port, and
+            // its liveness probe is the same socket test used here. Setting the
+            // pending flag makes its next tick publish CONNECTED the moment the
+            // listener answers, so a slow connect still lands on the UI.
+            ConnectionLog.record(
+                "aether SOCKS listener not up after ${SOCKS_READY_TIMEOUT_MS / 1000}s; " +
+                    "aether still working — watchdog will publish CONNECTED when it lands"
+            )
+            socksConnectPending.set(true)
+            startWatchdog()
         } catch (_: InterruptedException) {
             // A disconnect during the wait; the caller has already torn down.
         }
@@ -5825,7 +5892,6 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
 
         val disconnectIntent = Intent(this, MsnGuardVpnService::class.java).apply {
             action = ACTION_DISCONNECT
-            putExtra(EXTRA_CONFIG, storedConfig ?: "")
         }
         val disconnectPendingIntent = PendingIntent.getService(
             this, 1, disconnectIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT

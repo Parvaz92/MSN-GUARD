@@ -5819,7 +5819,10 @@ class MainActivity : Activity() {
         //   to grey out with the chain off, which read as "the setting is
         //   dead" while the picker behind it had been fully functional for
         //   plain connects all along.
-        val childrenAvailable = chainAvailable && psiphonChained
+        val childrenAvailable = psiphonSelected && modeControlsEnabled
+        // User request: Outer Transport for Psiphon is enabled whenever Psiphon is
+        // selected (from main page or settings), on all three TUN engines, and
+        // greyed otherwise — no gate on chainArmed or engine.
         chainOuterRow?.apply {
             setValue(chainOuterMode().label)
             setAvailable(childrenAvailable)
@@ -5855,14 +5858,15 @@ class MainActivity : Activity() {
             setChecked(chainArmed(Protocol.TOR) && torSelected && torChainable)
             setAvailable(torSelected && torChainable && modeControlsEnabled)
         }
-        // Tor's outer transport follows its switch's VISIBLE state, exactly as
-        // Psiphon's does: it only affects a chained Tor connect, so with the chain
-        // off — or with obfs4/Snowflake pinned, which cannot be chained at all — it
-        // is greyed rather than hidden.
-        val torChained = chainArmed(Protocol.TOR) && torSelected && torChainable
+        // Tor's outer transport: user request is "whenever Tor is selected" on all
+        // three TUN engines. Unlike the previous rule it must not wait for the
+        // chain switch to be armed — the chain switch still has the obfs4/
+        // Snowflake gate, but the outer transport is what would carry Tor when
+        // chaining is attempted, so the row is live the moment Tor is selected.
+        // No gate on TUN engine.
         torChainOuterRow?.apply {
             setValue(torChainOuterMode().label)
-            setAvailable(torSelected && torChainable && modeControlsEnabled && torChained)
+            setAvailable(torSelected && modeControlsEnabled)
         }
         // Tor's exit-country picker, greyed off the TOR transport for the same
         // reason Psiphon's is: it configures a transport that is not selected, and
@@ -7967,8 +7971,8 @@ class MainActivity : Activity() {
 
 
     private fun defaultScan(): ScanTarget {
-        val name = preferences().getString(DEFAULT_SCAN, ScanTarget.IPV4.coreName)
-        return ScanTarget.entries.firstOrNull { it.coreName == name } ?: ScanTarget.IPV4
+        val name = preferences().getString(DEFAULT_SCAN, ScanTarget.BOTH.coreName)
+        return ScanTarget.entries.firstOrNull { it.coreName == name } ?: ScanTarget.BOTH
     }
 
     private fun defaultScanMode(): ScanMode {

@@ -193,8 +193,8 @@ class MsnGuardTileService : TileService() {
             ?.coreName ?: Protocol.WIREGUARD.coreName
 
     private fun defaultScan(): ScanTarget {
-        val name = getSharedPreferences(SETTINGS, MODE_PRIVATE).getString(DEFAULT_SCAN, ScanTarget.IPV4.coreName)
-        return ScanTarget.entries.find { it.coreName == name } ?: ScanTarget.IPV4
+        val name = getSharedPreferences(SETTINGS, MODE_PRIVATE).getString(DEFAULT_SCAN, ScanTarget.BOTH.coreName)
+        return ScanTarget.entries.find { it.coreName == name } ?: ScanTarget.BOTH
     }
 
     private fun defaultScanMode(): ScanMode {

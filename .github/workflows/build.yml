@@ -31,6 +31,16 @@ jobs:
       - name: Verify Java
         run: java -version
 
+      # aether/Compose/KGP request a JDK 21 toolchain. foojay (the resolver
+      # Gradle downloads JDKs from) no longer lists Temurin or JetBrains for 21
+      # — its redirect answers 400 — so it cannot fetch one. Install 21 here
+      # and let Gradle's auto-detect find it instead of downloading.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -137,11 +147,10 @@ jobs:
           AETHERY_KEYSTORE_PASSWORD: ${{ secrets.AETHERY_KEYSTORE_PASSWORD }}
           AETHERY_KEY_ALIAS: ${{ secrets.AETHERY_KEY_ALIAS }}
           AETHERY_KEY_PASSWORD: ${{ secrets.AETHERY_KEY_PASSWORD }}
-        run: |
-          ./gradlew assembleRelease \
-            --no-daemon \
-            --stacktrace \
-            -PaetheryKeystore=release.keystore
+          # foojay can no longer serve JDK 21, so stop Gradle trying to fetch
+          # one and use the JDK installed above. auto-detect is Gradle's default.
+          ORG_GRADLE_PROJECT_org.gradle.java.installations.auto-download: 'false'
+        run: ./gradlew assembleRelease -PaetheryKeystore=release.keystore
 
       - name: Rename APK files
         run: |

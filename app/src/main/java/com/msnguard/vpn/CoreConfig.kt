@@ -144,7 +144,7 @@ object CoreConfig {
             put("config_path", java.io.File(context.filesDir, "aether.toml").absolutePath)
             put("listen", if (listenOverride != null) "127.0.0.1:$listenOverride" else "${proxyBindHost(context)}:${sharedSocksPort(context)}")
             put("scan_mode", text("default_scan_mode", "balanced"))
-            put("ip_scan", text("default_scan", "v4"))
+            put("ip_scan", text("default_scan", "both"))
             // forwarded verbatim when present — keeps pin/SHARD-identity logic from breaking
             if (socksProxyForCore.isNotBlank()) put("socks_proxy", socksProxyForCore)
             text("manual_endpoint").ifBlank { null }?.let { put("forced_peer", it) }
@@ -259,7 +259,10 @@ object CoreConfig {
         // ironclad/real/verify/guaranteed, everything else -> balanced.
         // IpScan::parse takes v6/ipv6/6, both/all/dual, everything else -> v4.
         out["AETHER_SCAN"] = text("default_scan_mode", "balanced")
-        out["AETHER_IP"] = text("default_scan", "v4")
+        // Both means scan IPv4 and IPv6; the engine tries IPv6 first and
+        // falls back to IPv4 when v6 is unreachable, which is exactly the
+        // "v6 first, then v4" order requested.
+        out["AETHER_IP"] = text("default_scan", "both")
 
         // Obfuscation (aethernoize). off/light/balanced/aggressive/firewall/gfw;
         // the engine defaults wireguard to "firewall" and masque to "balanced".
@@ -322,10 +325,16 @@ object CoreConfig {
         out["AETHER_LOG_LEVEL"] = text("log_level", "info")
         out["AETHER_PERF_PROFILE"] = text("perf_profile", "auto")
 
-        // H2 fragmentation. The engine reads a truthy AETHER_MASQUE_H2_FRAGMENT
-        // and a "lo-hi" size and delay range.
+        // H2 fragmentation. FCAE sends AETHER_MASQUE_H2_FRAGMENT_SNI only when
+        // fragment_enabled is true (config.rs: if fragment_enabled { ... SNI ... } else { None }).
+        // Mixed-case SNI when fragmentation is OFF would be a behaviour FCAE never has
+        // — so gate it the same way, not independently.
         if (text("h2_fragmentation", "on") == "on") {
             out["AETHER_MASQUE_H2_FRAGMENT"] = "1"
+            // Only while fragmented; FCAE nests SNI inside the fragment branch.
+            if (bool("mixed_case_sni", false)) {
+                out["AETHER_MASQUE_H2_FRAGMENT_SNI"] = "1"
+            }
         }
 
         // Distributed identity via ECH — EXACTLY as FCAE does.
@@ -383,14 +392,6 @@ object CoreConfig {
         }
         text("route_direct").ifBlank { "" }.takeIf { it.isNotBlank() }?.let {
             out["AETHER_ROUTE_DIRECT"] = it
-        }
-
-        // Mixed-case SNI (L×Box spec 028): randomise the casing of the SNI
-        // hostname on every ClientHello. Off by default — it changes bytes on
-        // the wire, so it must be opt-in per network. The engine reads a truthy
-        // AETHER_MASQUE_H2_FRAGMENT_SNI.
-        if (bool("mixed_case_sni", false)) {
-            out["AETHER_MASQUE_H2_FRAGMENT_SNI"] = "1"
         }
 
         return out
