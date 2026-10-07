@@ -1034,6 +1034,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         private const val RECONNECT_SETTLE_MS = 600L
         private const val RECONNECT_CORE_WAIT_MS = 6_000
         private const val RECONNECT_POLL_MS = 100L
+        // 2.3.16: the extra wait after the job is done for the SOCKS listener it
+        // owned to actually let go of the port. One second is generous for a
+        // destructor that already had the whole core wait to run in, and the
+        // restart proceeds anyway if it expires — the bind failure it then hits is
+        // reported instead of silently swallowed.
+        private const val RECONNECT_PORT_WAIT_MS = 1_000
+        private const val RECONNECT_PORT_PROBE_MS = 150
         // waitForSocksReady: aether 2.3.0 publishes CONNECTED nowhere, so the
         // service probes the engine's SOCKS listener. The budget has to cover a
         // cold registration (ECH lookup + register) and a full endpoint scan,
@@ -2428,7 +2435,34 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         userInitiatedStop.set(false)
                         killSwitchSealed.set(false)
                         reconnectAttempts = 0
-                        startTunnel(config)
+                        // 2.3.16: a Reconnect the user asked for must own the service
+                        // exactly like the connected branch's requestQuickReconnect.
+                        // Starting startTunnel() synchronously on the main thread left
+                        // no latch set, so when the restart failed — aether's SOCKS
+                        // listener was still bound from the session that had just been
+                        // torn down, so startProxy returned "already running" — the
+                        // worker's finally fell through to stopForeground+stopSelf.
+                        // That is literally the report: the row vanished and nothing
+                        // reconnected. Latching here makes that same finally keep the
+                        // service alive for the retry scheduleAutoReconnect now arms.
+                        reconnectRequested.set(true)
+                        // Off the main thread, and after the same settle the quick
+                        // path uses: the port is released asynchronously and starting
+                        // immediately races it. The user asked for a reconnect, so a
+                        // sub-second delay is the correct price for the port actually
+                        // being free when the new job binds it.
+                        ladderScheduler.schedule({
+                            try {
+                                if (userInitiatedStop.get()) {
+                                    reconnectRequested.set(false)
+                                    return@schedule
+                                }
+                                startTunnel(config)
+                            } catch (e: Exception) {
+                                ConnectionLog.record("Reconnect start failed: ${e.message}")
+                                reconnectRequested.set(false)
+                            }
+                        }, RECONNECT_SETTLE_MS, TimeUnit.MILLISECONDS)
                     }
                 }
             }
@@ -3706,6 +3740,33 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     reconnectRequested.set(false)
                     return@schedule
                 }
+                // 2.3.16: isRunning()==false does not mean the SOCKS port is free.
+                // aether marks the job done the moment its task is told to unwind, but
+                // the listener it owns comes down when the task's destructor runs, which
+                // is a beat later. Starting on top of it makes aether_core_start fail
+                // the bind, nativeStart returns -1, and the reconnect dies on
+                // "already running" — the reported "notification never reconnects".
+                // Probing the port is the only honest signal: connect() refused is the
+                // listener being gone.
+                val port = socksListenerPortForWatchdog ?: CoreConfig.SOCKS_PORT
+                waited = 0
+                while (!socksPortFree(port) && waited < RECONNECT_PORT_WAIT_MS) {
+                    Thread.sleep(RECONNECT_POLL_MS)
+                    waited += RECONNECT_POLL_MS.toInt()
+                }
+                if (!socksPortFree(port)) {
+                    ConnectionLog.record(
+                        "Quick reconnect ($reason): port $port was still bound " +
+                            "after ${RECONNECT_PORT_WAIT_MS / 1000}s; restarting anyway"
+                    )
+                    // Not fatal — the restart reports its own bind failure, and the
+                    // latch keeps the service alive for the retry it schedules.
+                }
+                if (userInitiatedStop.get()) {
+                    ConnectionLog.record("Quick reconnect ($reason) abandoned: the user disconnected")
+                    reconnectRequested.set(false)
+                    return@schedule
+                }
                 reconnectAttempts = 0
                 startTunnel(config)
             } catch (e: Exception) {
@@ -3713,6 +3774,34 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 reconnectRequested.set(false)
             }
         }, RECONNECT_SETTLE_MS, TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * 2.3.16: is the aether SOCKS port free?
+     *
+     * `NativeCore.isRunning()==false` marks the job done, but the listener the job's
+     * task owns is released by that task's destructor a beat later. Starting the next
+     * job in that window fails the bind, which reads from the UI as "Reconnect did
+     * nothing". A refused connect on the port is the listener actually being gone —
+     * the same probe [waitForSocksReady] uses to know the tunnel is *up*, inverted.
+     */
+    private fun socksPortFree(port: Int = CoreConfig.SOCKS_PORT): Boolean {
+        // 2.3.16: a refused connect on the port IS the listener being gone — the
+        // inverse of the probe waitForSocksReady uses to know the tunnel is up.
+        // socksListenerPortForWatchdog is already null by the time a reconnect calls
+        // this (stopTunnel clears it), so the caller passes the port it asked the
+        // engine to bind: SOCKS_PORT for the WARP transports, the chain's
+        // CHAIN_SOCKS_PORT, or the user's port in proxy mode.
+        return try {
+            java.net.Socket().use { probe ->
+                probe.connect(java.net.InetSocketAddress("127.0.0.1", port), RECONNECT_PORT_PROBE_MS)
+            }
+            // Something is still answering. aether may still own it, or another
+            // process may have grabbed it — either way it is not free.
+            false
+        } catch (_: java.io.IOException) {
+            true
+        }
     }
 
     /**
