@@ -3287,7 +3287,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         repostNotification()
                         sendStatus(STATUS_CONNECTED)
                         ConnectionLog.record("aether SOCKS listener up (late) — connected")
-                        if (!proxyMode) startWarpTrafficPolling()
+                        startWarpTrafficPolling()
                     }
                     // Whether or not it landed, do not run the dead-tunnel
                     // checks below: nothing is established yet, so tunnelIsDead()
@@ -4526,6 +4526,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 //    health check reads it to decide whether to dial 127.0.0.1.
                 //  * the watchdog, armed before the blocking call.
                 if (proxyMode) {
+                    // WARP over SOCKS still counts through the same AETHER_STATS
+                    // counters; installs the same env the VPN branch already did.
+                    CoreConfig.applyEnv(
+                        CoreConfig.envFromEffectiveConfig(this@MsnGuardVpnService, effectiveConfig),
+                    )
                     val port = CoreConfig.proxyListenPort(this@MsnGuardVpnService)
                     val host = CoreConfig.proxyBindHost(this@MsnGuardVpnService)
                     NativeCore.prepare(effectiveConfig)
@@ -5201,7 +5206,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // Traffic Monitor stay at 0 on every TunEngine (Hev/Zeptun/Badvpn)
                     // over WireGuard/WoW/MASQUE — SHARD/Tor were spared only because
                     // their fronts count themselves.
-                    if (!proxyMode) startWarpTrafficPolling()
+                    startWarpTrafficPolling()
                     return
                 } catch (_: java.io.IOException) {
                     // Still provisioning the identity or scanning. Try again.
