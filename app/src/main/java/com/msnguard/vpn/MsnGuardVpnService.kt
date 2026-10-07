@@ -4871,7 +4871,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     try { TunEngineManager.stop(this) } catch (_: Throwable) {}
                     tun?.close(); tun = null; vpnModeActive.set(false)
                     val fbAddr = NativeCore.prepare(effectiveConfig)
-                    tun = Builder().setSession("MSN-GUARD").setMtu(1330).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr, TunEnginePref.LEGACY).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
+                    tun = Builder().setSession("MSN-GUARD").setMtu(warpMtu).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr, TunEnginePref.LEGACY).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
                     ConnectionLog.record("Scanning gateways for VPN (native fallback)")
                     TunnelStatus.isNativeTunMode = true; vpnModeActive.set(true)
                     // Not startWatchdog(): see the TunEngine branch above. The

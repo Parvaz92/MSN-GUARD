@@ -80,12 +80,18 @@ object MtuConfig {
     /** Effective MTU for [method] — stored value or its default. */
     fun get(context: Context, method: Method): Int {
         val raw = context.profiled().getInt(method.prefKey, -1)
-        return if (raw == -1) method.default else raw.coerceIn(MIN_MTU, MAX_MTU)
+        // 0 and -1 both mean "unset": an earlier build wrote the default rather
+        // than leaving the key absent, and reading that back would hand 0 to
+        // Builder.setMtu, which Android rejects with an exception.
+        return if (raw == -1 || raw == 0) method.default else raw.coerceIn(MIN_MTU, MAX_MTU)
     }
 
     /** Whether [method] has a user override (vs default). */
-    fun isCustom(context: Context, method: Method): Boolean =
-        context.profiled().contains(method.prefKey)
+    fun isCustom(context: Context, method: Method): Boolean {
+        // The same legacy-0 case as [get]: a key holding 0 is not a choice.
+        val raw = context.profiled().getInt(method.prefKey, -1)
+        return raw != -1 && raw != 0
+    }
 
     /** Persist [value] for [method]; returns false if out of range. */
     fun set(context: Context, method: Method, value: Int): Boolean {

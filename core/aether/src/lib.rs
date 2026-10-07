@@ -69,6 +69,20 @@ fn masque_tunnel_mtu() -> usize {
         TUNNEL_MTU
     }
 }
+
+/// The WireGuard leg's inner MTU. Defaults to [TUNNEL_MTU]; AETHER_WG_MTU
+/// overrides it (576..=1500) so the MTU screen's WireGuard row reaches the
+/// netstack the same way AETHER_MASQUE_MTU reaches the masque one.
+fn wg_tunnel_mtu() -> usize {
+    if let Some(mtu) = std::env::var("AETHER_WG_MTU")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|mtu| (576..=1500).contains(mtu))
+    {
+        return mtu;
+    }
+    TUNNEL_MTU
+}
 const DEFAULT_CONFIG: &str = "aether.toml";
 
 pub async fn run() -> Result<()> {
@@ -1442,11 +1456,51 @@ async fn run_masque(
                     None => match hunt_masque_peer(&identity, &mode_str, ip).await {
                         Ok(peer) => peer,
                         Err(e) => {
-                            log::warn!(
-                                "[-] no usable MASQUE gateway found: {e}; rescanning shortly"
-                            );
-                            tokio::time::sleep(masque_reconnect_delay()).await;
-                            continue;
+                            // 2.3.21: HTTP/3's scan probes over UDP. On a
+                            // carrier that drops or throttles QUIC every one
+                            // of them times out and this returns
+                            // NoCleanEndpoint, which used to mean "sleep and
+                            // scan the same dead path again" — the app stays
+                            // on Verifying forever while HTTP/2 would have
+                            // answered on the first try. The peer set is the
+                            // same for both carriers, so one retry of the
+                            // same candidates over TCP is cheap, and it is
+                            // the whole reason the H3 option's help text
+                            // promises the fallback. Only when the user has
+                            // NOT already asked for h2: their run sets
+                            // AETHER_MASQUE_HTTP2, and re-probing as h2 then
+                            // is a no-op that would loop.
+                            if !masque_h2::enabled() {
+                                log::warn!(
+                                    "[-] no usable MASQUE gateway over HTTP/3: {e}; \
+                                     retrying the same candidates over HTTP/2"
+                                );
+                                std::env::set_var("AETHER_MASQUE_HTTP2", "1");
+                                match hunt_masque_peer(&identity, &mode_str, ip).await {
+                                    Ok(peer) => {
+                                        log::info!(
+                                            "[+] HTTP/2 carried the tunnel where HTTP/3 could not; \
+                                             staying on h2 for this session"
+                                        );
+                                        peer
+                                    }
+                                    Err(e2) => {
+                                        log::warn!(
+                                            "[-] no usable MASQUE gateway found on either carrier \
+                                             (h3: {e}; h2: {e2}); rescanning shortly"
+                                        );
+                                        std::env::remove_var("AETHER_MASQUE_HTTP2");
+                                        tokio::time::sleep(masque_reconnect_delay()).await;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                log::warn!(
+                                    "[-] no usable MASQUE gateway found: {e}; rescanning shortly"
+                                );
+                                tokio::time::sleep(masque_reconnect_delay()).await;
+                                continue;
+                            }
                         }
                     },
                 },
@@ -2526,7 +2580,7 @@ async fn run_wireguard_tunnel(
     let stack = netstack::spawn(
         &identity.ipv4,
         &identity.ipv6,
-        TUNNEL_MTU,
+        wg_tunnel_mtu(),
         inbound_rx,
         outbound_tx,
     )?;
@@ -2754,7 +2808,7 @@ async fn run_warp_in_warp(
 
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
     let (outer_stack, mut outer_exit) =
-        establish_wg(&primary, peer, TUNNEL_MTU, true, 5, "outer").await?;
+        establish_wg(&primary, peer, wg_tunnel_mtu(), true, 5, "outer").await?;
     tasks.push(outer_exit.abort_handle());
 
     let (forwarder, _forwarder_guard) = spawn_udp_forwarder(&outer_stack, inner_peer).await?;
