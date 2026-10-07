@@ -33,6 +33,7 @@ const char* aether_core_start(const char* arguments);
 const char* aether_job_poll(unsigned long long id);
 const char* aether_job_cancel(unsigned long long id);
 const char* aether_job_free(unsigned long long id);
+const char* aether_stats_snapshot();
 void aether_string_free(const char* raw);
 }
 
@@ -322,6 +323,31 @@ Java_com_msnguard_vpn_NativeCore_nativeSetEnv(JNIEnv* env, jobject, jstring key,
     setenv(k, v, 1);
     env->ReleaseStringUTFChars(value, v);
     env->ReleaseStringUTFChars(key, k);
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_msnguard_vpn_NativeCore_nativeStatsSnapshot(JNIEnv* env, jobject) {
+    const char* raw = aether_stats_snapshot();
+    if (raw == nullptr) return nullptr;
+    std::string text(raw);
+    aether_string_free(raw);
+    // {\"ok\":true,\"up\":N,\"down\":M} — json objects, small and cheap.
+    auto findU64 = [&](const char* key) -> long long {
+        std::string needle = std::string("\"") + key + "\":";
+        size_t at = text.find(needle);
+        if (at == std::string::npos) return 0;
+        at += needle.size();
+        long long v = 0;
+        sscanf(text.c_str() + at, "%lld", &v);
+        return v;
+    };
+    long long up = findU64("up");
+    long long down = findU64("down");
+    jlongArray out = env->NewLongArray(2);
+    if (out == nullptr) return nullptr;
+    jlong vals[2] = { (jlong)up, (jlong)down };
+    env->SetLongArrayRegion(out, 0, 2, vals);
+    return out;
 }
 
 extern "C" JNIEXPORT void JNICALL

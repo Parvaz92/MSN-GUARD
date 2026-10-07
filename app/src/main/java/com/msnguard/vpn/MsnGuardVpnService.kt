@@ -600,6 +600,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * does not add a wakeup source beyond what a connected session already has.
      */
     private var torTrafficTask: java.util.concurrent.ScheduledFuture<*>? = null
+    /**
+     * Polls aether's AETHER_STATS counters while a WARP (MASQUE/WireGuard/WoW)
+     * VPN session is up — the 2.3.0 job emits no "traffic" events to the host,
+     * so the only source is periodic stats::snapshot(). Reuses the same
+     * 1 s cadence + screen-off throttle as Tor/SHARD; feeds
+     * updateTrafficNotification() directly. Shares torTrafficTask's scheduler
+     * so no new thread is needed.
+     */
+    private var warpTrafficTask: java.util.concurrent.ScheduledFuture<*>? = null
     private var ladderIndex = 0
     private var ladderAttempts = 0
     private var ladderTimer: ScheduledFuture<*>? = null
@@ -3186,6 +3195,41 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         torTrafficTask = null
     }
 
+    /**
+     * Same pipeline as Tor/SHARD, but the source is aether's SOCKS counters.
+     * WireGuard/WoW/MASQUE/Gool/MIM all ride the VPN TUN (Hev/Zeptun/Badvpn →
+     * 127.0.0.1:1819), so the only honest byte count is `socks.rs add_up/add_down`
+     * behind `AETHER_STATS` / `stats::snapshot()`. FCAE sets the same flag
+     * (runtime/src/config.rs: flag("AETHER_STATS", true)); without it the
+     * counters stay at 0 and Up/Down/Speed + Traffic Monitor sit at 0 on every
+     * TunEngine — SHARD/Tor were spared because their fronts count themselves.
+     */
+    private fun startWarpTrafficPolling() {
+        warpTrafficTask?.cancel(false)
+        // Do not double-count when a chained session exists — Psiphon-in-WARP
+        // and Tor-in-WARP fronts also count bytes; let their already-running pollers
+        // own the numbers in that shape.
+        warpTrafficTask = ladderScheduler.scheduleAtFixedRate({
+            try {
+                if (!connected.get() || paused.get()) return@scheduleAtFixedRate
+                if (!shouldSampleTraffic()) return@scheduleAtFixedRate
+                // When a chained front is active its poller already feeds the pipeline.
+                // Guard against stacking two sources in the same second.
+                if (TorSocksFront.isRunning || ShardSocksFront.isRunning) return@scheduleAtFixedRate
+                val snap = NativeCore.statsSnapshot() ?: return@scheduleAtFixedRate
+                if (snap.size < 2) return@scheduleAtFixedRate
+                // Kernel is [up, down]; pipeline is [tx, rx] with the same sense.
+                updateTrafficNotification(snap[0], snap[1])
+            } catch (_: Exception) {
+            }
+        }, 1L, 1L, TimeUnit.SECONDS)
+    }
+
+    private fun stopWarpTrafficPolling() {
+        warpTrafficTask?.cancel(false)
+        warpTrafficTask = null
+    }
+
     // ------------------------------------------------------ auto-reconnect
 
     /**
@@ -3243,6 +3287,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         repostNotification()
                         sendStatus(STATUS_CONNECTED)
                         ConnectionLog.record("aether SOCKS listener up (late) — connected")
+                        if (!proxyMode) startWarpTrafficPolling()
                     }
                     // Whether or not it landed, do not run the dead-tunnel
                     // checks below: nothing is established yet, so tunnelIsDead()
@@ -4869,6 +4914,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         SmartDnsFront.stop()
         TunEngineManager.stop(this)
         stopTrafficPolling()
+        stopWarpTrafficPolling()
         TorManager.stop()
         stopPsiphonTunnel()
         NativeCore.stop()
@@ -5150,6 +5196,12 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // watch. Arming it earlier killed the engine while it was
                     // still registering (see the comment at the startProxy call).
                     startWatchdog()
+                    // WARP path byte counters live behind AETHER_STATS. Without this
+                    // the 2.3.0 job emits no "traffic" events and Up/Down/Speed +
+                    // Traffic Monitor stay at 0 on every TunEngine (Hev/Zeptun/Badvpn)
+                    // over WireGuard/WoW/MASQUE — SHARD/Tor were spared only because
+                    // their fronts count themselves.
+                    if (!proxyMode) startWarpTrafficPolling()
                     return
                 } catch (_: java.io.IOException) {
                     // Still provisioning the identity or scanning. Try again.

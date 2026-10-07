@@ -98,8 +98,12 @@ object NativeCore {
      */
     fun setEnv(key: String, value: String) = nativeSetEnv(key, value)
 
+    /** Snapshot of aether's byte counters (AETHER_STATS). Returns [up, down]. */
+    fun statsSnapshot(): LongArray? = try { nativeStatsSnapshot() } catch (_: Throwable) { null }
+
     @JvmStatic private external fun nativePrepare(config: String): Int
     @JvmStatic private external fun nativeSetEnv(key: String, value: String)
+    @JvmStatic private external fun nativeStatsSnapshot(): LongArray
     @JvmStatic private external fun nativeLastResult(): String
     @JvmStatic private external fun nativeRequestEmailCode(team: String, email: String): Int
     @JvmStatic private external fun nativeConfirmEmailCode(code: String): Int

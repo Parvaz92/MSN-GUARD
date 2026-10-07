@@ -322,6 +322,15 @@ object CoreConfig {
             out["AETHER_WG_NO_DATA_CHECK"] = "1"
         }
 
+        // Traffic counters for the WARP path: socks.rs add_up/add_down is
+        // gated on AETHER_STATS, and 2.3.0's job model emits no "traffic"
+        // events to the host. Without this the VPN-mode MASQUE/WireGuard/WoW
+        // counters never move and Up/Down/Speed + Traffic Monitor sit at 0 on
+        // every TunEngine (Hev/Zeptun/Badvpn). FCAE sets exactly the same
+        // (runtime/src/config.rs: flag("AETHER_STATS", true) + 86400).
+        out["AETHER_STATS"] = "1"
+        out["AETHER_STATS_SECS"] = "86400"
+
         out["AETHER_LOG_LEVEL"] = text("log_level", "info")
         out["AETHER_PERF_PROFILE"] = text("perf_profile", "auto")
 
