@@ -2,9 +2,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+// MSN-GUARD 2.3.15: AETHER_STATS gating removed. The Kotlin host always sets
+// AETHER_STATS=1 before the engine starts, but 2.3.13/2.3.14 field reports
+// showed Up/Down/Speed + Traffic Monitor still at 0 while a WARP tunnel was
+// carrying traffic on every engine (Hev/Zeptun/Badvpn) — which means either
+// setenv raced aether_core_start's read or the process env never carried it,
+// and either way a stats gate that can silently stay OFF makes that
+// indistinguishable from a genuinely idle tunnel. The counters themselves are
+// two atomic adds, so unconditional counting costs nothing; the host's own
+// poll (MsnGuardVpnService.startWarpTrafficPolling) decides whether anything
+// is shown.
 static UP: AtomicU64 = AtomicU64::new(0);
 static DOWN: AtomicU64 = AtomicU64::new(0);
-static ENABLED: AtomicBool = AtomicBool::new(false);
+static ENABLED: AtomicBool = AtomicBool::new(true);
 static START: OnceLock<Instant> = OnceLock::new();
 
 const DEFAULT_REPORT_SECS: u64 = 60;
@@ -15,20 +25,10 @@ pub struct Counters {
     pub uptime: Duration,
 }
 
-pub fn init() {
-    let on = std::env::var("AETHER_STATS")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-
-    ENABLED.store(on, Ordering::Relaxed);
-    let _ = START.set(Instant::now());
-}
-
+/// Whether byte counters are being accumulated.
+///
+/// Always true since 2.3.15 (see UP/DOWN above); kept as an accessor so the
+/// call sites stay honest about what they are asking.
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
@@ -43,6 +43,19 @@ pub fn add_down(bytes: usize) {
     if enabled() {
         DOWN.fetch_add(bytes as u64, Ordering::Relaxed);
     }
+}
+
+/// 2.3.15: logs the accumulated byte counters once per minute so a tunnel
+/// whose Up/Down/Speed sits at 0 in the UI is diagnosable from logcat alone.
+/// The info-level line costs nothing when the tunnel is idle.
+pub fn log_counters() {
+    let counters = snapshot();
+    log::info!(
+        "[=] up {} down {} uptime {}",
+        format_bytes(counters.up),
+        format_bytes(counters.down),
+        format_uptime(counters.uptime)
+    );
 }
 
 pub fn snapshot() -> Counters {
@@ -94,11 +107,10 @@ fn report_interval() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// 2.3.15: the reporter is always spawned; see the ENABLED note at the top.
+/// The interval it logs at is still honoured, so a session that carries
+/// nothing still logs nothing.
 pub fn spawn_reporter() {
-    if !enabled() {
-        return;
-    }
-
     let every = report_interval();
     tokio::spawn(async move {
         loop {
@@ -112,6 +124,13 @@ pub fn spawn_reporter() {
             );
         }
     });
+}
+
+/// 2.3.15: no env gate remains — the counters are always live (see the note
+/// at the top of the file). Kept so lib.rs's call site reads clearly.
+pub fn init() {
+    let _ = START.set(Instant::now());
+    log::info!("[+] stats counters armed (AETHER_STATS gate removed 2.3.15)");
 }
 
 #[cfg(test)]
@@ -139,9 +158,16 @@ mod tests {
     }
 
     #[test]
-    fn counting_is_off_until_it_is_asked_for() {
-        assert!(!enabled());
+    fn a_session_always_counts_its_bytes() {
+        // 2.3.15: the AETHER_STATS gate is gone, so add_up/add_down always
+        // accumulate. A snapshot is process-global, so this proves the add
+        // happened rather than asserting a specific absolute value, which
+        // another test could have moved.
+        let before = snapshot().up;
         add_up(4096);
-        assert_eq!(snapshot().up, 0);
+        assert!(snapshot().up >= before + 4096);
+        let before_down = snapshot().down;
+        add_down(8192);
+        assert!(snapshot().down >= before_down + 8192);
     }
 }

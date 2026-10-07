@@ -609,6 +609,8 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * so no new thread is needed.
      */
     private var warpTrafficTask: java.util.concurrent.ScheduledFuture<*>? = null
+    /** 2.3.15: counts [startWarpTrafficPolling] ticks to emit a per-minute diagnostic. */
+    private var warpStatsTick = 0
     private var ladderIndex = 0
     private var ladderAttempts = 0
     private var ladderTimer: ScheduledFuture<*>? = null
@@ -3211,8 +3213,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         // own the numbers in that shape.
         warpTrafficTask = ladderScheduler.scheduleAtFixedRate({
             try {
-                if (!connected.get() || paused.get()) return@scheduleAtFixedRate
-                if (!shouldSampleTraffic()) return@scheduleAtFixedRate
+                // 2.3.15: `connected` and the screen-off throttle were the two
+                // guards that could silently swallow every sample — a tunnel that
+                // carried traffic while `connected` was still being latched by
+                // waitForSocksReady's late path, or a screen-off tick, both looked
+                // exactly like an idle tunnel. The counters are already cumulative
+                // (stats::snapshot), so reading them is safe at any time; updateTrafficNotification
+                // rebases on a backwards sample and the speed delta is clamped, so
+                // an out-of-order sample cannot inflate anything.
+                if (paused.get()) return@scheduleAtFixedRate
                 // When a chained front is active its poller already feeds the pipeline.
                 // Guard against stacking two sources in the same second.
                 if (TorSocksFront.isRunning || ShardSocksFront.isRunning) return@scheduleAtFixedRate
@@ -3220,6 +3229,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 if (snap.size < 2) return@scheduleAtFixedRate
                 // Kernel is [up, down]; pipeline is [tx, rx] with the same sense.
                 updateTrafficNotification(snap[0], snap[1])
+                // 2.3.15 diagnostic: one line per minute (every 60th tick) so a
+                // tunnel whose UI numbers sit at 0 is diagnosable from the app log
+                // without needing logcat. Records the raw counter, not the derived
+                // speed, so a stuck counter is visible as a constant.
+                warpStatsTick++
+                if (warpStatsTick >= 60) {
+                    warpStatsTick = 0
+                    ConnectionLog.record("warp stats: up=${snap[0]} down=${snap[1]}")
+                }
             } catch (_: Exception) {
             }
         }, 1L, 1L, TimeUnit.SECONDS)
@@ -3287,6 +3305,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         repostNotification()
                         sendStatus(STATUS_CONNECTED)
                         ConnectionLog.record("aether SOCKS listener up (late) — connected")
+                        // 2.3.15: polling was armed in startTunnel, so this is a
+                        // no-op guard, not a first start — but keep the call site
+                        // so a future change to the arm order cannot regress this
+                        // path silently.
                         startWarpTrafficPolling()
                     }
                     // Whether or not it landed, do not run the dead-tunnel
@@ -4307,6 +4329,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         nativeLastTx = -1L
         nativeLastRx = -1L
         nativeIdleTicks = 0
+        // 2.3.15: armed here, before the tunnel exists, not only from
+        // waitForSocksReady(). The counters are cumulative atomics inside the
+        // engine, so an early poll reads zeros and is harmless; arming it only
+        // post-CONNECT was the bug when the listener came up late (the deadline
+        // path) and waitForSocksReady returned without ever arming it.
+        stopWarpTrafficPolling()
+        startWarpTrafficPolling()
+        warpStatsTick = 0
         stopRequested.set(false)
         // Latched for the whole session — see [proxyMode]. Read once, here, so a
         // mid-session change of the setting cannot make teardown take the wrong
@@ -5206,6 +5236,9 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // Traffic Monitor stay at 0 on every TunEngine (Hev/Zeptun/Badvpn)
                     // over WireGuard/WoW/MASQUE — SHARD/Tor were spared only because
                     // their fronts count themselves.
+                    // 2.3.15: armed in startTunnel; this call is a guard, and
+                    // startWarpTrafficPolling cancels any prior task first, so it
+                    // never stacks a second poller.
                     startWarpTrafficPolling()
                     return
                 } catch (_: java.io.IOException) {

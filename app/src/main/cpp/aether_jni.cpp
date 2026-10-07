@@ -328,7 +328,12 @@ Java_com_msnguard_vpn_NativeCore_nativeSetEnv(JNIEnv* env, jobject, jstring key,
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_com_msnguard_vpn_NativeCore_nativeStatsSnapshot(JNIEnv* env, jobject) {
     const char* raw = aether_stats_snapshot();
-    if (raw == nullptr) return nullptr;
+    if (raw == nullptr) {
+        // 2.3.15: the engine is reachable but has no counters yet — log it so
+        // a permanent zero in the UI points at the FFI and not at the poller.
+        LOGI("aether_stats_snapshot returned null");
+        return nullptr;
+    }
     std::string text(raw);
     aether_string_free(raw);
     // {\"ok\":true,\"up\":N,\"down\":M} — json objects, small and cheap.
@@ -343,6 +348,11 @@ Java_com_msnguard_vpn_NativeCore_nativeStatsSnapshot(JNIEnv* env, jobject) {
     };
     long long up = findU64("up");
     long long down = findU64("down");
+    // 2.3.15: one logcat line per call makes a stuck counter visible in
+    // logcat (tag MSN_AETHER) without the app having to be in debug mode.
+    if (up == 0 && down == 0) {
+        LOGI("aether stats snapshot: zero (payload=%s)", text.c_str());
+    }
     jlongArray out = env->NewLongArray(2);
     if (out == nullptr) return nullptr;
     jlong vals[2] = { (jlong)up, (jlong)down };
