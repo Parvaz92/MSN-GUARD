@@ -4710,6 +4710,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         waitForSocksReady(
                             "${CoreConfig.proxyBindHost(this)}:${CoreConfig.proxyListenPort(this)}"
                         )
+                        // 2.3.17: aether 2.3.0's startProxy is non-blocking — the
+                        // worker must stay alive for the session, or the shared
+                        // finally immediately closes the tunnel and the foreground
+                        // service (the "Connecting then notification closes" report
+                        // on Hev/Zeptun/Badvpn). Block here until the job actually
+                        // exits or the service is asked to stop.
+                        while (!stopRequested.get() && NativeCore.isRunning()) {
+                            try { Thread.sleep(500) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+                        }
                     } else if (stopRequested.get()) {
                         // Not under a quick reconnect: MainActivity's DISCONNECTED
                         // branch would paint "Not connected" and the tile would flip
@@ -4830,6 +4839,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         // probing the SOCKS listener. In this native-TUN fallback
                         // the engine still publishes one.
                         waitForSocksReady("127.0.0.1:${CoreConfig.SOCKS_PORT}")
+                        // 2.3.17: see the TunEngine branch above.
+                        while (!stopRequested.get() && NativeCore.isRunning()) {
+                            try { Thread.sleep(500) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+                        }
                     } else if (stopRequested.get()) {
                         if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting…")) else sendStatus(STATUS_DISCONNECTED)
                     } else { ConnectionLog.record("Native tunnel stopped unexpectedly"); if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly") }
@@ -4894,6 +4907,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // tunnel works, Telegram and filtered sites open, but the
                     // dial never turns green.
                     waitForSocksReady(warpListen)
+                    // 2.3.17: see the proxy branch above. Non-blocking job.
+                    while (!stopRequested.get() && NativeCore.isRunning()) {
+                        try { Thread.sleep(500) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+                    }
                 } else if (stopRequested.get()) {
                     // Same as the SOCKS branch above: no DISCONNECTED under a pending
                     // reconnect, or the UI blinks "Not connected" mid-restart.
