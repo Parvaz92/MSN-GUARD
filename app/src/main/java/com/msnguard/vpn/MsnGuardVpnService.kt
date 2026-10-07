@@ -3132,7 +3132,6 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * user never asked for much, which is the safe direction: a node is only
      * promoted on evidence, never demoted for lack of it.
      *
-    /**
      * Samples below [SHARD_THROUGHPUT_FLOOR_KBPS] are ignored — a few kilobytes
      * of keepalive traffic in a second is not a measurement — and the result is
      * written at most once per [SHARD_THROUGHPUT_WRITE_INTERVAL_MS] to keep this
@@ -5299,6 +5298,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * start already occupies, bounded by [SOCKS_READY_TIMEOUT_MS], and it
      * publishes CONNECTED the same way every other path does.
      */
+
     /**
      * Is the aether engine's SOCKS listener accepting connections?
      *
@@ -5309,7 +5309,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * goes away with the job. A loopback connect that succeeds therefore means
      * the data plane is live; a refused connect means the tunnel is gone.
      *
-     // One connect, no handshake, no radio traffic — the same probe
+     * One connect, no handshake, no radio traffic — the same probe
      * [waitForSocksReady] uses to publish CONNECTED.
      *
      * 2.3.18: this is the native-core liveness check the watchdog runs every
