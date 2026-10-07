@@ -310,6 +310,7 @@ class MainActivity : Activity() {
     private var trafficMonitorPage: View? = null
     private var dnsPage: View? = null
     private var donatePage: View? = null
+    private var mtuPage: View? = null
     private var trafficSpeedValue: TextView? = null
     private var trafficSessionValue: TextView? = null
     private var trafficTx = 0L
@@ -3260,6 +3261,10 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(8) })
+            body.addView(navRow(Strings.t("MTU"), mtuSummary()) { openMtuScreen() }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(8) })
             // Share over LAN, directly under the port it publishes.
             //
             // Moved out of the PSIPHON section: it is not Psiphon's any more. Every
@@ -6149,6 +6154,146 @@ class MainActivity : Activity() {
         donatePage?.let { animatePageClose(it) { donatePage = null } }
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // MTU screen — one row per transport, same pattern as every other
+    // settings page in this activity (FrameLayout pageHost > ScrollView).
+    // ─────────────────────────────────────────────────────────────────
+
+    private fun mtuSummary(): String {
+        // The briefest invariant for the settings list: defaults → Default,
+        // anything overridden → Custom. Full per-method numbers live inside
+        // the screen where they can be read at a glance.
+        val custom = MtuConfig.Method.entries.count { MtuConfig.isCustom(this, it) }
+        return if (custom == 0) Strings.t("Default") else Strings.t("Custom")
+    }
+
+    private fun openMtuScreen() {
+        mtuPage?.let(pageHost::removeView)
+        val page = FrameLayout(this).apply { setBackgroundColor(CANVAS); isClickable = true }
+        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(16), dp(24), dp(24))
+        }
+        content.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(createHeaderBackButton { closeMtuScreen() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(label(Strings.t("MTU"), 22f, INK, TypefaceStyle.MEDIUM).apply { setPadding(dp(4), 0, 0, 0) })
+        })
+        content.addView(label(
+            Strings.t("Applies on the next connect — per transport, 68–1500. Empty returns the default."),
+            14f, MUTED,
+        ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(4); topMargin = dp(4); bottomMargin = dp(18)
+        })
+
+        for (method in MtuConfig.Method.entries) {
+            val row = navRow(
+                title = method.title,
+                value = MtuConfig.displayValue(this, method),
+                iconRes = R.drawable.ic_settings,
+            ) { editMtu(method) }
+            content.addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        }
+
+        // Footer: how to tell whether a number actually took.
+        content.addView(label(
+            Strings.t("Re-open this page to verify the saved value — tun0 updates once the new number is connected."),
+            12f, MUTED,
+        ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(18) })
+
+        scroll.addView(content)
+        page.addView(scroll, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        page.setOnApplyWindowInsetsListener { _, insets ->
+            content.setPadding(dp(24), insets.systemWindowInsetTop + dp(16), dp(24), insets.systemWindowInsetBottom + dp(24))
+            insets
+        }
+        mtuPage = page
+        pageHost.addView(page)
+        page.requestApplyInsets()
+        animatePageOpen(page)
+    }
+
+    private fun closeMtuScreen() {
+        mtuPage?.let { animatePageClose(it) { mtuPage = null } }
+        // Return path from the dedicated screen repaints the summary so that
+        // "Default" → "Custom" flips without reopening settings.
+        openSettingsScreen()
+    }
+
+    private fun editMtu(method: MtuConfig.Method) {
+        if (TunnelStatus.isActive()) {
+            toastShort(Strings.t("Disconnect first to change MTU"))
+            return
+        }
+        val currentRaw = if (MtuConfig.isCustom(this, method)) MtuConfig.get(this, method).toString() else ""
+        val field = settingsField(
+            value = currentRaw,
+            hintText = "${MtuConfig.MIN_MTU}–${MtuConfig.MAX_MTU} · ${method.default} (default)",
+        ).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+        }
+        val dialog = Dialog(this).apply { requestWindowFeature(Window.FEATURE_NO_TITLE) }
+        val sheet = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+            background = roundedBackground(SURFACE, 28, SURFACE)
+        }
+        sheet.addView(LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(createHeaderBackButton { dialog.dismiss() }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(label("${method.title} — ${Strings.t("MTU")}", 18f, INK, TypefaceStyle.MEDIUM))
+        })
+        sheet.addView(label(
+            Strings.t("Empty restores the default. Applies on the next connect."),
+            14f, MUTED,
+        ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(48); topMargin = dp(-4); bottomMargin = dp(16) })
+        val entry = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        entry.addView(field, LinearLayout.LayoutParams(0, dp(56), 1f))
+        entry.addView(createSettingsButton(Strings.t("Apply")) {
+            val raw = field.text.toString().trim()
+            if (raw.isEmpty()) {
+                MtuConfig.reset(this, method)
+                ConnectionLog.record("${method.title} MTU reset to default ${method.default}")
+                toastShort(Strings.tf("%s MTU reset to %s", method.title, method.default))
+                dialog.dismiss()
+                mtuPage?.let { pageHost.removeView(it); mtuPage = null }
+                openMtuScreen()
+                return@createSettingsButton
+            }
+            val typed = raw.toIntOrNull()
+            if (typed == null) {
+                field.error = Strings.t("Numbers only")
+                return@createSettingsButton
+            }
+            val rejection = MtuConfig.rejection(typed)
+            if (rejection != null) {
+                field.error = rejection
+                return@createSettingsButton
+            }
+            MtuConfig.set(this, method, typed)
+            ConnectionLog.record("${method.title} MTU set to $typed")
+            toastShort(Strings.tf("%s MTU set to %s", method.title, typed))
+            dialog.dismiss()
+            mtuPage?.let { pageHost.removeView(it); mtuPage = null }
+            openMtuScreen()
+        }, LinearLayout.LayoutParams(dp(110), dp(56)).apply { leftMargin = dp(10) })
+        sheet.addView(entry, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        dialog.setContentView(FrameLayout(this).apply {
+            setPadding(dp(16), 0, dp(16), dp(16))
+            addView(sheet)
+        })
+        dialog.show()
+        dialog.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            setDimAmount(0.62f)
+            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
+            setGravity(Gravity.BOTTOM)
+        }
+        field.requestFocus()
+    }
+
     /**
      * One network: a section label naming the chain, the address in a monospace
      * block, and a Copy button.
@@ -6932,6 +7077,7 @@ class MainActivity : Activity() {
             dnsPage != null -> closeDnsScreen()
             donatePage != null -> closeDonateScreen()
             tunnelControlsPage != null -> closeTunnelControlsScreen()
+            mtuPage != null -> closeMtuScreen()
             showingLogs -> closeLogsScreen()
             showingScanner -> closeScannerScreen()
             showingMode -> closeModeScreen()

@@ -1324,7 +1324,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             return
         }
 
-        if (!TunEngineManager.start(this, tunFd, port)) {
+        if (!TunEngineManager.start(this, tunFd, port, mtu = MtuConfig.get(this, MtuConfig.Method.PSIPHON))) {
             failAndStop(Strings.t("Could not start whole-device routing"))
             return
         }
@@ -2725,9 +2725,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 if (!proxyMode) {
                     val address = Tun2SocksManager.selectPrivateAddress()
                     ConnectionLog.record("Chain: creating TUN before either tunnel starts")
+                    val psiphonChainMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.PSIPHON)
+                    ConnectionLog.record("MTU: $psiphonChainMtu for Psiphon (chain)")
                     tun = Builder()
                         .setSession("MSN-GUARD")
-                        .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
+                        .setMtu(psiphonChainMtu)
                         .addAddress(address.ipAddress, address.prefixLength)
                         .addRoute("0.0.0.0", 0)
                         .addRoute(address.subnet, address.prefixLength)
@@ -2829,9 +2831,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             try {
                 val address = Tun2SocksManager.selectPrivateAddress()
                 ConnectionLog.record("Tor: creating TUN before Tor starts")
+                val torMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.TOR)
+                ConnectionLog.record("MTU: $torMtu for Tor")
                 tun = Builder()
                     .setSession("MSN-GUARD")
-                    .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
+                    .setMtu(torMtu)
                     .addAddress(address.ipAddress, address.prefixLength)
                     .addRoute("0.0.0.0", 0)
                     .addRoute(address.subnet, address.prefixLength)
@@ -2936,7 +2940,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // e.g. speed tests) DNS replies came back on rebinded conids and
                 // were rejected as "wrong remote address" — name resolution died
                 // mid-session while the tunnel itself was still healthy.
-                if (!TunEngineManager.start(this, tun!!, TorManager.FRONT_SOCKS_PORT, dnsOnly = true)) {
+                if (!TunEngineManager.start(this, tun!!, TorManager.FRONT_SOCKS_PORT, dnsOnly = true, mtu = MtuConfig.get(this, MtuConfig.Method.TOR))) {
                     error("Could not start device routing")
                 }
 
@@ -3000,9 +3004,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             try {
                 val address = Tun2SocksManager.selectPrivateAddress()
                 ConnectionLog.record("SHARD: creating TUN before xray starts")
+                val shardMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.SHARD)
+                ConnectionLog.record("MTU: $shardMtu for SHARD")
                 tun = Builder()
                     .setSession("MSN-GUARD")
-                    .setMtu(Tun2SocksManager.SHARD_TUNNEL_MTU)
+                    .setMtu(shardMtu)
                     .addAddress(address.ipAddress, address.prefixLength)
                     .addRoute("0.0.0.0", 0)
                     .addRoute(address.subnet, address.prefixLength)
@@ -3052,7 +3058,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     error("Could not start the UDP front-end")
                 }
                 activeSocksPort = ShardSocksFront.LISTEN_PORT
-                if (!TunEngineManager.start(this, tun!!, ShardSocksFront.LISTEN_PORT, mtu = Tun2SocksManager.SHARD_TUNNEL_MTU)) {
+                if (!TunEngineManager.start(this, tun!!, ShardSocksFront.LISTEN_PORT, mtu = shardMtu)) {
                     error("Could not start device routing")
                 }
 
@@ -4612,9 +4618,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     val address = Tun2SocksManager.selectPrivateAddress()
 
                     ConnectionLog.record("Creating TUN interface BEFORE Psiphon starts")
+                    val psiphonMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.PSIPHON)
+                    ConnectionLog.record("MTU: $psiphonMtu for Psiphon")
                     tun = Builder()
                         .setSession("MSN-GUARD")
-                        .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
+                        .setMtu(psiphonMtu)
                         .addAddress(address.ipAddress, address.prefixLength)
                         .addRoute("0.0.0.0", 0)
                         .addRoute(address.subnet, address.prefixLength)
@@ -4833,20 +4841,21 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     else -> CoreConfig.SOCKS_PORT
                 }
                 // ── MTU: same for the Builder's VPN interface and the TunEngine.
+                //    Per-method since 2.3.20 — MtuConfig resolves the user's choice
+                //    for THIS transport (MASQUE/WireGuard/WoW), defaulting to the
+                //    measured value each path shipped before the screen existed.
                 //    SHARD is the only tunnel bound to 512 — its WebSocket leg
-                //    drops anything bigger. A WARP leg (like the one behind
-                //    Psiphon or Tor) is WireGuard/MASQUE+jumbo-safe, so pushing
-                //    it down to 512 would fragment every real page while helping
-                //    nothing, and since a2b07e1 1330 was cargo-culted from the
-                //    Zeptun preset — not measured against this path. Restored to
-                //    1420: under 1500, over 1280 (when WARP was fast as a native
-                //    TUN at v2.1.9), and leaves headroom for the SOCKS and WARP
-                //    headers that ride inside the TUN payload. The two must agree
-                //    — a 1500 TUN feeding a 1420 engine (or vice versa) still
+                //    drops anything bigger, and it has its own Builder below. A WARP
+                //    leg (like the one behind Psiphon or Tor) is
+                //    WireGuard/MASQUE+jumbo-safe, so pushing it down to 512 would
+                //    fragment every real page while helping nothing. The two must
+                //    agree — a 1500 TUN feeding a 1420 engine (or vice versa) still
                 //    asks the peer to carry more than the hop advertises.
+                val warpMtu = MtuConfig.forWarpProtocol(this@MsnGuardVpnService, currentProtocol)
+                ConnectionLog.record("MTU: $warpMtu for $currentProtocol")
                 tun = Builder()
                     .setSession("MSN-GUARD")
-                    .setMtu(1420)
+                    .setMtu(warpMtu)
                     .applyTunnelAddresses(addresses)
                     .applyDns(effectiveConfig, addresses, activeEngine)
                     .applyGatewayProxy(effectiveConfig, addresses)
@@ -4857,7 +4866,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 vpnModeActive.set(true)
                 TunnelStatus.isNativeTunMode = false
                 TunnelStatus.isProxyMode = false
-                if (!TunEngineManager.start(this, tun!!, socksForEngine, mtu = 1420)) {
+                if (!TunEngineManager.start(this, tun!!, socksForEngine, mtu = warpMtu)) {
                     ConnectionLog.record("TunEngine failed — falling back to native TUN")
                     try { TunEngineManager.stop(this) } catch (_: Throwable) {}
                     tun?.close(); tun = null; vpnModeActive.set(false)

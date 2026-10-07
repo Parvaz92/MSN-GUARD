@@ -175,10 +175,18 @@ fn build_tuning() -> Tuning {
     // carrier underneath it stops being the narrow part. Both halves are paid
     // for up front on every connection, so the receive side, which is where the
     // traffic is, gets the room and the send side stays modest.
+    //
+    // Raised across the board after the "speed is low" field reports. A carrier
+    // link inside Iran to a Cloudflare edge is 120–250 ms one-way, so the old
+    // Medium numbers (1 MiB rx) cap a single stream at ~8 MB/s even when the
+    // radio has far more to give, and a tunnel that cannot use the radio never
+    // feels fast no matter how good its handshake is. Doubling the receive
+    // window doubles the ceiling on that same RTT for the cost of one buffer
+    // per socket, which is what the tier's memory budget already assumed.
     let (netstack_tcp_rx_buf, netstack_tcp_tx_buf) = match tier {
-        Tier::Low => (256 * 1024, 128 * 1024),
-        Tier::Medium => (1024 * 1024, 256 * 1024),
-        Tier::High => (2 * 1024 * 1024, 512 * 1024),
+        Tier::Low => (512 * 1024, 128 * 1024),
+        Tier::Medium => (2 * 1024 * 1024, 384 * 1024),
+        Tier::High => (4 * 1024 * 1024, 768 * 1024),
     };
 
     let netstack_tcp_rx_buf = buffer_override("AETHER_NETSTACK_TCP_RX", netstack_tcp_rx_buf);
@@ -189,10 +197,14 @@ fn build_tuning() -> Tuning {
     // arrives before we have drained it, so it follows the tier like the rest.
     // The ceiling it sets on a download is window / round-trip-time, which is
     // why the 64 KiB the h2 crate defaults to caps a 130 ms link at ~500 KB/s.
+    //
+    // Raised alongside the TCP windows after the same field reports: the
+    // carrier RTT is the ceiling on both, and the old Medium values (8/16 MiB)
+    // left a second bottleneck even after the TCP side was opened up.
     let (h2_stream_window, h2_connection_window) = match tier {
-        Tier::Low => (2 * 1024 * 1024, 4 * 1024 * 1024),
-        Tier::Medium => (8 * 1024 * 1024, 16 * 1024 * 1024),
-        Tier::High => (16 * 1024 * 1024, 32 * 1024 * 1024),
+        Tier::Low => (4 * 1024 * 1024, 8 * 1024 * 1024),
+        Tier::Medium => (16 * 1024 * 1024, 32 * 1024 * 1024),
+        Tier::High => (32 * 1024 * 1024, 64 * 1024 * 1024),
     };
 
     Tuning {
