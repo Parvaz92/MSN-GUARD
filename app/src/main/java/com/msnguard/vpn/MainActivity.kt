@@ -6256,7 +6256,8 @@ class MainActivity : Activity() {
         // part of "how do I fill this in" rather than as a footer action.
         // Disabled while a scan runs: ping() blocks a worker thread and a
         // second tap would start a second binary search against the same line.
-        val scanButton = createSettingsButton(Strings.t("Scan the best value"), icon = R.drawable.ic_settings) {
+        lateinit var scanButton: TextView
+        scanButton = createSettingsButton(Strings.t("Scan the best value"), icon = R.drawable.ic_settings) {
             if (mtuScanning) return@createSettingsButton
             mtuScanning = true
             scanButton.text = Strings.tf("Scanning… %s", MtuConfig.MIN_MTU)
