@@ -304,6 +304,29 @@ object CoreConfig {
             out["AETHER_MASQUE_HTTP2"] = "1"
         }
 
+        // 2.3.21: the user's MTU has to reach the engine too, not just the
+        // Android TUN. The engine sizes its own netstack and the masque
+        // datagram budget from these two variables alone; without them the
+        // inner tunnel keeps 1280/1500 whatever the screen says, and the
+        // TUN/engine mismatch the comment in MsnGuardVpnService warns about
+        // comes back — the number changes and nothing on the wire does.
+        // Only sent when the user actually picked something, so an untouched
+        // install keeps the engine's own defaults exactly.
+        if (MtuConfig.isCustom(context, MtuConfig.Method.MASQUE)) {
+            out["AETHER_MASQUE_MTU"] = MtuConfig.get(context, MtuConfig.Method.MASQUE).toString()
+        }
+        if (MtuConfig.isCustom(context, MtuConfig.Method.WIREGUARD)) {
+            out["AETHER_WG_MTU"] = MtuConfig.get(context, MtuConfig.Method.WIREGUARD).toString()
+        }
+        if (MtuConfig.isCustom(context, MtuConfig.Method.WOW)) {
+            // WoW's outer leg is WireGuard and its inner hop rides inside a
+            // masque tunnel, so both knobs apply; the masque one is capped by
+            // mim_inner_budget so an inner that no longer fits is refused with
+            // a named error rather than silently truncated.
+            out["AETHER_WG_MTU"] = MtuConfig.get(context, MtuConfig.Method.WOW).toString()
+            out["AETHER_MASQUE_MTU"] = MtuConfig.get(context, MtuConfig.Method.WOW).toString()
+        }
+
         // TLS fingerprint. The engine applies Chrome's groups/ciphers when this
         // is "chrome"; a custom list is passed through as-is.
         text("tls_curve_preset").ifBlank { "chrome" }.let { preset ->
@@ -321,6 +344,15 @@ object CoreConfig {
         if (!bool("wireguard_data_check", true)) {
             out["AETHER_WG_NO_DATA_CHECK"] = "1"
         }
+
+        // Traffic counters for the WARP path: socks.rs add_up/add_down is
+        // gated on AETHER_STATS, and 2.3.0's job model emits no "traffic"
+        // events to the host. Without this the VPN-mode MASQUE/WireGuard/WoW
+        // counters never move and Up/Down/Speed + Traffic Monitor sit at 0 on
+        // every TunEngine (Hev/Zeptun/Badvpn). FCAE sets exactly the same
+        // (runtime/src/config.rs: flag("AETHER_STATS", true) + 86400).
+        out["AETHER_STATS"] = "1"
+        out["AETHER_STATS_SECS"] = "86400"
 
         out["AETHER_LOG_LEVEL"] = text("log_level", "info")
         out["AETHER_PERF_PROFILE"] = text("perf_profile", "auto")

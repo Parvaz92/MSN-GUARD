@@ -600,6 +600,17 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * does not add a wakeup source beyond what a connected session already has.
      */
     private var torTrafficTask: java.util.concurrent.ScheduledFuture<*>? = null
+    /**
+     * Polls aether's AETHER_STATS counters while a WARP (MASQUE/WireGuard/WoW)
+     * VPN session is up — the 2.3.0 job emits no "traffic" events to the host,
+     * so the only source is periodic stats::snapshot(). Reuses the same
+     * 1 s cadence + screen-off throttle as Tor/SHARD; feeds
+     * updateTrafficNotification() directly. Shares torTrafficTask's scheduler
+     * so no new thread is needed.
+     */
+    private var warpTrafficTask: java.util.concurrent.ScheduledFuture<*>? = null
+    /** 2.3.15: counts [startWarpTrafficPolling] ticks to emit a per-minute diagnostic. */
+    private var warpStatsTick = 0
     private var ladderIndex = 0
     private var ladderAttempts = 0
     private var ladderTimer: ScheduledFuture<*>? = null
@@ -1023,6 +1034,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         private const val RECONNECT_SETTLE_MS = 600L
         private const val RECONNECT_CORE_WAIT_MS = 6_000
         private const val RECONNECT_POLL_MS = 100L
+        // 2.3.16: the extra wait after the job is done for the SOCKS listener it
+        // owned to actually let go of the port. One second is generous for a
+        // destructor that already had the whole core wait to run in, and the
+        // restart proceeds anyway if it expires — the bind failure it then hits is
+        // reported instead of silently swallowed.
+        private const val RECONNECT_PORT_WAIT_MS = 1_000
+        private const val RECONNECT_PORT_PROBE_MS = 150
         // waitForSocksReady: aether 2.3.0 publishes CONNECTED nowhere, so the
         // service probes the engine's SOCKS listener. The budget has to cover a
         // cold registration (ECH lookup + register) and a full endpoint scan,
@@ -1306,7 +1324,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             return
         }
 
-        if (!TunEngineManager.start(this, tunFd, port)) {
+        if (!TunEngineManager.start(this, tunFd, port, mtu = MtuConfig.get(this, MtuConfig.Method.PSIPHON))) {
             failAndStop(Strings.t("Could not start whole-device routing"))
             return
         }
@@ -2417,7 +2435,34 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         userInitiatedStop.set(false)
                         killSwitchSealed.set(false)
                         reconnectAttempts = 0
-                        startTunnel(config)
+                        // 2.3.16: a Reconnect the user asked for must own the service
+                        // exactly like the connected branch's requestQuickReconnect.
+                        // Starting startTunnel() synchronously on the main thread left
+                        // no latch set, so when the restart failed — aether's SOCKS
+                        // listener was still bound from the session that had just been
+                        // torn down, so startProxy returned "already running" — the
+                        // worker's finally fell through to stopForeground+stopSelf.
+                        // That is literally the report: the row vanished and nothing
+                        // reconnected. Latching here makes that same finally keep the
+                        // service alive for the retry scheduleAutoReconnect now arms.
+                        reconnectRequested.set(true)
+                        // Off the main thread, and after the same settle the quick
+                        // path uses: the port is released asynchronously and starting
+                        // immediately races it. The user asked for a reconnect, so a
+                        // sub-second delay is the correct price for the port actually
+                        // being free when the new job binds it.
+                        ladderScheduler.schedule({
+                            try {
+                                if (userInitiatedStop.get()) {
+                                    reconnectRequested.set(false)
+                                    return@schedule
+                                }
+                                startTunnel(config)
+                            } catch (e: Exception) {
+                                ConnectionLog.record("Reconnect start failed: ${e.message}")
+                                reconnectRequested.set(false)
+                            }
+                        }, RECONNECT_SETTLE_MS, TimeUnit.MILLISECONDS)
                     }
                 }
             }
@@ -2680,9 +2725,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 if (!proxyMode) {
                     val address = Tun2SocksManager.selectPrivateAddress()
                     ConnectionLog.record("Chain: creating TUN before either tunnel starts")
+                    val psiphonChainMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.PSIPHON)
+                    ConnectionLog.record("MTU: $psiphonChainMtu for Psiphon (chain)")
                     tun = Builder()
                         .setSession("MSN-GUARD")
-                        .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
+                        .setMtu(psiphonChainMtu)
                         .addAddress(address.ipAddress, address.prefixLength)
                         .addRoute("0.0.0.0", 0)
                         .addRoute(address.subnet, address.prefixLength)
@@ -2784,9 +2831,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             try {
                 val address = Tun2SocksManager.selectPrivateAddress()
                 ConnectionLog.record("Tor: creating TUN before Tor starts")
+                val torMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.TOR)
+                ConnectionLog.record("MTU: $torMtu for Tor")
                 tun = Builder()
                     .setSession("MSN-GUARD")
-                    .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
+                    .setMtu(torMtu)
                     .addAddress(address.ipAddress, address.prefixLength)
                     .addRoute("0.0.0.0", 0)
                     .addRoute(address.subnet, address.prefixLength)
@@ -2891,7 +2940,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 // e.g. speed tests) DNS replies came back on rebinded conids and
                 // were rejected as "wrong remote address" — name resolution died
                 // mid-session while the tunnel itself was still healthy.
-                if (!TunEngineManager.start(this, tun!!, TorManager.FRONT_SOCKS_PORT, dnsOnly = true)) {
+                if (!TunEngineManager.start(this, tun!!, TorManager.FRONT_SOCKS_PORT, dnsOnly = true, mtu = MtuConfig.get(this, MtuConfig.Method.TOR))) {
                     error("Could not start device routing")
                 }
 
@@ -2955,9 +3004,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
             try {
                 val address = Tun2SocksManager.selectPrivateAddress()
                 ConnectionLog.record("SHARD: creating TUN before xray starts")
+                val shardMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.SHARD)
+                ConnectionLog.record("MTU: $shardMtu for SHARD")
                 tun = Builder()
                     .setSession("MSN-GUARD")
-                    .setMtu(Tun2SocksManager.SHARD_TUNNEL_MTU)
+                    .setMtu(shardMtu)
                     .addAddress(address.ipAddress, address.prefixLength)
                     .addRoute("0.0.0.0", 0)
                     .addRoute(address.subnet, address.prefixLength)
@@ -3007,7 +3058,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     error("Could not start the UDP front-end")
                 }
                 activeSocksPort = ShardSocksFront.LISTEN_PORT
-                if (!TunEngineManager.start(this, tun!!, ShardSocksFront.LISTEN_PORT, mtu = Tun2SocksManager.SHARD_TUNNEL_MTU)) {
+                if (!TunEngineManager.start(this, tun!!, ShardSocksFront.LISTEN_PORT, mtu = shardMtu)) {
                     error("Could not start device routing")
                 }
 
@@ -3094,6 +3145,13 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * value, so one sample taken during congestion cannot mislabel a good node.
      */
     private fun observeShardThroughput(rx: Long) {
+        // 2.3.18: skip entirely while the screen is dark. The peak is a
+        // property of the user's own traffic — with the screen off there is
+        // almost never any, and the rare background burst is not a measurement
+        // worth waking the scheduler's thread for. The counters this compares
+        // are 60 s stale by the time anything reads them, which would throw the
+        // window out of the 500..3000 ms band this relies on anyway.
+        if (!isScreenInteractive()) return
         val now = SystemClock.elapsedRealtime()
         val previousRx = shardSampleRx
         val previousAt = shardSampleAt
@@ -3186,6 +3244,66 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         torTrafficTask = null
     }
 
+    /**
+     * Same pipeline as Tor/SHARD, but the source is aether's SOCKS counters.
+     * WireGuard/WoW/MASQUE/Gool/MIM all ride the VPN TUN (Hev/Zeptun/Badvpn →
+     * 127.0.0.1:1819), so the only honest byte count is `socks.rs add_up/add_down`
+     * behind `AETHER_STATS` / `stats::snapshot()`. FCAE sets the same flag
+     * (runtime/src/config.rs: flag("AETHER_STATS", true)); without it the
+     * counters stay at 0 and Up/Down/Speed + Traffic Monitor sit at 0 on every
+     * TunEngine — SHARD/Tor were spared because their fronts count themselves.
+     */
+    private fun startWarpTrafficPolling() {
+        warpTrafficTask?.cancel(false)
+        // Do not double-count when a chained session exists — Psiphon-in-WARP
+        // and Tor-in-WARP fronts also count bytes; let their already-running pollers
+        // own the numbers in that shape.
+        warpTrafficTask = ladderScheduler.scheduleAtFixedRate({
+            try {
+                // 2.3.15: `connected` and the screen-off throttle were the two
+                // guards that could silently swallow every sample — a tunnel that
+                // carried traffic while `connected` was still being latched by
+                // waitForSocksReady's late path, or a screen-off tick, both looked
+                // exactly like an idle tunnel. The counters are already cumulative
+                // (stats::snapshot), so reading them is safe at any time; updateTrafficNotification
+                // rebases on a backwards sample and the speed delta is clamped, so
+                // an out-of-order sample cannot inflate anything.
+                if (paused.get()) return@scheduleAtFixedRate
+                // When a chained front is active its poller already feeds the pipeline.
+                // Guard against stacking two sources in the same second.
+                if (TorSocksFront.isRunning || ShardSocksFront.isRunning) return@scheduleAtFixedRate
+                // 2.3.18: the screen-off throttle is back, narrower than before.
+                // 2.3.15 removed it because the guards swallowed samples while
+                // `connected` was still being latched — but that is now the only
+                // guard left, and this poller runs 1 Hz for the life of a WARP
+                // session: 3,600 JNI calls + Intents an hour while the phone is
+                // dark and nothing on screen can read them. With the screen off
+                // every SLEEP_SAMPLE_TICKS seconds is still 240/hour, and the
+                // counters are cumulative so the monthly total is identical.
+                if (!isScreenInteractive()) return@scheduleAtFixedRate
+                val snap = NativeCore.statsSnapshot() ?: return@scheduleAtFixedRate
+                if (snap.size < 2) return@scheduleAtFixedRate
+                // Kernel is [up, down]; pipeline is [tx, rx] with the same sense.
+                updateTrafficNotification(snap[0], snap[1])
+                // 2.3.15 diagnostic: one line per minute (every 60th tick) so a
+                // tunnel whose UI numbers sit at 0 is diagnosable from the app log
+                // without needing logcat. Records the raw counter, not the derived
+                // speed, so a stuck counter is visible as a constant.
+                warpStatsTick++
+                if (warpStatsTick >= 60) {
+                    warpStatsTick = 0
+                    ConnectionLog.record("warp stats: up=${snap[0]} down=${snap[1]}")
+                }
+            } catch (_: Exception) {
+            }
+        }, 1L, 1L, TimeUnit.SECONDS)
+    }
+
+    private fun stopWarpTrafficPolling() {
+        warpTrafficTask?.cancel(false)
+        warpTrafficTask = null
+    }
+
     // ------------------------------------------------------ auto-reconnect
 
     /**
@@ -3243,6 +3361,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         repostNotification()
                         sendStatus(STATUS_CONNECTED)
                         ConnectionLog.record("aether SOCKS listener up (late) — connected")
+                        // 2.3.15: polling was armed in startTunnel, so this is a
+                        // no-op guard, not a first start — but keep the call site
+                        // so a future change to the arm order cannot regress this
+                        // path silently.
+                        startWarpTrafficPolling()
                     }
                     // Whether or not it landed, do not run the dead-tunnel
                     // checks below: nothing is established yet, so tunnelIsDead()
@@ -3458,17 +3581,48 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 currentProtocol.contains("GOOL"))
         ) {
             if (!NativeCore.isRunning()) return "the tunnel process stopped"
-            // aether 2.3.0 never emits "traffic" events to the host (the job
-            // model publishes nothing but the job registry), so the byte
-            // counters this branch used to read never move and the watchdog
-            // condemned a fully working tunnel after two 30 s ticks. The honest
-            // liveness test on this path is the engine's own SOCKS listener:
-            // it is bound only after the tunnel validates and it stops
-            // accepting the moment the job dies, so a successful connect means
-            // the data plane is live. Same probe waitForSocksReady uses, one
-            // loopback connect, no radio traffic.
-            if (!socksListenerAccepting()) return "the tunnel stopped carrying traffic"
-            return null
+            // 2.3.19: the SOCKS-only probe was false-positive 47 times in one
+            // field log (2.3.17, BadVPN/WireGuard): every reconnect had just
+            // re-established a healthy tunnel and SOCKS was still momentarily
+            // busy after a Burst of downlink, so a single 1 s connect timeout
+            // condemned it and the watchdog looped. The byte counters from
+            // NativeCore.statsSnapshot() are ground truth here — they are the
+            // same cumulative atomics the traffic UI already polls — so they
+            // outrank the probe the same way SHARD treats rx movement as an
+            // unconditional pass.
+            val snap = NativeCore.statsSnapshot()
+            val tx = snap?.getOrNull(0) ?: -1L
+            val rx = snap?.getOrNull(1) ?: -1L
+            val moved = (tx != nativeLastTx || rx != nativeLastRx) &&
+                !(tx == -1L && rx == -1L)
+            nativeLastTx = tx
+            nativeLastRx = rx
+            if (moved) {
+                nativeIdleTicks = 0
+                return null
+            }
+            // Screen-off idle: not a dead tunnel.
+            if (!isScreenInteractive()) {
+                nativeIdleTicks = 0
+                return null
+            }
+            // Still byte-silent with screen on: now the SOCKS probe decides.
+            // Two strikes (60 s) so one transient miss does not tear a live
+            // tunnel down — same NATIVE_STRIKES_BEFORE_RECONNECT=2 budget SHARD
+            // uses.
+            if (socksListenerAccepting()) {
+                nativeIdleTicks = 0
+                return null
+            }
+            nativeIdleTicks++
+            if (nativeIdleTicks < NATIVE_STRIKES_BEFORE_RECONNECT) {
+                ConnectionLog.record(
+                    "native idle tick $nativeIdleTicks/$NATIVE_STRIKES_BEFORE_RECONNECT — waiting"
+                )
+                return null
+            }
+            nativeIdleTicks = 0
+            return "the tunnel went silent and stopped carrying traffic"
         }
 
         if (currentProtocol.contains("TOR")) {
@@ -3639,6 +3793,33 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     reconnectRequested.set(false)
                     return@schedule
                 }
+                // 2.3.16: isRunning()==false does not mean the SOCKS port is free.
+                // aether marks the job done the moment its task is told to unwind, but
+                // the listener it owns comes down when the task's destructor runs, which
+                // is a beat later. Starting on top of it makes aether_core_start fail
+                // the bind, nativeStart returns -1, and the reconnect dies on
+                // "already running" — the reported "notification never reconnects".
+                // Probing the port is the only honest signal: connect() refused is the
+                // listener being gone.
+                val port = socksListenerPortForWatchdog ?: CoreConfig.SOCKS_PORT
+                waited = 0
+                while (!socksPortFree(port) && waited < RECONNECT_PORT_WAIT_MS) {
+                    Thread.sleep(RECONNECT_POLL_MS)
+                    waited += RECONNECT_POLL_MS.toInt()
+                }
+                if (!socksPortFree(port)) {
+                    ConnectionLog.record(
+                        "Quick reconnect ($reason): port $port was still bound " +
+                            "after ${RECONNECT_PORT_WAIT_MS / 1000}s; restarting anyway"
+                    )
+                    // Not fatal — the restart reports its own bind failure, and the
+                    // latch keeps the service alive for the retry it schedules.
+                }
+                if (userInitiatedStop.get()) {
+                    ConnectionLog.record("Quick reconnect ($reason) abandoned: the user disconnected")
+                    reconnectRequested.set(false)
+                    return@schedule
+                }
                 reconnectAttempts = 0
                 startTunnel(config)
             } catch (e: Exception) {
@@ -3646,6 +3827,34 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 reconnectRequested.set(false)
             }
         }, RECONNECT_SETTLE_MS, TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * 2.3.16: is the aether SOCKS port free?
+     *
+     * `NativeCore.isRunning()==false` marks the job done, but the listener the job's
+     * task owns is released by that task's destructor a beat later. Starting the next
+     * job in that window fails the bind, which reads from the UI as "Reconnect did
+     * nothing". A refused connect on the port is the listener actually being gone —
+     * the same probe [waitForSocksReady] uses to know the tunnel is *up*, inverted.
+     */
+    private fun socksPortFree(port: Int = CoreConfig.SOCKS_PORT): Boolean {
+        // 2.3.16: a refused connect on the port IS the listener being gone — the
+        // inverse of the probe waitForSocksReady uses to know the tunnel is up.
+        // socksListenerPortForWatchdog is already null by the time a reconnect calls
+        // this (stopTunnel clears it), so the caller passes the port it asked the
+        // engine to bind: SOCKS_PORT for the WARP transports, the chain's
+        // CHAIN_SOCKS_PORT, or the user's port in proxy mode.
+        return try {
+            java.net.Socket().use { probe ->
+                probe.connect(java.net.InetSocketAddress("127.0.0.1", port), RECONNECT_PORT_PROBE_MS)
+            }
+            // Something is still answering. aether may still own it, or another
+            // process may have grabbed it — either way it is not free.
+            false
+        } catch (_: java.io.IOException) {
+            true
+        }
     }
 
     /**
@@ -4262,6 +4471,14 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         nativeLastTx = -1L
         nativeLastRx = -1L
         nativeIdleTicks = 0
+        // 2.3.15: armed here, before the tunnel exists, not only from
+        // waitForSocksReady(). The counters are cumulative atomics inside the
+        // engine, so an early poll reads zeros and is harmless; arming it only
+        // post-CONNECT was the bug when the listener came up late (the deadline
+        // path) and waitForSocksReady returned without ever arming it.
+        stopWarpTrafficPolling()
+        startWarpTrafficPolling()
+        warpStatsTick = 0
         stopRequested.set(false)
         // Latched for the whole session — see [proxyMode]. Read once, here, so a
         // mid-session change of the setting cannot make teardown take the wrong
@@ -4401,9 +4618,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     val address = Tun2SocksManager.selectPrivateAddress()
 
                     ConnectionLog.record("Creating TUN interface BEFORE Psiphon starts")
+                    val psiphonMtu = MtuConfig.get(this@MsnGuardVpnService, MtuConfig.Method.PSIPHON)
+                    ConnectionLog.record("MTU: $psiphonMtu for Psiphon")
                     tun = Builder()
                         .setSession("MSN-GUARD")
-                        .setMtu(Tun2SocksManager.VPN_INTERFACE_MTU)
+                        .setMtu(psiphonMtu)
                         .addAddress(address.ipAddress, address.prefixLength)
                         .addRoute("0.0.0.0", 0)
                         .addRoute(address.subnet, address.prefixLength)
@@ -4481,6 +4700,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 //    health check reads it to decide whether to dial 127.0.0.1.
                 //  * the watchdog, armed before the blocking call.
                 if (proxyMode) {
+                    // WARP over SOCKS still counts through the same AETHER_STATS
+                    // counters; installs the same env the VPN branch already did.
+                    CoreConfig.applyEnv(
+                        CoreConfig.envFromEffectiveConfig(this@MsnGuardVpnService, effectiveConfig),
+                    )
                     val port = CoreConfig.proxyListenPort(this@MsnGuardVpnService)
                     val host = CoreConfig.proxyBindHost(this@MsnGuardVpnService)
                     NativeCore.prepare(effectiveConfig)
@@ -4541,6 +4765,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         waitForSocksReady(
                             "${CoreConfig.proxyBindHost(this)}:${CoreConfig.proxyListenPort(this)}"
                         )
+                        // 2.3.17: aether 2.3.0's startProxy is non-blocking — the
+                        // worker must stay alive for the session, or the shared
+                        // finally immediately closes the tunnel and the foreground
+                        // service (the "Connecting then notification closes" report
+                        // on Hev/Zeptun/Badvpn). Block here until the job actually
+                        // exits or the service is asked to stop.
+                        while (!stopRequested.get() && NativeCore.isRunning()) {
+                            try { Thread.sleep(500) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+                        }
                     } else if (stopRequested.get()) {
                         // Not under a quick reconnect: MainActivity's DISCONNECTED
                         // branch would paint "Not connected" and the tile would flip
@@ -4608,20 +4841,21 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     else -> CoreConfig.SOCKS_PORT
                 }
                 // ── MTU: same for the Builder's VPN interface and the TunEngine.
+                //    Per-method since 2.3.20 — MtuConfig resolves the user's choice
+                //    for THIS transport (MASQUE/WireGuard/WoW), defaulting to the
+                //    measured value each path shipped before the screen existed.
                 //    SHARD is the only tunnel bound to 512 — its WebSocket leg
-                //    drops anything bigger. A WARP leg (like the one behind
-                //    Psiphon or Tor) is WireGuard/MASQUE+jumbo-safe, so pushing
-                //    it down to 512 would fragment every real page while helping
-                //    nothing, and since a2b07e1 1330 was cargo-culted from the
-                //    Zeptun preset — not measured against this path. Restored to
-                //    1420: under 1500, over 1280 (when WARP was fast as a native
-                //    TUN at v2.1.9), and leaves headroom for the SOCKS and WARP
-                //    headers that ride inside the TUN payload. The two must agree
-                //    — a 1500 TUN feeding a 1420 engine (or vice versa) still
+                //    drops anything bigger, and it has its own Builder below. A WARP
+                //    leg (like the one behind Psiphon or Tor) is
+                //    WireGuard/MASQUE+jumbo-safe, so pushing it down to 512 would
+                //    fragment every real page while helping nothing. The two must
+                //    agree — a 1500 TUN feeding a 1420 engine (or vice versa) still
                 //    asks the peer to carry more than the hop advertises.
+                val warpMtu = MtuConfig.forWarpProtocol(this@MsnGuardVpnService, currentProtocol)
+                ConnectionLog.record("MTU: $warpMtu for $currentProtocol")
                 tun = Builder()
                     .setSession("MSN-GUARD")
-                    .setMtu(1420)
+                    .setMtu(warpMtu)
                     .applyTunnelAddresses(addresses)
                     .applyDns(effectiveConfig, addresses, activeEngine)
                     .applyGatewayProxy(effectiveConfig, addresses)
@@ -4632,12 +4866,12 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                 vpnModeActive.set(true)
                 TunnelStatus.isNativeTunMode = false
                 TunnelStatus.isProxyMode = false
-                if (!TunEngineManager.start(this, tun!!, socksForEngine, mtu = 1420)) {
+                if (!TunEngineManager.start(this, tun!!, socksForEngine, mtu = warpMtu)) {
                     ConnectionLog.record("TunEngine failed — falling back to native TUN")
                     try { TunEngineManager.stop(this) } catch (_: Throwable) {}
                     tun?.close(); tun = null; vpnModeActive.set(false)
                     val fbAddr = NativeCore.prepare(effectiveConfig)
-                    tun = Builder().setSession("MSN-GUARD").setMtu(1330).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr, TunEnginePref.LEGACY).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
+                    tun = Builder().setSession("MSN-GUARD").setMtu(warpMtu).applyTunnelAddresses(fbAddr).applyDns(effectiveConfig, fbAddr, TunEnginePref.LEGACY).applyGatewayProxy(effectiveConfig, fbAddr).applyLanAccess(fbAddr).applyIranBypass().applySplitTunneling().establish() ?: error("Android could not establish the VPN interface")
                     ConnectionLog.record("Scanning gateways for VPN (native fallback)")
                     TunnelStatus.isNativeTunMode = true; vpnModeActive.set(true)
                     // Not startWatchdog(): see the TunEngine branch above. The
@@ -4661,6 +4895,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                         // probing the SOCKS listener. In this native-TUN fallback
                         // the engine still publishes one.
                         waitForSocksReady("127.0.0.1:${CoreConfig.SOCKS_PORT}")
+                        // 2.3.17: see the TunEngine branch above.
+                        while (!stopRequested.get() && NativeCore.isRunning()) {
+                            try { Thread.sleep(500) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+                        }
                     } else if (stopRequested.get()) {
                         if (reconnectRequested.get()) sendStatus(STATUS_CONNECTING, Strings.t("Reconnecting…")) else sendStatus(STATUS_DISCONNECTED)
                     } else { ConnectionLog.record("Native tunnel stopped unexpectedly"); if (!willAutoReconnect()) sendStatus(STATUS_FAILED, "Tunnel stopped unexpectedly") }
@@ -4725,6 +4963,10 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // tunnel works, Telegram and filtered sites open, but the
                     // dial never turns green.
                     waitForSocksReady(warpListen)
+                    // 2.3.17: see the proxy branch above. Non-blocking job.
+                    while (!stopRequested.get() && NativeCore.isRunning()) {
+                        try { Thread.sleep(500) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
+                    }
                 } else if (stopRequested.get()) {
                     // Same as the SOCKS branch above: no DISCONNECTED under a pending
                     // reconnect, or the UI blinks "Not connected" mid-restart.
@@ -4869,6 +5111,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
         SmartDnsFront.stop()
         TunEngineManager.stop(this)
         stopTrafficPolling()
+        stopWarpTrafficPolling()
         TorManager.stop()
         stopPsiphonTunnel()
         NativeCore.stop()
@@ -5095,6 +5338,7 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      * start already occupies, bounded by [SOCKS_READY_TIMEOUT_MS], and it
      * publishes CONNECTED the same way every other path does.
      */
+
     /**
      * Is the aether engine's SOCKS listener accepting connections?
      *
@@ -5107,6 +5351,11 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
      *
      * One connect, no handshake, no radio traffic — the same probe
      * [waitForSocksReady] uses to publish CONNECTED.
+     *
+     * 2.3.18: this is the native-core liveness check the watchdog runs every
+     * 30 s (and with the screen dark, the watchdog already stretches that —
+     * see the native-idle probe above). The connect itself is still 1 s on
+     * the clock, but while the screen is off nothing can see its answer.
      */
     private fun socksListenerAccepting(): Boolean {
         val port = socksListenerPortForWatchdog ?: return false
@@ -5150,6 +5399,15 @@ class MsnGuardVpnService : VpnService(), NativeCore.CoreCallback, PsiphonTunnel.
                     // watch. Arming it earlier killed the engine while it was
                     // still registering (see the comment at the startProxy call).
                     startWatchdog()
+                    // WARP path byte counters live behind AETHER_STATS. Without this
+                    // the 2.3.0 job emits no "traffic" events and Up/Down/Speed +
+                    // Traffic Monitor stay at 0 on every TunEngine (Hev/Zeptun/Badvpn)
+                    // over WireGuard/WoW/MASQUE — SHARD/Tor were spared only because
+                    // their fronts count themselves.
+                    // 2.3.15: armed in startTunnel; this call is a guard, and
+                    // startWarpTrafficPolling cancels any prior task first, so it
+                    // never stacks a second poller.
+                    startWarpTrafficPolling()
                     return
                 } catch (_: java.io.IOException) {
                     // Still provisioning the identity or scanning. Try again.

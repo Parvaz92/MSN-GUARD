@@ -1457,12 +1457,14 @@ async fn handle_udp_associate(
                             }
                         }
                     };
+                    crate::stats::add_up(payload.1.len());
                     let _ = sender.send_to(dst, payload.1).await;
                 }
             }
 
             maybe = from_stack.recv() => {
                 let (src, data) = match maybe { Some(v) => v, None => break };
+                crate::stats::add_down(data.len());
                 if let Some(c) = client {
                     let pkt = build_udp_reply(src, &data);
                     let _ = relay.send_to(&pkt, c).await;
@@ -1471,6 +1473,7 @@ async fn handle_udp_associate(
 
             r = direct_relay.recv_from(&mut dbuf) => {
                 let (n, from) = match r { Ok(v) => v, Err(_) => continue };
+                crate::stats::add_down(n);
                 if let Some(c) = client {
                     let pkt = build_udp_reply(from, &dbuf[..n]);
                     let _ = relay.send_to(&pkt, c).await;

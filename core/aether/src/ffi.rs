@@ -329,6 +329,18 @@ pub extern "C" fn aether_job_free(id: u64) -> *mut c_char {
 }
 
 #[no_mangle]
+pub extern "C" fn aether_stats_snapshot() -> *mut c_char {
+    respond(|| {
+        let counters = crate::stats::snapshot();
+        Ok(json!({
+            "up": counters.up,
+            "down": counters.down,
+            "uptime": counters.uptime.as_secs(),
+        }))
+    })
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn aether_identity_open(payload: *const c_char) -> *mut c_char {
     respond(|| {
         let payload: OpenPayload = unsafe { read_json(payload) }?;

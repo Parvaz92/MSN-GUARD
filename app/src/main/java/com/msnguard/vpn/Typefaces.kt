@@ -46,7 +46,7 @@ object Typefaces {
     }
 
     /**
-     * Between medium and bold — the weight WhiteAesther's Persian UI is set in.
+     * Between medium and bold — the weight the Persian UI is set in.
      *
      * Persian has no bold-on-light contrast tradition to lean on: heavy weights
      * close the counters that distinguish ع from غ and ک from گ, so a heading
