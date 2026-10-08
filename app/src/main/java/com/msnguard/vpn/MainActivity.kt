@@ -311,6 +311,8 @@ class MainActivity : Activity() {
     private var dnsPage: View? = null
     private var donatePage: View? = null
     private var mtuPage: View? = null
+    private var mtuScanning: Boolean = false
+    private var mtuScanResult: MtuProbe.Result? = null
     private var trafficSpeedValue: TextView? = null
     private var trafficSessionValue: TextView? = null
     private var trafficTx = 0L
@@ -6249,6 +6251,47 @@ class MainActivity : Activity() {
             Strings.t("Empty restores the default. Applies on the next connect."),
             14f, MUTED,
         ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(48); topMargin = dp(-4); bottomMargin = dp(16) })
+
+        // The scanner button sits between the hint and the field so it reads as
+        // part of "how do I fill this in" rather than as a footer action.
+        // Disabled while a scan runs: ping() blocks a worker thread and a
+        // second tap would start a second binary search against the same line.
+        val scanButton = createSettingsButton(Strings.t("Scan the best value"), icon = R.drawable.ic_settings) {
+            if (mtuScanning) return@createSettingsButton
+            mtuScanning = true
+            scanButton.text = Strings.tf("Scanning… %s", MtuConfig.MIN_MTU)
+            scanButton.isEnabled = false
+            Thread {
+                val r = MtuProbe.measure(method) { size ->
+                    runOnUiThread { scanButton.text = Strings.tf("Scanning… %s", size) }
+                }
+                runOnUiThread {
+                    mtuScanning = false
+                    scanButton.isEnabled = true
+                    scanButton.text = Strings.t("Scan the best value")
+                    mtuScanResult = r
+                    val found = r.inner
+                    when {
+                        found == null && r.localTermination ->
+                            toastShort(Strings.tf("%s needs no scan — using %s", method.title, MtuConfig.get(this, method)))
+                        found == null ->
+                            toastShort(Strings.t("This line dropped every probe — MTU unchanged"))
+                        else -> {
+                            field.setText(found.toString())
+                            toastShort(Strings.tf("Best MTU for %s on this line: %s", method.title, found))
+                        }
+                    }
+                }
+            }.start()
+        }
+        sheet.addView(scanButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { bottomMargin = dp(14) })
+        mtuScanResult?.takeIf { it.method == method }?.inner?.let { found ->
+            sheet.addView(label(
+                Strings.tf("Last scan: %s (path %s, %s probes)", found, mtuScanResult?.outerPathMtu ?: "—", mtuScanResult?.probes ?: 0),
+                12f, MUTED,
+            ), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(12) })
+        }
+
         val entry = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         entry.addView(field, LinearLayout.LayoutParams(0, dp(56), 1f))
         entry.addView(createSettingsButton(Strings.t("Apply")) {

@@ -706,6 +706,36 @@ object Strings {
             "نام دامنه‌های اختیاری SNI، جدا شده با کاما، فاصله یا خط جدید. حالت‌های بدون SNI هم امتحان می‌شوند.",
             "可选的额外 SNI 主机名，以逗号、空格或换行分隔。也会尝试无 SNI 的变体。",
         ),
+        "Scan the best value" to Triple(
+            "Scan the best value",
+            "بهترین مقدار را پیدا کن",
+            "扫描最佳值",
+        ),
+        "Scanning… %s" to Triple(
+            "Scanning… %s",
+            "در حال اندازه‌گیری… %s",
+            "正在扫描… %s",
+        ),
+        "Best MTU for %s on this line: %s" to Triple(
+            "Best MTU for %s on this line: %s",
+            "بهترین MTU برای %s روی این خط: %s",
+            "此线路上 %s 的最佳 MTU: %s",
+        ),
+        "%s needs no scan — using %s" to Triple(
+            "%s needs no scan — using %s",
+            "%s نیازی به اسکن ندارد — مقدار %s",
+            "%s 无需扫描 — 使用 %s",
+        ),
+        "This line dropped every probe — MTU unchanged" to Triple(
+            "This line dropped every probe — MTU unchanged",
+            "این خط به هیچ بسته‌ای پاسخ نداد — MTU تغییر نکرد",
+            "此线路未响应探测 — MTU 未改变",
+        ),
+        "Last scan: %s (path %s, %s probes)" to Triple(
+            "Last scan: %s (path %s, %s probes)",
+            "آخرین اسکن: %s (مسیر %s، %s بسته)",
+            "上次扫描: %s (路径 %s, %s 次探测)",
+        ),
     )
 
     /** Translate [key] into the active language, falling back to English. */
