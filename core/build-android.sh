@@ -78,13 +78,8 @@ if [[ -z "$NDK" || ! -d "$NDK" || ! -d "$BIN" || -z "$CMAKE" || ! -x "$CMAKE" ]]
   exit 1
 fi
 
-# Force fresh dependency resolution for rand 0.10 (avoid stale Cargo.lock from cache)
-rm -f "$CRATE/Cargo.lock"
-(
-  cd "$CRATE"
-  cargo generate-lockfile
-)
-
+# Keep Cargo's resolved dependency graph stable when a lockfile is present.
+# Do not delete or regenerate Cargo.lock during a release build.
 export ANDROID_NDK_HOME="$NDK"
 export ANDROID_NDK_ROOT="$NDK"
 export CMAKE="$CMAKE"
@@ -137,8 +132,8 @@ export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-soname,libaether.so -C link-ar
 # PT_GNU_RELRO out to a 16K boundary that can overhang the end of the LOAD
 # segment holding it (RELRO@4K OVERRUN on every .so since the MIM port grew
 # the Rust core). 16K device support comes from max-page-size alone; the
-# loader honors max-page-size for mapping and common-page-size only shrinks
-# the RELRO padding, so dropping it fixes the overhang with no 16K cost.
+# loader honors max-page-size for mapping and common-page-size only shrinks the
+# RELRO padding, so dropping it fixes the overhang with no 16K cost.
 
 cd "$CRATE"
 cargo build --release --lib --target "$TARGET_TRIPLE"
